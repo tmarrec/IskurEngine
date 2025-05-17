@@ -1,0 +1,6 @@
+BasedOnStyle: Microsoft
+
+ColumnLimit: 200
+
+PointerAlignment: Left
+ReferenceAlignment: Left
