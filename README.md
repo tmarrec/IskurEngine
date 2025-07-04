@@ -35,8 +35,10 @@ Dependencies are managed using CMake and vcpkg.
 
 ### Prerequisites
 
-- Windows 10 or higher
-- Visual Studio 2022
+- Windows 11
+- Visual Studio 2022 (ensure the following components are installed)
+   - Windows 11 SDK (10.0.26100.X)
+   - Clang Compiler for Windows
 - CMake 4.0.2 or higher
 - vcpkg for managing dependencies
 

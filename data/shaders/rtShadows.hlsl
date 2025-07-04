@@ -7,6 +7,8 @@
 
 RaytracingAccelerationStructure Scene : register(t0, space0);
 RWTexture2D<half> ShadowRenderTarget : register(u0);
+Texture2D<float> Depth : register(t1);
+SamplerState DepthSampler : register(s0);
 cbuffer RtRootConstants : register(b1)
 {
     row_major float4x4 invViewProj;
@@ -22,8 +24,6 @@ cbuffer RtRootConstants : register(b1)
     float3 cameraPos;
     float pad1;
 };
-Texture2D<float> Depth : register(t1);
-SamplerState DepthSampler  : register(s0);
 
 static const uint invBayer2[4] = { 0, 3, 1, 2 };
 static const uint invBayer4[16] = { 0,10,2,8, 5,15,7,13, 1,11,3,9, 4,14,6,12 };

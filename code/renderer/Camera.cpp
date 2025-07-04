@@ -25,6 +25,8 @@ void Camera::Update(f32 elapsedSeconds)
         m_KeysPressed.space = false;
     }
 
+    f32 moveMultiplier = 1.f;
+
     float3 move;
     if (m_KeysPressed.w)
     {
@@ -42,16 +44,24 @@ void Camera::Update(f32 elapsedSeconds)
     {
         move += float3::Cross(m_Front, m_Up).Normalized();
     }
-    if (m_KeysPressed.leftShift)
+    if (m_KeysPressed.e)
     {
         move += {0, 1, 0};
     }
-    if (m_KeysPressed.leftCtrl)
+    if (m_KeysPressed.q)
     {
         move += {0, -1, 0};
     }
+    if (m_KeysPressed.leftShift)
+    {
+        moveMultiplier *= 4.f;
+    }
+    if (m_KeysPressed.leftCtrl)
+    {
+        moveMultiplier *= 0.25f;
+    }
 
-    m_Position += move * m_MoveSpeed * elapsedSeconds;
+    m_Position += move * m_MoveSpeed * moveMultiplier * elapsedSeconds;
 
     if (m_MouseOffset.x != 0.0f || m_MouseOffset.y != 0.0f)
     {
@@ -96,8 +106,14 @@ void Camera::OnKeyDown(u64 key)
 {
     switch (key)
     {
+    case 'Q':
+        m_KeysPressed.q = true;
+        break;
     case 'W':
         m_KeysPressed.w = true;
+        break;
+    case 'E':
+        m_KeysPressed.e = true;
         break;
     case 'A':
         m_KeysPressed.a = true;
@@ -129,8 +145,14 @@ void Camera::OnKeyUp(u64 key)
 {
     switch (key)
     {
+    case 'Q':
+        m_KeysPressed.q = false;
+        break;
     case 'W':
         m_KeysPressed.w = false;
+        break;
+    case 'E':
+        m_KeysPressed.e = false;
         break;
     case 'A':
         m_KeysPressed.a = false;

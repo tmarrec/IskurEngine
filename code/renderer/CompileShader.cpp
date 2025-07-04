@@ -51,7 +51,7 @@ class IncludeHandler : public IDxcIncludeHandler
         IDxcBlobEncoding* pEncoding;
         if (m_IncludedFiles.Find(pFilename))
         {
-            static constexpr char nullStr[] = " ";
+            constexpr char nullStr[] = " ";
             IE_Check(m_Utils->CreateBlobFromPinned(nullStr, ARRAYSIZE(nullStr), DXC_CP_ACP, &pEncoding));
             *ppIncludeSource = pEncoding;
             return S_OK;
@@ -119,13 +119,12 @@ IDxcBlob* CompileShader(ShaderType type, const WString& filename, const Vector<W
     case IE_SHADER_TYPE_MESH:
     case IE_SHADER_TYPE_PIXEL:
     case IE_SHADER_TYPE_VERTEX:
+    case IE_SHADER_TYPE_COMPUTE:
         arguments.Add(L"-E");
         arguments.Add(L"main");
         break;
     case IE_SHADER_TYPE_LIB:
         break;
-    case IE_SHADER_TYPE_COMPUTE:
-        IE_Assert(false); // Not implemented!
     }
     arguments.Add(L"-T");
     arguments.Add(ToTargetName(type));

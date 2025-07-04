@@ -17,8 +17,8 @@ enum class RayTracingResolution : u32
 
 namespace IE_Constants
 {
-static constexpr u32 frameInFlightCount = 3;
+constexpr u32 frameInFlightCount = 3;
 
-static constexpr bool enableRaytracedShadows = true;
-static constexpr RayTracingResolution raytracedShadowsType = RayTracingResolution::Half;
+constexpr bool enableRaytracedShadows = true;
+constexpr RayTracingResolution raytracedShadowsType = RayTracingResolution::FullX_HalfY;
 } // namespace IE_Constants

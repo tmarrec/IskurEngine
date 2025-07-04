@@ -27,7 +27,7 @@ class Primitive
 {
   public:
     Primitive(const tinygltf::Primitive& gltfPrimitive, const SharedPtr<Mesh>& parentMesh);
-    void Process(const tinygltf::Model& model);
+    void Process(const tinygltf::Model& model, const String& sceneFilename);
 
     float4x4 GetTransform() const;
 
@@ -39,20 +39,19 @@ class Primitive
     Vector<Vertex> m_Vertices;
     Vector<u32> m_Indices;
 
+    u32 m_MaterialIdx = UINT_MAX;
+
+    tinygltf::Primitive m_GltfPrimitive;
+    SharedPtr<Mesh> m_ParentMesh;
+
     SharedPtr<Buffer> m_VerticesBuffer;
     SharedPtr<Buffer> m_MeshletsBuffer;
     SharedPtr<Buffer> m_MeshletVerticesBuffer;
     SharedPtr<Buffer> m_MeshletTrianglesBuffer;
     SharedPtr<Buffer> m_MeshletBoundsBuffer;
-
-    tinygltf::Primitive m_GltfPrimitive;
-    SharedPtr<Mesh> m_ParentMesh;
-
     // RT
     ComPtr<ID3D12Resource> m_VertexBuffer;
     ComPtr<ID3D12Resource> m_IndexBuffer;
     ComPtr<ID3D12Resource> m_BLAS;
     ComPtr<ID3D12Resource> m_ScratchResource;
-
-    u32 m_MaterialIdx = UINT_MAX;
 };

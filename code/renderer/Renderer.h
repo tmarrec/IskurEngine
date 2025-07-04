@@ -13,7 +13,6 @@
 #include "Constants.h"
 #include "Material.h"
 #include "PipelineState.h"
-#include "RenderTarget.h"
 #include "Shader.h"
 #include "World.h"
 
@@ -85,7 +84,7 @@ class Renderer : public Singleton<Renderer>
     void Render();
 
     SharedPtr<PipelineState> CreatePipelineState(const SharedPtr<Shader>& amplificationShader, const SharedPtr<Shader>& meshShader, const SharedPtr<Shader>& pixelShader,
-                                                 Vector<SharedPtr<RenderTarget>> renderTargets, const SharedPtr<RenderTarget>& depthStencil) const;
+                                                 const Vector<ComPtr<ID3D12Resource>>& renderTargets, const ComPtr<ID3D12Resource>& depthStencil) const;
 
     void GetOrWaitNextFrame();
 
@@ -94,6 +93,7 @@ class Renderer : public Singleton<Renderer>
     void UploadTexture(const ComPtr<ID3D12GraphicsCommandList7>& cmdList, i32 width, i32 height, const void* data, u32 sizeInBytes, DXGI_FORMAT format);
 
     D3D12_CPU_DESCRIPTOR_HANDLE GetNewCBVSRVUAVHeapHandle();
+    D3D12_CPU_DESCRIPTOR_HANDLE GetNewSamplerHeapHandle();
 
     static SharedPtr<Shader> LoadShader(ShaderType type, const WString& filename);
 
@@ -107,6 +107,20 @@ class Renderer : public Singleton<Renderer>
     void AllocateUAVBuffer(u32 sizeInBytes, ComPtr<ID3D12Resource>& resource, D3D12_RESOURCE_STATES initialResourceState, const wchar_t* resourceName) const;
 
   private:
+    void CreateDevice();
+    void CreateAllocator();
+    void CreateCommandQueue();
+    void CreateSwapchain();
+    void CreateFrameSynchronizationFences();
+    void CreateCommandAllocators();
+    void CreateBindlessHeaps();
+    void CreateRTVs();
+    void CreateDSV();
+
+    void LoadScene();
+
+    static void WaitOnFence(const ComPtr<ID3D12Fence>& fence, u64& fenceValue);
+
     void SetupRaytracing(ComPtr<ID3D12GraphicsCommandList7>& cmdList);
 
     ComPtr<ID3D12Device14> m_Device;
@@ -117,24 +131,28 @@ class Renderer : public Singleton<Renderer>
     ComPtr<ID3D12CommandQueue> m_CommandQueue;
     ComPtr<IDXGISwapChain4> m_Swapchain;
 
-    HANDLE m_FenceEvent = nullptr;
-
     struct PerFrameData
     {
-        ComPtr<ID3D12Fence> renderFinishedFence;
-        u64 renderFinishedFenceValue;
-        Array<ComPtr<ID3D12CommandAllocator>, AlphaMode_Count> commandAllocators;
-        ComPtr<ID3D12CommandAllocator> rtCommandAllocator;
-        ComPtr<ID3D12CommandAllocator> depthCommandAllocator;
+        ComPtr<ID3D12CommandAllocator> commandAllocator;
+
+        ComPtr<ID3D12Fence> frameFence;
+        u64 frameFenceValue;
     };
     Array<PerFrameData, IE_Constants::frameInFlightCount> m_AllFrameData{};
-    PerFrameData* m_Pfd = nullptr;
+    PerFrameData& GetCurrentFrameData();
 
     u32 m_FrameInFlightIdx = 0;
     u32 m_FrameIndex = 0;
 
-    SharedPtr<RenderTarget> m_ColorTarget;
-    SharedPtr<RenderTarget> m_DepthStencil;
+    Array<ComPtr<ID3D12Resource>, IE_Constants::frameInFlightCount> m_RTVs;
+    Array<D3D12_CPU_DESCRIPTOR_HANDLE, IE_Constants::frameInFlightCount> m_RTVsHandle;
+    ComPtr<ID3D12DescriptorHeap> m_RTVsHeap;
+
+    ComPtr<ID3D12Resource> m_DSV;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_DSVHandle;
+    ComPtr<ID3D12DescriptorHeap> m_DSVHeap;
+    u32 m_SrvDepthIdx = UINT32_MAX;
+
     SharedPtr<Shader> m_AmplificationShader;
     SharedPtr<Shader> m_MeshShader;
     SharedPtr<Shader> m_PixelShader;
@@ -146,6 +164,8 @@ class Renderer : public Singleton<Renderer>
 
     D3D12_VIEWPORT m_Viewport = {0, 0, 0, 0, 0, 0};
     D3D12_RECT m_Rect = {0, 0, 0, 0};
+
+    D3D12_GPU_DESCRIPTOR_HANDLE m_CBVSRVUAVNullDescriptor{};
 
     ComPtr<ID3D12DescriptorHeap> m_CBVSRVUAVHeap;
     u32 m_CBVSRVUAVHeapLastIdx = 0;
@@ -174,10 +194,19 @@ class Renderer : public Singleton<Renderer>
     ComPtr<ID3D12Resource> m_HitGroupShaderTable;
     ComPtr<ID3D12Resource> m_RayGenShaderTable;
 
-    ComPtr<ID3D12DescriptorHeap> m_SamplerDepthRTHeap;
+    D3D12_GPU_DESCRIPTOR_HANDLE m_RaytracingSamplerGpuDescriptor{};
 
     // Raytracing output
     ComPtr<ID3D12Resource> m_RaytracingOutput;
     D3D12_GPU_DESCRIPTOR_HANDLE m_RaytracingOutputResourceUAVGpuDescriptor{};
     u32 m_RaytracingOutputIndex = UINT_MAX;
+
+    ComPtr<ID3D12Resource> m_BlurTemp;
+    ComPtr<ID3D12RootSignature> m_BlurRootSignature;
+    ComPtr<ID3D12PipelineState> m_BlurHPso;
+    ComPtr<ID3D12PipelineState> m_BlurVPso;
+
+    u32 m_SrvRawIdx = UINT32_MAX;
+    u32 m_SrvTempIdx = UINT32_MAX;
+    u32 m_UavTempIdx = UINT32_MAX;
 };

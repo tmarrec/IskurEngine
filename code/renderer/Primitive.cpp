@@ -6,7 +6,6 @@
 #include "Primitive.h"
 
 #include <DirectXMesh.h>
-#include <d3dx12.h>
 #include <meshoptimizer.h>
 
 #include "../common/Asserts.h"
@@ -18,7 +17,7 @@ Primitive::Primitive(const tinygltf::Primitive& gltfPrimitive, const SharedPtr<M
     m_ParentMesh = parentMesh;
 }
 
-void Primitive::Process(const tinygltf::Model& model)
+void Primitive::Process(const tinygltf::Model& model, const String& sceneFilename)
 {
     Vector<Vertex> initialVertices;
     Vector<u32> initialIndices;

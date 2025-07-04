@@ -14,6 +14,8 @@
 #include "../common/Asserts.h"
 #include "Camera.h"
 
+#include <execution>
+
 namespace
 {
 void GetPrimitiveRecursion(Vector<SharedPtr<Primitive>>& primitives, const SharedPtr<Node>& node)
@@ -32,7 +34,7 @@ void GetPrimitiveRecursion(Vector<SharedPtr<Primitive>>& primitives, const Share
 }
 } // namespace
 
-World::World(const tinygltf::Model& model)
+World::World(const tinygltf::Model& model, const String& sceneFilename)
 {
     for (const tinygltf::Scene& scene : model.scenes)
     {
@@ -46,6 +48,14 @@ World::World(const tinygltf::Model& model)
     }
     m_CurrentSceneIdx = model.defaultScene >= 0 ? model.defaultScene : 0;
     IE_Assert(m_CurrentSceneIdx < model.scenes.size());
+
+    const Vector<SharedPtr<Primitive>>& primitives = GetPrimitives();
+    Vector<u32> primitiveIndices(primitives.Size());
+    for (u32 i = 0; i < primitiveIndices.Size(); ++i)
+    {
+        primitiveIndices[i] = i;
+    }
+    std::for_each(std::execution::par_unseq, primitiveIndices.begin(), primitiveIndices.end(), [&primitives, &model, &sceneFilename](u32 i) { primitives[i]->Process(model, sceneFilename); });
 
     for (const tinygltf::Camera& camera : model.cameras)
     {

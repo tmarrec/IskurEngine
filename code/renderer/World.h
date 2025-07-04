@@ -13,7 +13,7 @@
 class World
 {
   public:
-    World(const tinygltf::Model& model);
+    World(const tinygltf::Model& model, const String& sceneFilename);
     Vector<SharedPtr<Primitive>> GetPrimitives();
 
   private:

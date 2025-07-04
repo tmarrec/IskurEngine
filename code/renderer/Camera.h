@@ -37,7 +37,9 @@ class Camera : public Singleton<Camera>
 
     struct KeysPressed
     {
+        bool q = false;
         bool w = false;
+        bool e = false;
         bool a = false;
         bool s = false;
         bool d = false;

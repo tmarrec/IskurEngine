@@ -116,21 +116,288 @@ DXGI_FORMAT GetDXGIFormat(const tinygltf::Image& image)
 
 void Renderer::Init()
 {
-    const Window& window = Window::GetInstance();
+    CreateDevice();
+    CreateAllocator();
+    CreateCommandQueue();
+    CreateCommandAllocators();
+    CreateFrameSynchronizationFences();
+    CreateSwapchain();
+    CreateBindlessHeaps();
+    CreateRTVs();
+    CreateDSV();
 
+    AllocateUploadBuffer(nullptr, sizeof(GlobalConstants) * IE_Constants::frameInFlightCount, 0, m_ConstantsBuffer, L"Color Constants");
+
+    m_AmplificationShader = LoadShader(IE_SHADER_TYPE_AMPLIFICATION, L"asBasic.hlsl");
+    m_MeshShader = LoadShader(IE_SHADER_TYPE_MESH, L"msBasic.hlsl");
+    m_PixelShader = LoadShader(IE_SHADER_TYPE_PIXEL, L"psBasic.hlsl");
+
+    Vector<ComPtr<ID3D12Resource>> renderTargets;
+    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
+    {
+        renderTargets.Add(m_RTVs[i]);
+    }
+    m_PipelineStates = CreatePipelineState(m_AmplificationShader, m_MeshShader, m_PixelShader, renderTargets, m_DSV);
+
+    LoadScene();
+}
+
+void Renderer::Render()
+{
+    Camera& camera = Camera::GetInstance();
+
+    /*
+    const std::chrono::microseconds ms = duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    );
+    camera.m_SunDir.x = static_cast<f32>(sin(static_cast<double>(ms.count()) / 25000000.0));
+    camera.m_SunDir.z = static_cast<f32>(-sin(static_cast<double>(ms.count()) / 20000000.0));
+    IE_Log("{} {}", camera.m_SunDir.x, camera.m_SunDir.z);
+    */
+
+    camera.m_SunDir.x = 0.04225999f;
+    camera.m_SunDir.z = -0.66877323f;
+
+    GetOrWaitNextFrame();
+    PerFrameData& frameData = GetCurrentFrameData();
+
+    u32 swapchainWidth;
+    u32 swapchainHeight;
+    IE_Check(m_Swapchain->GetSourceSize(&swapchainWidth, &swapchainHeight));
+
+    const float2 zNearFar = camera.GetZNearFar();
+
+    const Array<ID3D12DescriptorHeap*, 2> descriptorHeaps = {m_CBVSRVUAVHeap.Get(), m_SamplerHeap.Get()};
+
+    // Constant Buffer
+    const float4x4 view = camera.GetViewMatrix();
+    const float4x4 proj = camera.GetProjection();
+    const float4x4 projCull = camera.GetProjection();
+    const float4x4 vp = (view * projCull).Transposed();
+    m_Constants.view = view.Transposed();
+    m_Constants.proj = proj.Transposed();
+    m_Constants.planes[0] = (vp[3] + vp[0]).Normalized();
+    m_Constants.planes[1] = (vp[3] - vp[0]).Normalized();
+    m_Constants.planes[2] = (vp[3] + vp[1]).Normalized();
+    m_Constants.planes[3] = (vp[3] - vp[1]).Normalized();
+    m_Constants.planes[4] = vp[2].Normalized();
+    m_Constants.planes[5] = (vp[3] - vp[2]).Normalized();
+    m_Constants.cameraPos = camera.GetPosition();
+    m_Constants.sunDir = camera.m_SunDir;
+    m_Constants.raytracingOutputIndex = m_RaytracingOutputIndex;
+    SetResourceBufferData(m_ConstantsBuffer, &m_Constants, sizeof(GlobalConstants), m_FrameInFlightIdx * sizeof(GlobalConstants));
+
+    IE_Check(frameData.commandAllocator->Reset());
+    ComPtr<ID3D12GraphicsCommandList7> cmdList;
+    IE_Check(m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frameData.commandAllocator.Get(), nullptr, IID_PPV_ARGS(&cmdList)));
+    IE_Check(cmdList->SetName(L"Main command list"));
+
+    // Depth Pre-Pass
+    {
+        Barrier(cmdList, m_DSV, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+
+        cmdList->ClearDepthStencilView(m_DSVHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        cmdList->OMSetRenderTargets(0, nullptr, FALSE, &m_DSVHandle);
+        cmdList->SetDescriptorHeaps(descriptorHeaps.Size(), descriptorHeaps.Data());
+        cmdList->SetGraphicsRootSignature(m_PipelineStates->rootSignatures[AlphaMode_Opaque].Get());
+        cmdList->SetPipelineState(m_PipelineStates->depthPipelineState.Get());
+        cmdList->SetGraphicsRootConstantBufferView(1, m_ConstantsBuffer->GetGPUVirtualAddress() + m_FrameInFlightIdx * sizeof(GlobalConstants));
+        cmdList->RSSetViewports(1, &m_Viewport);
+        cmdList->RSSetScissorRects(1, &m_Rect);
+
+        for (const Vector<SharedPtr<Primitive>>& primitives : m_PrimitivesPerAlphaMode)
+        {
+            for (const SharedPtr<Primitive>& primitive : primitives)
+            {
+                PrimitiveRootConstants rootConstants = {.world = primitive->GetTransform().Transposed(),
+                                                        .meshletCount = primitive->m_Meshlets.Size(),
+                                                        .materialIdx = primitive->m_MaterialIdx,
+                                                        .verticesBufferIndex = primitive->m_VerticesBuffer->index,
+                                                        .meshletsBufferIndex = primitive->m_MeshletsBuffer->index,
+                                                        .meshletVerticesBufferIndex = primitive->m_MeshletVerticesBuffer->index,
+                                                        .meshletTrianglesBufferIndex = primitive->m_MeshletTrianglesBuffer->index,
+                                                        .meshletBoundsBufferIndex = primitive->m_MeshletBoundsBuffer->index,
+                                                        .materialsBufferIndex = m_MaterialsBuffer->index};
+                cmdList->SetGraphicsRoot32BitConstants(0, sizeof(rootConstants) / 4, &rootConstants, 0);
+                cmdList->DispatchMesh((primitive->m_Meshlets.Size() + 31) / 32, 1, 1);
+            }
+        }
+
+        Barrier(cmdList, m_DSV, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    }
+
+    // RayTracing
+    if (IE_Constants::enableRaytracedShadows)
+    {
+        cmdList->SetComputeRootSignature(m_RaytracingGlobalRootSignature.Get());
+        cmdList->SetDescriptorHeaps(descriptorHeaps.Size(), descriptorHeaps.Data());
+
+        cmdList->SetPipelineState1(m_DxrStateObject.Get());
+
+        cmdList->SetComputeRootDescriptorTable(RtRootSignatureParams::OutputViewSlot, m_RaytracingOutputResourceUAVGpuDescriptor);
+        cmdList->SetComputeRootShaderResourceView(RtRootSignatureParams::AccelerationStructureSlot, m_TLAS->GetGPUVirtualAddress());
+        cmdList->SetComputeRootDescriptorTable(RtRootSignatureParams::DepthBufferSlot, m_DepthResourceSRVGpuDescriptor);
+        cmdList->SetComputeRootDescriptorTable(RtRootSignatureParams::SamplerSlot, m_RaytracingSamplerGpuDescriptor);
+
+        const float3 cameraPos = camera.GetPosition();
+        const RtRootConstants rayTraceRootConstants = {
+            .invViewProj = (view * proj).Inversed(),
+            .zNear = zNearFar.x,
+            .zFar = zNearFar.y,
+            .resolutionType = static_cast<u32>(IE_Constants::raytracedShadowsType), // I should use defines to DXC when compiling but apparently there
+                                                                                    // is an DXC issue with -D defines with raytracing shaders...
+            .sunDir = camera.m_SunDir.Normalized(),
+            .frameIndex = m_FrameIndex,
+            .cameraPos = cameraPos,
+        };
+        cmdList->SetComputeRoot32BitConstants(RtRootSignatureParams::ConstantsSlot, sizeof(RtRootConstants) / sizeof(u32), &rayTraceRootConstants, 0);
+
+        uint2 rtShadowsRes = {swapchainWidth, swapchainHeight};
+        switch (IE_Constants::raytracedShadowsType)
+        {
+        case RayTracingResolution::Full:
+            break;
+        case RayTracingResolution::FullX_HalfY:
+            rtShadowsRes.y /= 2;
+            break;
+        case RayTracingResolution::Half:
+            rtShadowsRes /= 2;
+            break;
+        case RayTracingResolution::Quarter:
+            rtShadowsRes /= 4;
+            break;
+        }
+
+        const D3D12_DISPATCH_RAYS_DESC dispatchDesc = {
+            .RayGenerationShaderRecord =
+                {
+                    .StartAddress = m_RayGenShaderTable->GetGPUVirtualAddress(),
+                    .SizeInBytes = m_RayGenShaderTable->GetDesc().Width,
+                },
+            .MissShaderTable =
+                {
+                    .StartAddress = m_MissShaderTable->GetGPUVirtualAddress(),
+                    .SizeInBytes = m_MissShaderTable->GetDesc().Width,
+                    .StrideInBytes = m_MissShaderTable->GetDesc().Width,
+                },
+            .HitGroupTable =
+                {
+                    .StartAddress = m_HitGroupShaderTable->GetGPUVirtualAddress(),
+                    .SizeInBytes = m_HitGroupShaderTable->GetDesc().Width,
+                    .StrideInBytes = m_HitGroupShaderTable->GetDesc().Width,
+                },
+            .Width = rtShadowsRes.x,
+            .Height = rtShadowsRes.y,
+            .Depth = 1,
+        };
+        cmdList->DispatchRays(&dispatchDesc);
+
+        // Unbind DepthBuffer
+        cmdList->SetComputeRootDescriptorTable(RtRootSignatureParams::DepthBufferSlot, m_CBVSRVUAVNullDescriptor);
+    }
+
+    // Blur RT
+    if (IE_Constants::enableRaytracedShadows)
+    {
+        const float zNearFarConstants[2] = {zNearFar.x, zNearFar.y};
+
+        UAVBarrier(cmdList, m_RaytracingOutput);
+
+        // — Horizontal pass —
+        cmdList->SetComputeRootSignature(m_BlurRootSignature.Get());
+        cmdList->SetPipelineState(m_BlurHPso.Get());
+        cmdList->SetDescriptorHeaps(2, descriptorHeaps.Data());
+        CD3DX12_GPU_DESCRIPTOR_HANDLE srvRawGPU(m_CBVSRVUAVHeap->GetGPUDescriptorHandleForHeapStart(), m_SrvRawIdx, m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        cmdList->SetComputeRootDescriptorTable(0, srvRawGPU);
+        cmdList->SetComputeRootDescriptorTable(1, m_DepthResourceSRVGpuDescriptor);
+        CD3DX12_GPU_DESCRIPTOR_HANDLE uavTempGPU(m_CBVSRVUAVHeap->GetGPUDescriptorHandleForHeapStart(), m_UavTempIdx,
+                                                 m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        cmdList->SetComputeRootDescriptorTable(2, uavTempGPU);
+        cmdList->SetComputeRoot32BitConstants(3, 2, zNearFarConstants, 0);
+
+        cmdList->Dispatch((swapchainWidth + 15) / 16, (swapchainHeight + 15) / 16, 1);
+        UAVBarrier(cmdList, m_BlurTemp);
+
+        // — Vertical pass —
+        cmdList->SetPipelineState(m_BlurVPso.Get());
+        CD3DX12_GPU_DESCRIPTOR_HANDLE srvTempGPU(m_CBVSRVUAVHeap->GetGPUDescriptorHandleForHeapStart(), m_SrvTempIdx,
+                                                 m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        cmdList->SetComputeRootDescriptorTable(0, srvTempGPU);
+        cmdList->SetComputeRootDescriptorTable(1, m_DepthResourceSRVGpuDescriptor);
+        CD3DX12_GPU_DESCRIPTOR_HANDLE uavOutGPU(m_CBVSRVUAVHeap->GetGPUDescriptorHandleForHeapStart(), m_RaytracingOutputIndex,
+                                                m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        cmdList->SetComputeRootDescriptorTable(2, uavOutGPU);
+        cmdList->SetComputeRoot32BitConstants(3, 2, zNearFarConstants, 0);
+
+        cmdList->Dispatch((swapchainWidth + 15) / 16, (swapchainHeight + 15) / 16, 1);
+        UAVBarrier(cmdList, m_RaytracingOutput);
+    }
+
+    for (u32 i = 0; i < AlphaMode_Count; ++i)
+    {
+        const AlphaMode alphaMode = static_cast<AlphaMode>(i);
+
+        Barrier(cmdList, m_RTVs[m_FrameInFlightIdx], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Barrier(cmdList, m_DSV, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+
+        cmdList->SetDescriptorHeaps(descriptorHeaps.Size(), descriptorHeaps.Data());
+        cmdList->SetGraphicsRootSignature(m_PipelineStates->rootSignatures[alphaMode].Get());
+        cmdList->RSSetViewports(1, &m_Viewport);
+        cmdList->RSSetScissorRects(1, &m_Rect);
+
+        if (alphaMode == AlphaMode_Opaque)
+        {
+            const Array<f32, 4> color = {0, 0, 0, 1};
+            cmdList->ClearRenderTargetView(m_RTVsHandle[m_FrameInFlightIdx], color.Data(), 0, nullptr);
+        }
+
+        cmdList->OMSetRenderTargets(1, &m_RTVsHandle[m_FrameInFlightIdx], false, &m_DSVHandle);
+        cmdList->SetPipelineState(m_PipelineStates->pipelineStates[alphaMode].Get());
+        cmdList->SetGraphicsRootConstantBufferView(1, m_ConstantsBuffer->GetGPUVirtualAddress() + m_FrameInFlightIdx * sizeof(GlobalConstants));
+
+        for (const SharedPtr<Primitive>& primitive : m_PrimitivesPerAlphaMode[alphaMode])
+        {
+            const PrimitiveRootConstants rootConstants = {
+                .world = primitive->GetTransform().Transposed(),
+                .meshletCount = primitive->m_Meshlets.Size(),
+                .materialIdx = primitive->m_MaterialIdx,
+                .verticesBufferIndex = primitive->m_VerticesBuffer->index,
+                .meshletsBufferIndex = primitive->m_MeshletsBuffer->index,
+                .meshletVerticesBufferIndex = primitive->m_MeshletVerticesBuffer->index,
+                .meshletTrianglesBufferIndex = primitive->m_MeshletTrianglesBuffer->index,
+                .meshletBoundsBufferIndex = primitive->m_MeshletBoundsBuffer->index,
+                .materialsBufferIndex = m_MaterialsBuffer->index,
+            };
+            cmdList->SetGraphicsRoot32BitConstants(0, sizeof(PrimitiveRootConstants) / 4, &rootConstants, 0);
+            cmdList->DispatchMesh((primitive->m_Meshlets.Size() + 32 - 1) / 32, 1, 1);
+        }
+
+        Barrier(cmdList, m_DSV, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        Barrier(cmdList, m_RTVs[m_FrameInFlightIdx], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    }
+
+    IE_Check(cmdList->Close());
+    ID3D12CommandList* pCmdList = cmdList.Get();
+    m_CommandQueue->ExecuteCommandLists(1, &pCmdList);
+    IE_Check(m_CommandQueue->Signal(frameData.frameFence.Get(), frameData.frameFenceValue));
+
+    IE_Check(m_Swapchain->Present(0, 0));
+
+    m_FrameIndex++;
+}
+
+void Renderer::CreateDevice()
+{
     u32 dxgiFactoryFlags = 0;
-
-#if defined(_DEBUG)
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&m_Debug))))
     {
         m_Debug->EnableDebugLayer();
         dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
     }
-#endif
 
     IE_Check(CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&m_DxgiFactory)));
 
-    static constexpr D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_12_2;
+    constexpr D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_12_2;
     i32 currentAdapterIndex = 0;
     bool adapterFound = false;
     while (m_DxgiFactory->EnumAdapters1(currentAdapterIndex, &m_Adapter) != DXGI_ERROR_NOT_FOUND) // Find a GPU that supports DX12
@@ -152,8 +419,10 @@ void Renderer::Init()
     }
     IE_Assert(adapterFound);
     IE_Check(D3D12CreateDevice(m_Adapter.Get(), featureLevel, IID_PPV_ARGS(&m_Device)));
+}
 
-    // >>> Create allocator
+void Renderer::CreateAllocator()
+{
     const D3D12MA::ALLOCATOR_DESC allocatorDesc = {
         .Flags = D3D12MA::ALLOCATOR_FLAG_MSAA_TEXTURES_ALWAYS_COMMITTED | D3D12MA::ALLOCATOR_FLAG_DEFAULT_POOLS_NOT_ZEROED,
         .pDevice = m_Device.Get(),
@@ -161,10 +430,11 @@ void Renderer::Init()
         .pAllocationCallbacks = nullptr,
         .pAdapter = m_Adapter.Get(),
     };
-    IE_Check(CreateAllocator(&allocatorDesc, &m_Allocator));
-    // <<< Create allocator
+    IE_Check(D3D12MA::CreateAllocator(&allocatorDesc, &m_Allocator));
+}
 
-    // >>> Create command queue
+void Renderer::CreateCommandQueue()
+{
     constexpr D3D12_COMMAND_QUEUE_DESC commandQueueDesc = {
         .Type = D3D12_COMMAND_LIST_TYPE_DIRECT,
         .Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH,
@@ -172,10 +442,13 @@ void Renderer::Init()
         .NodeMask = 0,
     };
     IE_Check(m_Device->CreateCommandQueue(&commandQueueDesc, IID_PPV_ARGS(&m_CommandQueue)));
-    // <<< Create command queue
+}
 
-    // >>> Create swapchain
+void Renderer::CreateSwapchain()
+{
+    const Window& window = Window::GetInstance();
     const uint2& windowRes = window.GetResolution();
+
     const DXGI_SWAP_CHAIN_DESC1 swapchainDesc = {
         .Width = windowRes.x,
         .Height = windowRes.y,
@@ -198,56 +471,96 @@ void Renderer::Init()
     IE_Check(m_DxgiFactory->CreateSwapChainForHwnd(m_CommandQueue.Get(), window.GetHwnd(), &swapchainDesc, nullptr, nullptr, &tempSwapchain));
     IE_Check(m_DxgiFactory->MakeWindowAssociation(window.GetHwnd(), DXGI_MWA_NO_ALT_ENTER)); // No fullscreen with alt enter
     IE_Check(tempSwapchain->QueryInterface(IID_PPV_ARGS(&m_Swapchain)));
-    // <<< Create swapchain
 
-    // >>> Create fences and command allocators
+    m_Viewport = {
+        .TopLeftX = 0.f,
+        .TopLeftY = 0.f,
+        .Width = static_cast<f32>(windowRes.x),
+        .Height = static_cast<f32>(windowRes.y),
+        .MinDepth = 0.f,
+        .MaxDepth = 1.f,
+    };
+    m_Rect = {
+        .left = 0,
+        .top = 0,
+        .right = static_cast<i32>(windowRes.x),
+        .bottom = static_cast<i32>(windowRes.y),
+    };
+}
+
+void Renderer::CreateFrameSynchronizationFences()
+{
     for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
     {
-        IE_Check(m_Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_AllFrameData[i].renderFinishedFence)));
-
-        for (u32 j = 0; j < AlphaMode_Count; ++j)
-        {
-            IE_Check(m_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_AllFrameData[i].commandAllocators[j])));
-        }
-        IE_Check(m_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_AllFrameData[i].rtCommandAllocator)));
-        IE_Check(m_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_AllFrameData[i].depthCommandAllocator)));
+        IE_Check(m_Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_AllFrameData[i].frameFence)));
     }
-    // <<< Create fences and command allocators
+}
 
-    // >>> Create color render target
-    m_ColorTarget = IE_MakeSharedPtr<RenderTarget>();
+void Renderer::CreateCommandAllocators()
+{
+    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
+    {
+        IE_Check(m_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_AllFrameData[i].commandAllocator)));
+    }
+}
+
+void Renderer::CreateBindlessHeaps()
+{
+    constexpr D3D12_DESCRIPTOR_HEAP_DESC descriptorHeapDesc = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        .NumDescriptors = 65536,
+        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    };
+    IE_Check(m_Device->CreateDescriptorHeap(&descriptorHeapDesc, IID_PPV_ARGS(&m_CBVSRVUAVHeap)));
+    IE_Check(m_CBVSRVUAVHeap->SetName(L"CBV/SRV/UAV Heap"));
+    m_CBVSRVUAVNullDescriptor =
+        CD3DX12_GPU_DESCRIPTOR_HANDLE(m_CBVSRVUAVHeap->GetGPUDescriptorHandleForHeapStart(), 0, m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+
+    constexpr D3D12_DESCRIPTOR_HEAP_DESC samplerDescriptorHeapDesc = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+        .NumDescriptors = 4080,
+        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    };
+    IE_Check(m_Device->CreateDescriptorHeap(&samplerDescriptorHeapDesc, IID_PPV_ARGS(&m_SamplerHeap)));
+    IE_Check(m_SamplerHeap->SetName(L"Sampler Heap"));
+}
+
+void Renderer::CreateRTVs()
+{
     constexpr D3D12_DESCRIPTOR_HEAP_DESC descriptorRtvHeapDesc = {
         .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
         .NumDescriptors = IE_Constants::frameInFlightCount,
         .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
     };
-    IE_Check(m_Device->CreateDescriptorHeap(&descriptorRtvHeapDesc, IID_PPV_ARGS(&m_ColorTarget->heap)));
-    IE_Check(m_ColorTarget->heap->SetName(L"Color : Heap"));
+    IE_Check(m_Device->CreateDescriptorHeap(&descriptorRtvHeapDesc, IID_PPV_ARGS(&m_RTVsHeap)));
+    IE_Check(m_RTVsHeap->SetName(L"Color : Heap"));
     constexpr D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {
         .Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         .ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D,
     };
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_ColorTarget->heap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvHandleBase = m_RTVsHeap->GetCPUDescriptorHandleForHeapStart();
     for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
     {
-        ID3D12Resource* renderTarget;
-        IE_Check(m_Swapchain->GetBuffer(i, IID_PPV_ARGS(&renderTarget)));
-        m_Device->CreateRenderTargetView(renderTarget, &rtvDesc, rtvHandle);
-        rtvHandle.ptr += m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV); // Offset
-        IE_Check(renderTarget->SetName(L"Color : RTV"));
-        m_ColorTarget->resource.Add(renderTarget);
+        IE_Check(m_Swapchain->GetBuffer(i, IID_PPV_ARGS(&m_RTVs[i])));
+        m_RTVsHandle[i] = rtvHandleBase;
+        m_RTVsHandle[i].ptr += i * m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        m_Device->CreateRenderTargetView(m_RTVs[i].Get(), &rtvDesc, m_RTVsHandle[i]);
+        IE_Check(m_RTVs[i]->SetName(L"Color : RTV"));
     }
-    // <<< Create color render target
+}
 
-    // >>> Create depth stencil target
-    m_DepthStencil = IE_MakeSharedPtr<RenderTarget>();
+void Renderer::CreateDSV()
+{
+    const Window& window = Window::GetInstance();
+    const uint2& windowRes = window.GetResolution();
+
     constexpr D3D12_DESCRIPTOR_HEAP_DESC descriptorDsvHeapDesc = {
         .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
         .NumDescriptors = 1,
         .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
     };
-    IE_Check(m_Device->CreateDescriptorHeap(&descriptorDsvHeapDesc, IID_PPV_ARGS(&m_DepthStencil->heap)));
-    IE_Check(m_DepthStencil->heap->SetName(L"Depth/Stencil : Heap"));
+    IE_Check(m_Device->CreateDescriptorHeap(&descriptorDsvHeapDesc, IID_PPV_ARGS(&m_DSVHeap)));
+    IE_Check(m_DSVHeap->SetName(L"Depth/Stencil : Heap"));
     constexpr D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {
         .Format = DXGI_FORMAT_D32_FLOAT,
         .ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D,
@@ -265,73 +578,29 @@ void Renderer::Init()
     constexpr D3D12MA::ALLOCATION_DESC allocDesc = {
         .HeapType = D3D12_HEAP_TYPE_DEFAULT,
     };
-    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_DepthStencil->heap->GetCPUDescriptorHandleForHeapStart();
-    ID3D12Resource* depthStencil;
+    m_DSVHandle = m_DSVHeap->GetCPUDescriptorHandleForHeapStart();
     D3D12MA::Allocation* allocation;
-    IE_Check(m_Allocator->CreateResource(&allocDesc, &resourceDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depthOptimizedClearValue, &allocation, IID_PPV_ARGS(&depthStencil)));
-    m_Device->CreateDepthStencilView(depthStencil, &dsvDesc, dsvHandle);
-    dsvHandle.ptr += m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV); // Offset
-    IE_Check(depthStencil->SetName(L"Depth/Stencil : DSV"));
-    m_DepthStencil->resource.Add(depthStencil);
-    // <<< Create depth stencil target
+    IE_Check(m_Allocator->CreateResource(&allocDesc, &resourceDesc, D3D12_RESOURCE_STATE_GENERIC_READ, &depthOptimizedClearValue, &allocation, IID_PPV_ARGS(&m_DSV)));
+    m_Device->CreateDepthStencilView(m_DSV.Get(), &dsvDesc, m_DSVHandle);
+    IE_Check(m_DSV->SetName(L"Depth/Stencil : DSV"));
+}
 
-    // >>> Create main descriptor heap (CBV_SRV_UAV) for bindless
-    constexpr D3D12_DESCRIPTOR_HEAP_DESC descriptorHeapDesc = {
-        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-        .NumDescriptors = 65536,
-        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-    };
-    IE_Check(m_Device->CreateDescriptorHeap(&descriptorHeapDesc, IID_PPV_ARGS(&m_CBVSRVUAVHeap)));
-    // <<< Create main descriptor heap (CBV_SRV_UAV) for bindless
+void Renderer::LoadScene()
+{
+    PerFrameData& frameData = GetCurrentFrameData();
 
-    // >>> Create main descriptor heap (SAMPLER) for bindless
-    constexpr D3D12_DESCRIPTOR_HEAP_DESC samplerDescriptorHeapDesc = {
-        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-        .NumDescriptors = 4080,
-        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-    };
-    IE_Check(m_Device->CreateDescriptorHeap(&samplerDescriptorHeapDesc, IID_PPV_ARGS(&m_SamplerHeap)));
-    // <<< Create main descriptor heap (SAMPLER) for bindless
-
-    AllocateUploadBuffer(nullptr, sizeof(GlobalConstants) * IE_Constants::frameInFlightCount, 0, m_ConstantsBuffer, L"Color Constants");
-
-    m_AmplificationShader = LoadShader(IE_SHADER_TYPE_AMPLIFICATION, L"asBasic.hlsl");
-    m_MeshShader = LoadShader(IE_SHADER_TYPE_MESH, L"msBasic.hlsl");
-    m_PixelShader = LoadShader(IE_SHADER_TYPE_PIXEL, L"psBasic.hlsl");
-
-    const Vector renderTargets = {m_ColorTarget};
-    m_PipelineStates = CreatePipelineState(m_AmplificationShader, m_MeshShader, m_PixelShader, renderTargets, m_DepthStencil);
-
-    m_Viewport = {
-        .TopLeftX = 0.f,
-        .TopLeftY = 0.f,
-        .Width = static_cast<f32>(window.GetResolution().x),
-        .Height = static_cast<f32>(window.GetResolution().y),
-        .MinDepth = 0.f,
-        .MaxDepth = 1.f,
-    };
-    m_Rect = {
-        .left = 0,
-        .top = 0,
-        .right = static_cast<i32>(window.GetResolution().x),
-        .bottom = static_cast<i32>(window.GetResolution().y),
-    };
-
-    GetOrWaitNextFrame();
-
-    // Create command list for setup
     ComPtr<ID3D12GraphicsCommandList7> cmdList;
-    IE_Check(m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_Pfd->commandAllocators[0].Get(), nullptr, IID_PPV_ARGS(&cmdList)));
+    IE_Check(m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frameData.commandAllocator.Get(), nullptr, IID_PPV_ARGS(&cmdList)));
 
     const CommandLineArguments& args = GetCommandLineArguments();
-    String sceneFile = String("data/scenes/");
+    String sceneFilename = String("data/scenes/");
     String fileName;
     if (!args.sceneFile.Empty())
     {
         fileName = args.sceneFile;
 
         const u32 lastCharIdx = fileName.Size() - 1;
-        if (fileName[lastCharIdx - 3] != '.' || fileName[lastCharIdx - 2] != 'g' || fileName[lastCharIdx - 1] != 'l' || fileName[lastCharIdx] != 'b')
+        if (lastCharIdx <= 3 || fileName[lastCharIdx - 3] != '.' || fileName[lastCharIdx - 2] != 'g' || fileName[lastCharIdx - 1] != 'l' || fileName[lastCharIdx] != 'b')
         {
             fileName += ".glb";
         }
@@ -340,16 +609,16 @@ void Renderer::Init()
     {
         fileName = "chess.glb";
     }
-    sceneFile += fileName;
+    sceneFilename += fileName;
 
     tinygltf::Model model;
     tinygltf::TinyGLTF loader;
     std::string err;
     std::string warn;
-    IE_Assert(loader.LoadBinaryFromFile(&model, &err, &warn, sceneFile.Data()));
+    IE_Assert(loader.LoadBinaryFromFile(&model, &err, &warn, sceneFilename.Data()));
     IE_Assert(warn.empty());
     IE_Assert(err.empty());
-    m_World = IE_MakeSharedPtr<World>(model);
+    m_World = IE_MakeSharedPtr<World>(model, sceneFilename);
 
     // >> Store all textures
     // Because the textures are the first thing being uploaded to the heap, we can keep their gltf indices!
@@ -375,10 +644,9 @@ void Renderer::Init()
             .MinLOD = 0.0f,
             .MaxLOD = D3D12_FLOAT32_MAX,
         };
-        D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_SamplerHeap->GetCPUDescriptorHandleForHeapStart();
-        srvHandle.ptr += m_SamplerHeapLastIdx * m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = GetNewSamplerHeapHandle();
         m_Device->CreateSampler(&samplerDesc, srvHandle);
-        m_SamplerHeapLastIdx++;
     }
     // <<< Store all samplers
 
@@ -455,13 +723,6 @@ void Renderer::Init()
 
     // >>> Upload primitives to GPU
     const Vector<SharedPtr<Primitive>>& primitives = m_World->GetPrimitives();
-    Vector<u32> indices(primitives.Size());
-    for (u32 i = 0; i < indices.Size(); ++i)
-    {
-        indices[i] = i;
-    }
-    std::for_each(std::execution::par_unseq, indices.begin(), indices.end(), [&primitives, &model](u32 i) { primitives[i]->Process(model); });
-
     for (const SharedPtr<Primitive>& primitive : primitives)
     {
         primitive->m_VerticesBuffer = CreateStructuredBuffer(primitive->m_Vertices.ByteSize(), sizeof(Vertex), L"Vertices");
@@ -485,7 +746,6 @@ void Renderer::Init()
     // <<< Upload primitives to GPU
 
     // >>> Create Depth SRV and Sampler
-    ID3D12Resource* depthTex = m_DepthStencil->resource[0];
     D3D12_CPU_DESCRIPTOR_HANDLE depthSrvHandle = GetNewCBVSRVUAVHeapHandle();
     constexpr D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
         .Format = DXGI_FORMAT_R32_FLOAT,
@@ -496,16 +756,10 @@ void Renderer::Init()
                 .MipLevels = 1,
             },
     };
-    m_Device->CreateShaderResourceView(depthTex, &srvDesc, depthSrvHandle);
+    m_Device->CreateShaderResourceView(m_DSV.Get(), &srvDesc, depthSrvHandle);
     m_DepthResourceSRVGpuDescriptor = CD3DX12_GPU_DESCRIPTOR_HANDLE(m_CBVSRVUAVHeap->GetGPUDescriptorHandleForHeapStart(), m_CBVSRVUAVHeapLastIdx - 1,
                                                                     m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
-
-    constexpr D3D12_DESCRIPTOR_HEAP_DESC sampHeapDesc = {
-        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-        .NumDescriptors = 1,
-        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-    };
-    IE_Check(m_Device->CreateDescriptorHeap(&sampHeapDesc, IID_PPV_ARGS(&m_SamplerDepthRTHeap)));
+    m_SrvDepthIdx = m_CBVSRVUAVHeapLastIdx - 1;
 
     constexpr D3D12_SAMPLER_DESC linearClampDesc = {
         .Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -518,8 +772,10 @@ void Renderer::Init()
         .MinLOD = 0,
         .MaxLOD = D3D12_FLOAT32_MAX,
     };
-    D3D12_CPU_DESCRIPTOR_HANDLE sampHandle = m_SamplerDepthRTHeap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE sampHandle = GetNewSamplerHeapHandle();
     m_Device->CreateSampler(&linearClampDesc, sampHandle);
+    m_RaytracingSamplerGpuDescriptor =
+        CD3DX12_GPU_DESCRIPTOR_HANDLE(m_SamplerHeap->GetGPUDescriptorHandleForHeapStart(), m_SamplerHeapLastIdx - 1, m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
     // <<< Create Depth SRV and Sampler
 
     // >>> Setup Raytracing
@@ -532,235 +788,19 @@ void Renderer::Init()
     IE_Check(cmdList->Close());
     ID3D12CommandList* pCmdList = cmdList.Get();
     m_CommandQueue->ExecuteCommandLists(1, &pCmdList);
-    IE_Check(m_CommandQueue->Signal(m_Pfd->renderFinishedFence.Get(), m_Pfd->renderFinishedFenceValue));
+    IE_Check(m_CommandQueue->Signal(frameData.frameFence.Get(), frameData.frameFenceValue));
     cmdList.Reset();
 }
 
-void Renderer::Render()
+void Renderer::WaitOnFence(const ComPtr<ID3D12Fence>& fence, u64& fenceValue)
 {
-    Camera& camera = Camera::GetInstance();
-
-    /*
-    const std::chrono::microseconds ms = duration_cast<std::chrono::microseconds>(
-        std::chrono::system_clock::now().time_since_epoch()
-    );
-    camera.m_SunDir.x = static_cast<f32>(sin(static_cast<double>(ms.count()) / 25000000.0));
-    camera.m_SunDir.z = static_cast<f32>(-sin(static_cast<double>(ms.count()) / 20000000.0));
-    IE_Log("{} {}", camera.m_SunDir.x, camera.m_SunDir.z);
-    */
-
-    camera.m_SunDir.x = 0.04225999f;
-    camera.m_SunDir.z = -0.66877323f;
-
-    GetOrWaitNextFrame();
-
-    const Array<ID3D12DescriptorHeap*, 2> descriptorHeaps = {m_CBVSRVUAVHeap.Get(), m_SamplerHeap.Get()};
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_ColorTarget->heap->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += m_FrameInFlightIdx * m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_DepthStencil->heap->GetCPUDescriptorHandleForHeapStart();
-    dsvHandle.ptr += 0 * m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-
-    // Constant Buffer
-    const float4x4 view = camera.GetViewMatrix();
-    const float4x4 proj = camera.GetProjection();
-    const float4x4 projCull = camera.GetProjection();
-    const float4x4 vp = (view * projCull).Transposed();
-    m_Constants.view = view.Transposed();
-    m_Constants.proj = proj.Transposed();
-    m_Constants.planes[0] = (vp[3] + vp[0]).Normalized();
-    m_Constants.planes[1] = (vp[3] - vp[0]).Normalized();
-    m_Constants.planes[2] = (vp[3] + vp[1]).Normalized();
-    m_Constants.planes[3] = (vp[3] - vp[1]).Normalized();
-    m_Constants.planes[4] = vp[2].Normalized();
-    m_Constants.planes[5] = (vp[3] - vp[2]).Normalized();
-    m_Constants.cameraPos = camera.GetPosition();
-    m_Constants.sunDir = camera.m_SunDir;
-    m_Constants.raytracingOutputIndex = m_RaytracingOutputIndex;
-    SetResourceBufferData(m_ConstantsBuffer, &m_Constants, sizeof(GlobalConstants), m_FrameInFlightIdx * sizeof(GlobalConstants));
-
-    Array<u32, AlphaMode_Count> alphaModeIndices;
-    for (u32 i = 0; i < alphaModeIndices.Size(); ++i)
+    if (fence->GetCompletedValue() < fenceValue)
     {
-        alphaModeIndices[i] = i;
+        HANDLE fenceEvent = nullptr;
+        IE_Check(fence->SetEventOnCompletion(fenceValue, fenceEvent));
+        WaitForSingleObject(fenceEvent, INFINITE);
     }
-
-    // Depth Pre-Pass
-    {
-        IE_Check(m_Pfd->depthCommandAllocator->Reset());
-
-        ComPtr<ID3D12GraphicsCommandList7> depthCmd;
-        IE_Check(m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_Pfd->depthCommandAllocator.Get(), nullptr, IID_PPV_ARGS(&depthCmd)));
-
-        depthCmd->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        depthCmd->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
-        depthCmd->SetDescriptorHeaps(descriptorHeaps.Size(), descriptorHeaps.Data());
-        depthCmd->SetGraphicsRootSignature(m_PipelineStates->rootSignatures[AlphaMode_Opaque].Get());
-        depthCmd->SetPipelineState(m_PipelineStates->depthPipelineState.Get());
-        depthCmd->SetGraphicsRootConstantBufferView(1, m_ConstantsBuffer->GetGPUVirtualAddress() + m_FrameInFlightIdx * sizeof(GlobalConstants));
-        depthCmd->RSSetViewports(1, &m_Viewport);
-        depthCmd->RSSetScissorRects(1, &m_Rect);
-
-        for (const Vector<SharedPtr<Primitive>>& primitives : m_PrimitivesPerAlphaMode)
-        {
-            for (const SharedPtr<Primitive>& primitive : primitives)
-            {
-                PrimitiveRootConstants rootConstants = {.world = primitive->GetTransform().Transposed(),
-                                                        .meshletCount = primitive->m_Meshlets.Size(),
-                                                        .materialIdx = primitive->m_MaterialIdx,
-                                                        .verticesBufferIndex = primitive->m_VerticesBuffer->index,
-                                                        .meshletsBufferIndex = primitive->m_MeshletsBuffer->index,
-                                                        .meshletVerticesBufferIndex = primitive->m_MeshletVerticesBuffer->index,
-                                                        .meshletTrianglesBufferIndex = primitive->m_MeshletTrianglesBuffer->index,
-                                                        .meshletBoundsBufferIndex = primitive->m_MeshletBoundsBuffer->index,
-                                                        .materialsBufferIndex = m_MaterialsBuffer->index};
-                depthCmd->SetGraphicsRoot32BitConstants(0, sizeof(rootConstants) / 4, &rootConstants, 0);
-                depthCmd->DispatchMesh((primitive->m_Meshlets.Size() + 31) / 32, 1, 1);
-            }
-        }
-
-        Barrier(depthCmd, m_DepthStencil->resource[0], D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ);
-
-        IE_Check(depthCmd->Close());
-        ID3D12CommandList* lists[] = {depthCmd.Get()};
-        m_CommandQueue->ExecuteCommandLists(1, lists);
-    }
-
-    static constexpr u32 raytraceCmdListCount = IE_Constants::enableRaytracedShadows ? 1 : 0;
-    Array<ID3D12GraphicsCommandList7*, raytraceCmdListCount + AlphaMode_Count> cmdLists;
-
-    // RayTracing
-    if (IE_Constants::enableRaytracedShadows)
-    {
-        IE_Check(m_Pfd->rtCommandAllocator->Reset());
-
-        ID3D12GraphicsCommandList7*& rtcmdList = cmdLists[0];
-
-        IE_Check(m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_Pfd->rtCommandAllocator.Get(), nullptr, IID_PPV_ARGS(&rtcmdList)));
-        u32 swapchainWidth;
-        u32 swapchainHeight;
-        IE_Check(m_Swapchain->GetSourceSize(&swapchainWidth, &swapchainHeight));
-
-        rtcmdList->SetComputeRootSignature(m_RaytracingGlobalRootSignature.Get());
-        rtcmdList->SetDescriptorHeaps(descriptorHeaps.Size(), descriptorHeaps.Data());
-
-        rtcmdList->SetPipelineState1(m_DxrStateObject.Get());
-
-        rtcmdList->SetComputeRootDescriptorTable(RtRootSignatureParams::OutputViewSlot, m_RaytracingOutputResourceUAVGpuDescriptor);
-        rtcmdList->SetComputeRootShaderResourceView(RtRootSignatureParams::AccelerationStructureSlot, m_TLAS->GetGPUVirtualAddress());
-        rtcmdList->SetComputeRootDescriptorTable(RtRootSignatureParams::DepthBufferSlot, m_DepthResourceSRVGpuDescriptor);
-        rtcmdList->SetComputeRootDescriptorTable(RtRootSignatureParams::SamplerSlot, m_SamplerDepthRTHeap->GetGPUDescriptorHandleForHeapStart());
-
-        const float2 cameraZNearFar = camera.GetZNearFar();
-        const float3 cameraPos = camera.GetPosition();
-        const RtRootConstants rayTraceRootConstants = {
-            .invViewProj = (view * proj).Inversed(),
-            .zNear = cameraZNearFar.x,
-            .zFar = cameraZNearFar.y,
-            .resolutionType = static_cast<u32>(IE_Constants::raytracedShadowsType), // I should use defines to DXC when compiling but apparently there
-                                                                                    // is an DXC issue with -D defines with raytracing shaders...
-            .sunDir = camera.m_SunDir.Normalized(),
-            .frameIndex = m_FrameIndex,
-            .cameraPos = cameraPos,
-        };
-        rtcmdList->SetComputeRoot32BitConstants(RtRootSignatureParams::ConstantsSlot, sizeof(RtRootConstants) / sizeof(u32), &rayTraceRootConstants, 0);
-
-        uint2 rtShadowsRes = {swapchainWidth, swapchainHeight};
-        switch (IE_Constants::raytracedShadowsType)
-        {
-        case RayTracingResolution::Full:
-            break;
-        case RayTracingResolution::FullX_HalfY:
-            rtShadowsRes.y /= 2;
-            break;
-        case RayTracingResolution::Half:
-            rtShadowsRes /= 2;
-            break;
-        case RayTracingResolution::Quarter:
-            rtShadowsRes /= 4;
-            break;
-        }
-
-        const D3D12_DISPATCH_RAYS_DESC dispatchDesc = {
-            .RayGenerationShaderRecord =
-                {
-                    .StartAddress = m_RayGenShaderTable->GetGPUVirtualAddress(),
-                    .SizeInBytes = m_RayGenShaderTable->GetDesc().Width,
-                },
-            .MissShaderTable =
-                {
-                    .StartAddress = m_MissShaderTable->GetGPUVirtualAddress(),
-                    .SizeInBytes = m_MissShaderTable->GetDesc().Width,
-                    .StrideInBytes = m_MissShaderTable->GetDesc().Width,
-                },
-            .HitGroupTable =
-                {
-                    .StartAddress = m_HitGroupShaderTable->GetGPUVirtualAddress(),
-                    .SizeInBytes = m_HitGroupShaderTable->GetDesc().Width,
-                    .StrideInBytes = m_HitGroupShaderTable->GetDesc().Width,
-                },
-            .Width = rtShadowsRes.x,
-            .Height = rtShadowsRes.y,
-            .Depth = 1,
-        };
-        rtcmdList->DispatchRays(&dispatchDesc);
-
-        IE_Check(rtcmdList->Close());
-    }
-
-    std::for_each(std::execution::par_unseq, alphaModeIndices.begin(), alphaModeIndices.end(), [&](u32 i) {
-        const AlphaMode alphaMode = static_cast<AlphaMode>(i);
-
-        IE_Check(m_Pfd->commandAllocators[i]->Reset());
-        ID3D12GraphicsCommandList7*& cmdList = cmdLists[raytraceCmdListCount + i];
-        IE_Check(m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_Pfd->commandAllocators[i].Get(), nullptr, IID_PPV_ARGS(&cmdList)));
-
-        Barrier(cmdList, m_ColorTarget->resource[m_FrameInFlightIdx], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        Barrier(cmdList, m_DepthStencil->resource[0], D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-
-        cmdList->SetDescriptorHeaps(descriptorHeaps.Size(), descriptorHeaps.Data());
-        cmdList->SetGraphicsRootSignature(m_PipelineStates->rootSignatures[alphaMode].Get());
-        cmdList->RSSetViewports(1, &m_Viewport);
-        cmdList->RSSetScissorRects(1, &m_Rect);
-
-        if (alphaMode == AlphaMode_Opaque)
-        {
-            const Array<f32, 4> color = {0, 0, 0, 1};
-            cmdList->ClearRenderTargetView(rtvHandle, color.Data(), 0, nullptr);
-        }
-
-        cmdList->OMSetRenderTargets(1, &rtvHandle, false, &dsvHandle);
-        cmdList->SetPipelineState(m_PipelineStates->pipelineStates[alphaMode].Get());
-        cmdList->SetGraphicsRootConstantBufferView(1, m_ConstantsBuffer->GetGPUVirtualAddress() + m_FrameInFlightIdx * sizeof(GlobalConstants));
-
-        for (const SharedPtr<Primitive>& primitive : m_PrimitivesPerAlphaMode[alphaMode])
-        {
-            const PrimitiveRootConstants rootConstants = {
-                .world = primitive->GetTransform().Transposed(),
-                .meshletCount = primitive->m_Meshlets.Size(),
-                .materialIdx = primitive->m_MaterialIdx,
-                .verticesBufferIndex = primitive->m_VerticesBuffer->index,
-                .meshletsBufferIndex = primitive->m_MeshletsBuffer->index,
-                .meshletVerticesBufferIndex = primitive->m_MeshletVerticesBuffer->index,
-                .meshletTrianglesBufferIndex = primitive->m_MeshletTrianglesBuffer->index,
-                .meshletBoundsBufferIndex = primitive->m_MeshletBoundsBuffer->index,
-                .materialsBufferIndex = m_MaterialsBuffer->index,
-            };
-            cmdList->SetGraphicsRoot32BitConstants(0, sizeof(PrimitiveRootConstants) / 4, &rootConstants, 0);
-            cmdList->DispatchMesh((primitive->m_Meshlets.Size() + 32 - 1) / 32, 1, 1);
-        }
-
-        Barrier(cmdList, m_ColorTarget->resource[m_FrameInFlightIdx], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-
-        IE_Check(cmdList->Close());
-    });
-
-    m_CommandQueue->ExecuteCommandLists(cmdLists.Size(), reinterpret_cast<ID3D12CommandList* const*>(cmdLists.Data()));
-
-    IE_Check(m_CommandQueue->Signal(m_Pfd->renderFinishedFence.Get(), m_Pfd->renderFinishedFenceValue));
-
-    IE_Check(m_Swapchain->Present(0, 0));
-
-    m_FrameIndex++;
+    fenceValue++;
 }
 
 void Renderer::SetupRaytracing(ComPtr<ID3D12GraphicsCommandList7>& cmdList)
@@ -783,9 +823,9 @@ void Renderer::SetupRaytracing(ComPtr<ID3D12GraphicsCommandList7>& cmdList)
         m_RaytracingOutputIndex = m_CBVSRVUAVHeapLastIdx - 1;
 
         m_Device->CreateUnorderedAccessView(m_RaytracingOutput.Get(), nullptr, &UAVDesc, uavDescriptorHandle);
-        m_RaytracingOutputResourceUAVGpuDescriptor = CD3DX12_GPU_DESCRIPTOR_HANDLE(m_CBVSRVUAVHeap->GetGPUDescriptorHandleForHeapStart(), m_CBVSRVUAVHeapLastIdx - 1,
+        m_RaytracingOutputResourceUAVGpuDescriptor = CD3DX12_GPU_DESCRIPTOR_HANDLE(m_CBVSRVUAVHeap->GetGPUDescriptorHandleForHeapStart(), m_RaytracingOutputIndex,
                                                                                    m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
-        m_RaytracingOutput->SetName(L"Raytracing Output");
+        IE_Check(m_RaytracingOutput->SetName(L"Raytracing Output"));
     }
 
     const CD3DX12_DESCRIPTOR_RANGE1 depthRange(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
@@ -832,10 +872,9 @@ void Renderer::SetupRaytracing(ComPtr<ID3D12GraphicsCommandList7>& cmdList)
     globalRootSignature->SetRootSignature(m_RaytracingGlobalRootSignature.Get());
 
     CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT* pipelineConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
-    static constexpr u32 maxRecursionDepth = 1;
+    constexpr u32 maxRecursionDepth = 1;
     pipelineConfig->Config(maxRecursionDepth);
 
-    // Create the state object.
     IE_Check(m_Device->CreateStateObject(raytracingPipeline, IID_PPV_ARGS(&m_DxrStateObject)));
 
     Vector<D3D12_RAYTRACING_INSTANCE_DESC> instanceDescs;
@@ -914,7 +953,6 @@ void Renderer::SetupRaytracing(ComPtr<ID3D12GraphicsCommandList7>& cmdList)
     AllocateUAVBuffer(static_cast<u32>(topLevelPrebuildInfo.ScratchDataSizeInBytes), m_ScratchResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, L"ScratchResource");
     AllocateUAVBuffer(static_cast<u32>(topLevelPrebuildInfo.ResultDataMaxSizeInBytes), m_TLAS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, L"TLAS");
 
-    // Top Level Acceleration Structure desc
     const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC topLevelBuildDesc = {
         .DestAccelerationStructureData = m_TLAS->GetGPUVirtualAddress(),
         .Inputs = topLevelInputs,
@@ -925,24 +963,108 @@ void Renderer::SetupRaytracing(ComPtr<ID3D12GraphicsCommandList7>& cmdList)
     ComPtr<ID3D12StateObjectProperties> stateObjectProperties;
     IE_Check(m_DxrStateObject.As(&stateObjectProperties));
 
-    static constexpr u32 shaderRecordSize = (D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES + (D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT - 1)) & ~(D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT - 1);
+    constexpr u32 shaderRecordSize = (D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES + (D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT - 1)) & ~(D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT - 1);
     const CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(shaderRecordSize);
     const CD3DX12_HEAP_PROPERTIES uploadHeapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
 
     // Ray gen shader table
     IE_Check(m_Device->CreateCommittedResource(&uploadHeapProperties, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_RayGenShaderTable)));
-    m_RayGenShaderTable->SetName(L"RayGenShaderTable");
+    IE_Check(m_RayGenShaderTable->SetName(L"RayGenShaderTable"));
     SetResourceBufferData(m_RayGenShaderTable, stateObjectProperties->GetShaderIdentifier(L"Raygen"), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, 0);
 
     // Miss shader table
     IE_Check(m_Device->CreateCommittedResource(&uploadHeapProperties, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_MissShaderTable)));
-    m_MissShaderTable->SetName(L"MissShaderTable");
+    IE_Check(m_MissShaderTable->SetName(L"MissShaderTable"));
     SetResourceBufferData(m_MissShaderTable, stateObjectProperties->GetShaderIdentifier(L"Miss"), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, 0);
 
     // Hit group shader table
     IE_Check(m_Device->CreateCommittedResource(&uploadHeapProperties, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_HitGroupShaderTable)));
-    m_HitGroupShaderTable->SetName(L"HitGroupShaderTable");
+    IE_Check(m_HitGroupShaderTable->SetName(L"HitGroupShaderTable"));
     SetResourceBufferData(m_HitGroupShaderTable, stateObjectProperties->GetShaderIdentifier(L"HitGroup"), D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, 0);
+
+    // Setup blur pass
+    {
+        // 1) Allocate intermediate UAV texture (same size/format)
+        CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16_FLOAT, swapchainWidth, swapchainHeight, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        CD3DX12_HEAP_PROPERTIES heap(D3D12_HEAP_TYPE_DEFAULT);
+        IE_Check(m_Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_BlurTemp)));
+        m_BlurTemp->SetName(L"BlurTemp");
+
+        // 2) UAV descriptor for temp
+        constexpr D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+            .Format = DXGI_FORMAT_R16_FLOAT,
+            .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D,
+        };
+
+        auto uavHandle = GetNewCBVSRVUAVHeapHandle();
+        m_Device->CreateUnorderedAccessView(m_BlurTemp.Get(), nullptr, &uavDesc, uavHandle);
+        m_UavTempIdx = m_CBVSRVUAVHeapLastIdx - 1;
+
+        // 3) SRV for raw shadow UAV (t0)
+        constexpr D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+            .Format = DXGI_FORMAT_R16_FLOAT,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D.MostDetailedMip = 0,
+            .Texture2D.MipLevels = 1,
+        };
+
+        auto srvRawHandle = GetNewCBVSRVUAVHeapHandle();
+        m_Device->CreateShaderResourceView(m_RaytracingOutput.Get(), &srvDesc, srvRawHandle);
+        m_SrvRawIdx = m_CBVSRVUAVHeapLastIdx - 1;
+
+        // 4) SRV for the temp buffer (t0 in vertical pass)
+        auto srvTempHandle = GetNewCBVSRVUAVHeapHandle();
+        m_Device->CreateShaderResourceView(m_BlurTemp.Get(), &srvDesc, srvTempHandle);
+        m_SrvTempIdx = m_CBVSRVUAVHeapLastIdx - 1;
+
+        // 5) Build a 3‐param root signature:
+        //    [0] raw shadow SRV @ t0
+        //    [1] depth SRV      @ t1
+        //    [2] UAV            @ u0
+        const CD3DX12_DESCRIPTOR_RANGE1 ranges[3] = {
+            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0},
+            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1},
+            {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0},
+        };
+        CD3DX12_ROOT_PARAMETER1 params[4];
+        params[0].InitAsDescriptorTable(1, &ranges[0]);
+        params[1].InitAsDescriptorTable(1, &ranges[1]);
+        params[2].InitAsDescriptorTable(1, &ranges[2]);
+        params[3].InitAsConstants(2, 1, 0);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rsDesc(4, params);
+        ComPtr<ID3DBlob> rsBlob, rsError;
+        IE_Check(D3D12SerializeVersionedRootSignature(&rsDesc, &rsBlob, &rsError));
+        IE_Check(m_Device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(), IID_PPV_ARGS(&m_BlurRootSignature)));
+
+        // 6) Compile & create horizontal PSO
+        {
+            auto csH = CompileShader(IE_SHADER_TYPE_COMPUTE, L"csBlurH.hlsl", {});
+            const D3D12_COMPUTE_PIPELINE_STATE_DESC psoH = {
+                .pRootSignature = m_BlurRootSignature.Get(),
+                .CS = {csH->GetBufferPointer(), csH->GetBufferSize()},
+            };
+
+            IE_Check(m_Device->CreateComputePipelineState(&psoH, IID_PPV_ARGS(&m_BlurHPso)));
+        }
+
+        // 7) Compile & create vertical PSO
+        {
+            auto csV = CompileShader(IE_SHADER_TYPE_COMPUTE, L"csBlurV.hlsl", {});
+            const D3D12_COMPUTE_PIPELINE_STATE_DESC psoV = {
+                .pRootSignature = m_BlurRootSignature.Get(),
+                .CS = {csV->GetBufferPointer(), csV->GetBufferSize()},
+            };
+
+            IE_Check(m_Device->CreateComputePipelineState(&psoV, IID_PPV_ARGS(&m_BlurVPso)));
+        }
+    }
+}
+
+Renderer::PerFrameData& Renderer::GetCurrentFrameData()
+{
+    return m_AllFrameData[m_Swapchain->GetCurrentBackBufferIndex()];
 }
 
 SharedPtr<Buffer> Renderer::CreateStructuredBuffer(u32 sizeInBytes, u32 strideInBytes, const WString& name, D3D12_HEAP_TYPE heapType)
@@ -1014,7 +1136,7 @@ SharedPtr<Buffer> Renderer::CreateBytesBuffer(u32 numElements, const WString& na
 }
 
 SharedPtr<PipelineState> Renderer::CreatePipelineState(const SharedPtr<Shader>& amplificationShader, const SharedPtr<Shader>& meshShader, const SharedPtr<Shader>& pixelShader,
-                                                       Vector<SharedPtr<RenderTarget>> renderTargets, const SharedPtr<RenderTarget>& depthStencil) const
+                                                       const Vector<ComPtr<ID3D12Resource>>& renderTargets, const ComPtr<ID3D12Resource>& depthStencil) const
 {
     PipelineState pipelineState;
 
@@ -1068,12 +1190,12 @@ SharedPtr<PipelineState> Renderer::CreatePipelineState(const SharedPtr<Shader>& 
             .DepthStencilState = depthStencilDesc,
             .PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             .NumRenderTargets = renderTargets.Size(),
-            .DSVFormat = depthStencil->resource[0]->GetDesc().Format,
+            .DSVFormat = depthStencil->GetDesc().Format,
             .SampleDesc = DefaultSampleDesc(),
         };
         for (u32 i = 0; i < renderTargets.Size(); ++i)
         {
-            psoDesc.RTVFormats[i] = renderTargets[i]->resource[0]->GetDesc().Format;
+            psoDesc.RTVFormats[i] = renderTargets[i]->GetDesc().Format;
         }
         CD3DX12_PIPELINE_MESH_STATE_STREAM psoStream = CD3DX12_PIPELINE_MESH_STATE_STREAM(psoDesc);
         const D3D12_PIPELINE_STATE_STREAM_DESC streamDesc = {
@@ -1087,19 +1209,6 @@ SharedPtr<PipelineState> Renderer::CreatePipelineState(const SharedPtr<Shader>& 
     D3D12_SHADER_BYTECODE& dxMeshShader = meshShader->bytecodes[AlphaMode_Opaque];
 
     IE_Check(m_Device->CreateRootSignature(0, dxMeshShader.pShaderBytecode, dxMeshShader.BytecodeLength, IID_PPV_ARGS(&pipelineState.depthRootSignature)));
-
-    D3D12_BLEND_DESC blendDesc = {
-        .AlphaToCoverageEnable = FALSE,
-        .IndependentBlendEnable = FALSE,
-    };
-    for (u8 i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
-    {
-        D3D12_RENDER_TARGET_BLEND_DESC& rtBlendDesc = blendDesc.RenderTarget[i];
-        rtBlendDesc.LogicOpEnable = FALSE;
-        rtBlendDesc.LogicOp = D3D12_LOGIC_OP_NOOP;
-        rtBlendDesc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-        rtBlendDesc.BlendEnable = FALSE;
-    }
 
     constexpr D3D12_RASTERIZER_DESC rasterizerDesc = {
         .FillMode = D3D12_FILL_MODE_SOLID,
@@ -1120,18 +1229,18 @@ SharedPtr<PipelineState> Renderer::CreatePipelineState(const SharedPtr<Shader>& 
         .AS = amplificationShader ? amplificationShader->bytecodes[AlphaMode_Opaque] : D3D12_SHADER_BYTECODE{},
         .MS = meshShader ? dxMeshShader : D3D12_SHADER_BYTECODE{},
         .PS = pixelShader ? pixelShader->bytecodes[AlphaMode_Opaque] : D3D12_SHADER_BYTECODE{},
-        .BlendState = blendDesc,
+        .BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT),
         .SampleMask = UINT_MAX,
         .RasterizerState = rasterizerDesc,
         .DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT),
         .PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
         .NumRenderTargets = renderTargets.Size(),
-        .DSVFormat = depthStencil->resource[0]->GetDesc().Format,
+        .DSVFormat = depthStencil->GetDesc().Format,
         .SampleDesc = DefaultSampleDesc(),
     };
     for (u32 i = 0; i < renderTargets.Size(); ++i)
     {
-        psoDesc.RTVFormats[i] = renderTargets[i]->resource[0]->GetDesc().Format;
+        psoDesc.RTVFormats[i] = renderTargets[i]->GetDesc().Format;
     }
     CD3DX12_PIPELINE_MESH_STATE_STREAM psoStream = CD3DX12_PIPELINE_MESH_STATE_STREAM(psoDesc);
     const D3D12_PIPELINE_STATE_STREAM_DESC streamDesc = {
@@ -1174,15 +1283,9 @@ SharedPtr<Shader> Renderer::LoadShader(const ShaderType type, const WString& fil
 void Renderer::GetOrWaitNextFrame()
 {
     m_FrameInFlightIdx = m_Swapchain->GetCurrentBackBufferIndex();
-    m_Pfd = &m_AllFrameData[m_FrameInFlightIdx];
 
-    // Wait until the fence has been processed
-    if (m_Pfd->renderFinishedFence->GetCompletedValue() < m_Pfd->renderFinishedFenceValue)
-    {
-        IE_Check(m_Pfd->renderFinishedFence->SetEventOnCompletion(m_Pfd->renderFinishedFenceValue, m_FenceEvent));
-        WaitForSingleObject(m_FenceEvent, INFINITE);
-    }
-    m_Pfd->renderFinishedFenceValue++;
+    PerFrameData& frameData = GetCurrentFrameData();
+    WaitOnFence(frameData.frameFence, frameData.frameFenceValue);
 }
 
 void Renderer::SetBufferData(const ComPtr<ID3D12GraphicsCommandList7>& cmdList, const SharedPtr<Buffer>& buffer, const void* data, u32 sizeInBytes, u32 offsetInBytes) const
@@ -1216,6 +1319,7 @@ void Renderer::UploadTexture(const ComPtr<ID3D12GraphicsCommandList7>& cmdList, 
     D3D12MA::Allocation* allocation;
     ComPtr<ID3D12Resource> resource;
     IE_Check(m_Allocator->CreateResource(&textureAllocDesc, &textureDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, &allocation, IID_PPV_ARGS(&resource)));
+    resource->SetName(L"Texture");
 
     const D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
         .Format = format,
@@ -1254,10 +1358,18 @@ void Renderer::UploadTexture(const ComPtr<ID3D12GraphicsCommandList7>& cmdList, 
 
 D3D12_CPU_DESCRIPTOR_HANDLE Renderer::GetNewCBVSRVUAVHeapHandle()
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_CBVSRVUAVHeap->GetCPUDescriptorHandleForHeapStart();
-    srvHandle.ptr += m_CBVSRVUAVHeapLastIdx * m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = m_CBVSRVUAVHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += m_CBVSRVUAVHeapLastIdx * m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     m_CBVSRVUAVHeapLastIdx++;
-    return srvHandle;
+    return handle;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE Renderer::GetNewSamplerHeapHandle()
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = m_SamplerHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += m_SamplerHeapLastIdx * m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    m_SamplerHeapLastIdx++;
+    return handle;
 }
 
 void Renderer::Barrier(const ComPtr<ID3D12GraphicsCommandList7>& commandList, const ComPtr<ID3D12Resource>& resource, D3D12_RESOURCE_STATES stateBefore, D3D12_RESOURCE_STATES stateAfter)
