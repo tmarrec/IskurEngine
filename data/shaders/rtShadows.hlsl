@@ -3,27 +3,11 @@
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
 
-#include "data/shaders/common.hlsli"
+#include "data/shaders/Common.hlsli"
+#include "data/CPUGPU.h"
+#include "data/shaders/utils/ReconstructWorldPos.hlsli"
 
-RaytracingAccelerationStructure Scene : register(t0, space0);
-RWTexture2D<half> ShadowRenderTarget : register(u0);
-Texture2D<float> Depth : register(t1);
-SamplerState DepthSampler : register(s0);
-cbuffer RtRootConstants : register(b1)
-{
-    row_major float4x4 invViewProj;
-
-    float zNear;
-    float zFar;
-    float pad0;
-    uint resolutionType;
-
-    float3 sunDir;
-    uint frameIndex;
-
-    float3 cameraPos;
-    float pad1;
-};
+ConstantBuffer<RtShadowsTraceConstants> Constants : register(b0);
 
 static const uint invBayer2[4] = { 0, 3, 1, 2 };
 static const uint invBayer4[16] = { 0,10,2,8, 5,15,7,13, 1,11,3,9, 4,14,6,12 };
@@ -43,30 +27,20 @@ static const uint rtTileCount[4] =
     16  // quarter
 };
 
-struct RayPayload
+struct [raypayload] RayPayload
 {
-    uint hitCount;
+    uint hitCount : read(caller, closesthit) : write(caller, closesthit);
 };
-
-float3 ReconstructWorldPos(float2 uv)
-{
-    float d = Depth.SampleLevel(DepthSampler, uv, 0).r;
-    float2 ndc0  = uv * 2 - 1;
-    ndc0.y = -ndc0.y; // D3D
-    float4 clip0   = float4(ndc0, d, 1);
-    float4 worldH = mul(clip0, invViewProj);
-    return worldH.xyz / worldH.w;
-}
 
 void GetDitherOffset(out uint2 fullPxOut, out float2 fullDimInvOut)
 {
     uint2 px = DispatchRaysIndex().xy;
     float2 dim = DispatchRaysDimensions().xy;
 
-    uint2 factor = rtFactors[resolutionType];
-    uint tileCount = rtTileCount[resolutionType];
+    uint2 factor = rtFactors[Constants.resolutionType];
+    uint tileCount = rtTileCount[Constants.resolutionType];
 
-    uint slot = frameIndex % tileCount;
+    uint slot = Constants.frameIndex % tileCount;
 
     uint idx;
     if (tileCount < 4)
@@ -94,6 +68,9 @@ void GetDitherOffset(out uint2 fullPxOut, out float2 fullDimInvOut)
 [shader("raygeneration")]
 void Raygen()
 {
+    RaytracingAccelerationStructure scene = ResourceDescriptorHeap[Constants.tlasIndex];
+    RWTexture2D<half> output = ResourceDescriptorHeap[Constants.outputTextureIndex];
+
     uint2 fullPx;
     float2 fullDimInv;
     GetDitherOffset(fullPx, fullDimInv);
@@ -101,17 +78,20 @@ void Raygen()
     RayPayload payload = { 0 };
 
     float2 centerUV = (float2(fullPx) + 0.5f) * fullDimInv;
-    float3 worldPos = ReconstructWorldPos(centerUV);
+    Texture2D<float> depthTexture = ResourceDescriptorHeap[Constants.depthTextureIndex];
+    SamplerState depthSampler = SamplerDescriptorHeap[Constants.depthSamplerIndex];
+    float depth = depthTexture.Load(int3(fullPx, 0)).r;
+    float3 worldPos = ReconstructWorldPos(centerUV, depth, Constants.invViewProj);
 
     RayDesc ray;
-    ray.Origin = worldPos + normalize(cameraPos - worldPos) * 0.025;
-    ray.Direction = sunDir;
+    ray.Origin = worldPos + normalize(Constants.cameraPos - worldPos) * 0.025;
+    ray.Direction = -Constants.sunDir;
     ray.TMin = 0.01f;
     ray.TMax = 1e6f;
 
-    TraceRay(Scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, 0, 1, 0, ray, payload);
+    TraceRay(scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, 0, 1, 0, ray, payload);
 
-    ShadowRenderTarget[fullPx] = payload.hitCount;
+    output[fullPx] = half(payload.hitCount);
 }
 
 [shader("closesthit")]
@@ -120,7 +100,8 @@ void ClosestHit(inout RayPayload payload, in BuiltInTriangleIntersectionAttribut
     payload.hitCount++;
 }
 
-[shader("miss")] // todo no need?
+[shader("miss")]
 void Miss(inout RayPayload payload)
 {
+    // intentionally empty
 }

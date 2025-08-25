@@ -32,3 +32,9 @@ void Core::OnRender()
 {
     Renderer::GetInstance().Render();
 }
+
+void Core::OnTerminate()
+{
+    Renderer::GetInstance().Terminate();
+    Renderer::DestroyInstance();
+}

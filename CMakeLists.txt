@@ -3,124 +3,156 @@
 # Licensed under the MIT License.
 # See the LICENSE file in the project root for license information.
 
-cmake_minimum_required(VERSION 4.0.2)
+cmake_minimum_required(VERSION 4.1)
 project(IskurEngine LANGUAGES CXX)
 
-message(STATUS "Using toolchain: ${CMAKE_TOOLCHAIN_FILE}")
-message(STATUS "C++ compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
-
-# C++23
+# C++ Settings
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# -- Dependencies ----------------------------------------------------------------
-find_package(meshoptimizer CONFIG REQUIRED)
-find_package(d3d12-memory-allocator CONFIG REQUIRED)
-find_package(Catch2 CONFIG REQUIRED)
-find_package(directx-dxc CONFIG REQUIRED)
-find_package(directxmesh CONFIG REQUIRED)
+# Output directory for binaries and libraries
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+foreach(OUTPUTCONFIG Debug Release RelWithDebInfo MinSizeRel)
+    string(TOUPPER ${OUTPUTCONFIG} OUTPUTCONFIG_UPPER)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${OUTPUTCONFIG_UPPER} ${CMAKE_SOURCE_DIR}/bin/${OUTPUTCONFIG})
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${OUTPUTCONFIG_UPPER} ${CMAKE_SOURCE_DIR}/bin/${OUTPUTCONFIG})
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${OUTPUTCONFIG_UPPER} ${CMAKE_SOURCE_DIR}/bin/${OUTPUTCONFIG})
+endforeach()
 
-find_path(TINYGLTF_INCLUDE_DIR NAMES "tiny_gltf.h")
-find_path(D3DX12_INCLUDE_DIR NAMES "d3dx12.h")
+# DXC (DirectX Shader Compiler)
+set(DXC_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc_2025_07_14")
+set(DXC_BIN_DIR "${DXC_SDK_ROOT}/bin/x64")
 
-# wrap header-only libs
-add_library(tinygltf_hdr INTERFACE)
-target_include_directories(tinygltf_hdr INTERFACE ${TINYGLTF_INCLUDE_DIR})
+add_library(dxcompiler STATIC IMPORTED)
+set_target_properties(dxcompiler PROPERTIES
+  IMPORTED_LOCATION "${DXC_SDK_ROOT}/lib/x64/dxcompiler.lib"
+  INTERFACE_INCLUDE_DIRECTORIES "${DXC_SDK_ROOT}/inc"
+)
+set(DIRECTX_DXC_PATH "${DXC_BIN_DIR}" CACHE PATH "Directory containing dxc.exe")
 
-add_library(d3dx12_hdr INTERFACE)
-target_include_directories(d3dx12_hdr INTERFACE ${D3DX12_INCLUDE_DIR})
+# Third-Party Dependencies
+add_subdirectory(third_party/DirectX-Headers-1.616.0 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/meshoptimizer-0.24 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/D3D12MemoryAllocator-3.0.1 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/tinygltf-2.9.6 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/DirectXTex-jul2025 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/DirectXMesh-jul2025 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/Catch2-3.9.1 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/DirectXTK12-jul2025 EXCLUDE_FROM_ALL)
 
-# -- Common compile settings ----------------------------------------------------
-add_library(common_settings INTERFACE)
+set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui-1.92.1")
+add_library(imgui STATIC
+  ${IMGUI_DIR}/imgui.cpp
+  ${IMGUI_DIR}/imgui_draw.cpp
+  ${IMGUI_DIR}/imgui_tables.cpp
+  ${IMGUI_DIR}/imgui_widgets.cpp
+  ${IMGUI_DIR}/backends/imgui_impl_dx12.cpp
+  ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+)
+target_include_directories(imgui PUBLIC
+  "${IMGUI_DIR}"
+  "${IMGUI_DIR}/backends"
+)
+add_library(mikktspace STATIC third_party/MikkTSpace/mikktspace.c)
+target_include_directories(mikktspace PUBLIC third_party/MikkTSpace)
 
-target_compile_options(common_settings INTERFACE
-    /W3                             # Warning level 3
-    /EHs-c-                         # Disable exceptions
-    /utf-8                          # Treat sources as UTF-8
-    $<$<CONFIG:Release>:/O2>
-    $<$<CONFIG:Release>:/GL>
-    $<$<CONFIG:Release>:/arch:AVX2>
+# FidelityFX API (FSR2/3 + Frame-Generation)
+set(FFX_API_BACKEND "DX12_X64" CACHE STRING "" FORCE)
+add_subdirectory(third_party/FidelityFX-SDK-v1.1.4/ffx-api EXCLUDE_FROM_ALL)
+
+# Core Settings Target
+add_library(core_settings INTERFACE)
+target_compile_definitions(core_settings INTERFACE
+  _HAS_EXCEPTIONS=0
+  UNICODE
+  _UNICODE
+)
+target_link_libraries(core_settings INTERFACE
+  dxguid
+  d3d12
+  dxgi
+  meshoptimizer
+  D3D12MemoryAllocator
+  imgui
+  tinygltf
+  DirectXTex
+  DirectXMesh
+  DirectXTK12
+  dxcompiler
+  DirectX-Headers
+  amd_fidelityfx_dx12
+  mikktspace
+)
+target_include_directories(core_settings INTERFACE
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/FidelityFX-SDK-v1.1.4/sdk/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/data"
 )
 
-target_compile_definitions(common_settings INTERFACE
-_HAS_EXCEPTIONS=0 # Disable STL exceptions
-UNICODE
-_UNICODE
-)
-
-# Common libraries
-target_link_libraries(common_settings INTERFACE
-    meshoptimizer::meshoptimizer
-    unofficial::D3D12MemoryAllocator
-    dxguid
-    d3d12
-    dxgi
-    dxcompiler
-    Microsoft::DirectXMesh
-    tinygltf_hdr
-    d3dx12_hdr
-)
-
-# Precompiled header
+# Engine Core (Object Library)
 set(PCH_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/code/pch.h")
-
-# -- Engine Target ---------------------------------------------------------------
 file(GLOB_RECURSE ENGINE_SOURCES
-    code/*.cpp
-    code/*.h
-    code/*.natvis
+  code/*.cpp
+  code/*.h
+  code/*.natvis
+  data/*CPUGPU.h
 )
-# Remove anything inside code/unittests from ENGINE_SOURCES
 list(FILTER ENGINE_SOURCES EXCLUDE REGEX ".*/code/unittests/.*")
-add_executable(${PROJECT_NAME} ${ENGINE_SOURCES})
-target_precompile_headers(${PROJECT_NAME} PRIVATE ${PCH_HEADER})
+list(FILTER ENGINE_SOURCES EXCLUDE REGEX ".*/code/tools/.*")
+add_library(engine_core OBJECT ${ENGINE_SOURCES})
+target_precompile_headers(engine_core PRIVATE ${PCH_HEADER})
+target_link_libraries(engine_core PUBLIC core_settings)
 
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    common_settings
-)
- 
-set_target_properties(${PROJECT_NAME} PROPERTIES
-  WIN32_EXECUTABLE ON
-  LINK_FLAGS "/SUBSYSTEM:WINDOWS"
+# Engine Executable
+add_executable(${PROJECT_NAME} $<TARGET_OBJECTS:engine_core>)
+target_link_libraries(${PROJECT_NAME} PRIVATE core_settings)
+target_link_options(${PROJECT_NAME} PRIVATE "/SUBSYSTEM:WINDOWS")
+
+# Copy DXC runtime next to the exe
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+  COMMENT "Copying DXC runtime"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${DXC_BIN_DIR}"
+    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
 )
 
-# -- Unit Tests ------------------------------------------------------------------
+# Copy FidelityFX host DLL
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+  COMMENT "Copying FidelityFX host DLL"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:amd_fidelityfx_dx12>
+    $<TARGET_FILE_DIR:${PROJECT_NAME}>
+)
+
+# Unit Tests
 file(GLOB_RECURSE UNITTEST_SOURCES
-    ${ENGINE_SOURCES}
-    code/unittests/*.cpp
-    code/unittests/*.h
+  code/unittests/*.cpp
+  code/unittests/*.h
+)
+add_executable(${PROJECT_NAME}_tests
+  $<TARGET_OBJECTS:engine_core>
+  ${UNITTEST_SOURCES}
+)
+target_precompile_headers(${PROJECT_NAME}_tests PRIVATE ${PCH_HEADER})
+target_link_libraries(${PROJECT_NAME}_tests PRIVATE
+  core_settings
+  Catch2WithMain
 )
 
-add_executable(${PROJECT_NAME}_unittests ${UNITTEST_SOURCES})
-target_precompile_headers(${PROJECT_NAME}_unittests PRIVATE ${PCH_HEADER})
-
-target_link_libraries(${PROJECT_NAME}_unittests PRIVATE
-    common_settings
-    Catch2::Catch2WithMain
+# Iskur scene packer
+file(GLOB ISKUR_SCENE_GEN_SOURCES
+  code/tools/IskurScenePacker/*.cpp
+  code/tools/IskurScenePacker/*.h
 )
 
-# -- VS IntelliSense hack for clang-cl: add /I flags for all externals ---------
-if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    get_target_property(_incs1 meshoptimizer::meshoptimizer INTERFACE_INCLUDE_DIRECTORIES)
-    get_target_property(_incs2 unofficial::D3D12MemoryAllocator INTERFACE_INCLUDE_DIRECTORIES)
-    get_target_property(_incs3 Microsoft::DirectXMesh INTERFACE_INCLUDE_DIRECTORIES)
-    get_target_property(_incs4 Catch2::Catch2WithMain INTERFACE_INCLUDE_DIRECTORIES)
+add_executable(IskurScenePacker ${ISKUR_SCENE_GEN_SOURCES})
+target_link_libraries(IskurScenePacker PRIVATE
+  core_settings
+)
+target_link_options(IskurScenePacker PRIVATE "/SUBSYSTEM:CONSOLE")
 
-    set(_all_includes
-        ${TINYGLTF_INCLUDE_DIR}
-        ${D3DX12_INCLUDE_DIR}
-        ${_incs1}
-        ${_incs2}
-        ${_incs3}
-        ${_incs4}
-    )
-
-    foreach(_inc IN LISTS _all_includes)
-        target_compile_options(${PROJECT_NAME} PRIVATE "/I${_inc}")
-        target_compile_options(${PROJECT_NAME}_unittests PRIVATE "/I${_inc}")
-    endforeach()
-endif()
-
-
-# -- Visual Studio Startup --------------------------------------------------------
-set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
+# IDE Settings
+set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME}
+)

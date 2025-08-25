@@ -14,12 +14,13 @@ struct Node;
 class Mesh : public std::enable_shared_from_this<Mesh>
 {
   public:
-    Mesh(const SharedPtr<Node>& parentNode);
+    Mesh(const SharedPtr<Node>& parentNode, i32 meshIndex);
     void SetPrimitives(const tinygltf::Mesh& mesh);
     const Vector<SharedPtr<Primitive>>& GetPrimitives();
     float4x4 GetTransform() const;
 
   private:
     Vector<SharedPtr<Primitive>> m_Primitives;
-    SharedPtr<Node> m_ParentNode;
+    WeakPtr<Node> m_ParentNode;
+    i32 m_Index;
 };

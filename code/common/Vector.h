@@ -16,14 +16,14 @@ template <typename T> class Vector
 
     explicit Vector(u32 size) : m_Data(nullptr), m_Size(size), m_Capacity(size)
     {
-        m_Data = new T[m_Capacity];
+        m_Data = new T[m_Capacity]{};
     }
 
     Vector(const Vector& other)
     {
         m_Size = other.m_Size;
         m_Capacity = other.m_Capacity;
-        m_Data = new T[m_Capacity];
+        m_Data = new T[m_Capacity]{};
         for (u32 i = 0; i < m_Size; ++i)
         {
             m_Data[i] = other.m_Data[i];
@@ -32,7 +32,7 @@ template <typename T> class Vector
 
     Vector(std::initializer_list<T> initializerList) : m_Size(initializerList.size()), m_Capacity(initializerList.size())
     {
-        m_Data = new T[m_Capacity];
+        m_Data = new T[m_Capacity]{};
         u32 i = 0;
         for (const T& value : initializerList)
         {
@@ -47,7 +47,7 @@ template <typename T> class Vector
             delete[] m_Data;
             m_Size = other.m_Size;
             m_Capacity = other.m_Capacity;
-            m_Data = new T[m_Capacity];
+            m_Data = new T[m_Capacity]{};
             for (u32 i = 0; i < m_Size; ++i)
             {
                 m_Data[i] = other.m_Data[i];
@@ -83,6 +83,10 @@ template <typename T> class Vector
 
     ~Vector()
     {
+        for (u32 i = 0; i < m_Size; ++i)
+        {
+            m_Data[i] = T();
+        }
         delete[] m_Data;
     }
 
@@ -141,11 +145,30 @@ template <typename T> class Vector
         {
             Reallocate(newSize);
         }
+        if (newSize < m_Size)
+        {
+            for (u32 i = newSize; i < m_Size; ++i)
+            {
+                m_Data[i] = T(); // drop refs for removed elements
+            }
+        }
+        else if (newSize > m_Size)
+        {
+            for (u32 i = m_Size; i < newSize; ++i)
+            {
+                m_Data[i] = T(); // default-init new slots
+            }
+        }
         m_Size = newSize;
     }
 
     void Clear()
     {
+        // overwrite live elements so refs drop
+        for (u32 i = 0; i < m_Size; ++i)
+        {
+            m_Data[i] = T();
+        }
         m_Size = 0;
     }
 
@@ -203,10 +226,16 @@ template <typename T> class Vector
         return m_Data + m_Size;
     }
 
+    template <typename U, typename... Rest, std::enable_if_t<(sizeof...(Rest) > 0), int> = 0> Vector(U&& first, Rest&&... rest) : m_Data(nullptr), m_Size(0), m_Capacity(0)
+    {
+        AddElement(std::forward<U>(first));
+        (AddElement(std::forward<Rest>(rest)), ...);
+    }
+
   private:
     void Reallocate(u32 newCapacity)
     {
-        T* newData = new T[newCapacity];
+        T* newData = new T[newCapacity]{};
         for (u32 i = 0; i < m_Size; ++i)
         {
             newData[i] = m_Data[i];
@@ -214,6 +243,19 @@ template <typename T> class Vector
         delete[] m_Data;
         m_Data = newData;
         m_Capacity = newCapacity;
+    }
+
+    template <typename U> std::enable_if_t<std::is_same_v<std::decay_t<U>, Vector>, void> AddElement(U&& v)
+    {
+        for (auto& x : v)
+        {
+            Add(x);
+        }
+    }
+
+    template <typename U> std::enable_if_t<!std::is_same_v<std::decay_t<U>, Vector>, void> AddElement(U&& x)
+    {
+        Add(std::forward<U>(x));
     }
 
     T* m_Data;

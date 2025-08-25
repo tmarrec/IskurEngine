@@ -5,7 +5,6 @@
 
 #define CATCH_CONFIG_MAIN
 #define CATCH_CONFIG_DISABLE_EXCEPTIONS
-#include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <string>
 
@@ -110,63 +109,4 @@ TEST_CASE("WString basic operations", "[WString]")
         REQUIRE(a == WString(L"blabla"));
         REQUIRE(b == WString(L"hehe"));
     }
-}
-
-TEST_CASE("WString performance benchmarks", "[WString][benchmark]")
-{
-    BENCHMARK("Default construction")
-    {
-        return WString();
-    };
-
-    BENCHMARK("Construction from literal")
-    {
-        return WString(L"benchmark");
-    };
-
-    BENCHMARK("Append single chars 100 times")
-    {
-        WString s;
-        for (u8 i = 0; i < 100; ++i)
-        {
-            s.Append(L"x");
-        }
-        return s;
-    };
-
-    BENCHMARK("Reserve then append 100 chars")
-    {
-        WString s;
-        s.Reserve(1000);
-        for (u8 i = 0; i < 100; ++i)
-        {
-            s.Append(L"y");
-        }
-        return s;
-    };
-
-    BENCHMARK("Copy large string")
-    {
-        WString big;
-        for (u16 i = 0; i < 1000; ++i)
-        {
-            big.Append(L"z");
-        }
-        return WString(big);
-    };
-
-    BENCHMARK("Move large string")
-    {
-        WString big;
-        for (u16 i = 0; i < 1000; ++i)
-        {
-            big.Append(L"z");
-        }
-        return WString(std::move(big));
-    };
-
-    BENCHMARK("Concatenate two small WStrings")
-    {
-        return WString(L"blabla") + WString(L"hehe");
-    };
 }

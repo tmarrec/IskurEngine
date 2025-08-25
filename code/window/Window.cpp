@@ -7,6 +7,7 @@
 
 #include <bit>
 #include <chrono>
+#include <imgui_impl_win32.h>
 #include <windowsx.h>
 
 #include "../Core.h"
@@ -14,16 +15,25 @@
 #include "../common/Log.h"
 #include "../renderer/Camera.h"
 
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
 namespace
 {
 using namespace std::chrono;
 
-time_point<steady_clock> g_LastTime = high_resolution_clock::now();
-i32 g_FrameCount = 0;
+steady_clock::time_point g_LastFrameTime = steady_clock::now();
+steady_clock::time_point g_LastFpsTime = g_LastFrameTime;
+u32 g_FrameCount = 0;
+f32 g_FrameTimeMs = 0.0f;
 f32 g_Fps = 0.0f;
 
 LRESULT CALLBACK loc_WndProc(const HWND hWnd, const UINT msg, const WPARAM wParam, const LPARAM lParam)
 {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+    {
+        return true;
+    }
+
     const Window* window = std::bit_cast<const Window*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
     if (!window)
     {
@@ -35,6 +45,7 @@ LRESULT CALLBACK loc_WndProc(const HWND hWnd, const UINT msg, const WPARAM wPara
     switch (msg)
     {
     case WM_DESTROY:
+        Core::OnTerminate();
         PostQuitMessage(0);
         break;
 
@@ -70,15 +81,17 @@ LRESULT CALLBACK loc_WndProc(const HWND hWnd, const UINT msg, const WPARAM wPara
         return DefWindowProc(hWnd, msg, wParam, lParam);
     }
 
-    const time_point<steady_clock> currentTime = high_resolution_clock::now();
-    const duration<f32> elapsed = currentTime - g_LastTime;
+    const steady_clock::time_point now = steady_clock::now();
+    g_FrameTimeMs = std::chrono::duration<f32, std::milli>(now - g_LastFrameTime).count();
+    g_LastFrameTime = now;
+
     g_FrameCount++;
-    if (elapsed.count() >= 1.0f)
+    const f32 elapsedSec = std::chrono::duration<f32>(now - g_LastFpsTime).count();
+    if (elapsedSec >= 1.0f)
     {
-        g_Fps = static_cast<f32>(g_FrameCount) / elapsed.count();
+        g_Fps = static_cast<f32>(g_FrameCount) / elapsedSec;
         g_FrameCount = 0;
-        g_LastTime = currentTime;
-        IE_Log("FPS : {}", g_Fps);
+        g_LastFpsTime = now;
     }
 
     return 0;
@@ -181,4 +194,14 @@ f32 Window::GetAspectRatio() const
 bool Window::IsFullscreen() const
 {
     return m_Fullscreen;
+}
+
+f32 Window::GetFPS()
+{
+    return g_Fps;
+}
+
+f32 Window::GetFrameTimeMs()
+{
+    return g_FrameTimeMs;
 }

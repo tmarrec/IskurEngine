@@ -12,11 +12,15 @@ class Camera : public Singleton<Camera>
   public:
     void Init();
 
+    void LoadSceneConfig(const String& sceneName);
+
     void Update(f32 elapsedSeconds);
 
     float4x4 GetViewMatrix() const;
     float3 GetPosition() const;
     const float4x4& GetProjection() const;
+    const float4x4& GetProjectionNoJitter() const;
+    const float4x4& GetFrustumCullingProjection() const;
     float2 GetZNearFar() const;
 
     void OnKeyDown(u64 key);
@@ -27,10 +31,7 @@ class Camera : public Singleton<Camera>
 
     void HandleShowCursor() const;
 
-    void ConfigurePerspective(f32 aspectRatio, f32 yfov, f32 znear, f32 zfar);
-    void ConfigureOrthographic(f32 xmag, f32 ymag, f32 znear, f32 zfar);
-
-    float3 m_SunDir = {0.3f, 1.f, 0.75f};
+    void ConfigurePerspective(f32 aspectRatio, f32 yfov, f32 frustumCullingYfov, f32 znear, f32 jitterX, f32 jitterY);
 
   private:
     void SetFocus(bool value);
@@ -49,21 +50,11 @@ class Camera : public Singleton<Camera>
         bool escape = false;
     };
 
-    // BistroExterior.glb
     float3 m_Position = {-25.53637f, 3.5737517f, -3.990844f};
     f32 m_Yaw = 374.79907f;
     f32 m_Pitch = -4.89994f;
     float3 m_Front = {0.9632942f, -0.085415885f, 0.25449646f};
     f32 m_MoveSpeed = 10.f;
-
-    // chess.glb
-    /*
-    float3 m_Position = { 0.2979117f, 0.19526237f, 0.3732724f };
-    f32 m_Yaw = 229.19913f;
-    f32 m_Pitch = -22.099709f;
-    float3 m_Front = { -0.6054248f, -0.37621954f, -0.7013698f };
-    f32 m_MoveSpeed = 1.f;
-    */
 
     float3 m_Up = {0.f, 1.f, 0.f};
     f32 m_MouseSensitivity = 0.2f;
@@ -71,8 +62,10 @@ class Camera : public Singleton<Camera>
     float2 m_MouseOffset = {0.f, 0.f};
 
     float4x4 m_Projection = float4x4::Identity();
-    f32 m_Near = 0;
-    f32 m_Far = 0;
+    float4x4 m_ProjectionNoJitter = float4x4::Identity();
+    float2 m_ZNearFar = {0, 0};
+
+    float4x4 m_FrustumCullingProjection = float4x4::Identity();
 
     KeysPressed m_KeysPressed;
     bool m_IsFocused = false;

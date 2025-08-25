@@ -34,7 +34,7 @@ void GetPrimitiveRecursion(Vector<SharedPtr<Primitive>>& primitives, const Share
 }
 } // namespace
 
-World::World(const tinygltf::Model& model, const String& sceneFilename)
+World::World(const tinygltf::Model& model)
 {
     for (const tinygltf::Scene& scene : model.scenes)
     {
@@ -55,7 +55,7 @@ World::World(const tinygltf::Model& model, const String& sceneFilename)
     {
         primitiveIndices[i] = i;
     }
-    std::for_each(std::execution::par_unseq, primitiveIndices.begin(), primitiveIndices.end(), [&primitives, &model, &sceneFilename](u32 i) { primitives[i]->Process(model, sceneFilename); });
+    std::for_each(std::execution::par_unseq, primitiveIndices.begin(), primitiveIndices.end(), [&primitives](u32 i) { primitives[i]->Process(); });
 
     for (const tinygltf::Camera& camera : model.cameras)
     {
@@ -68,12 +68,11 @@ World::World(const tinygltf::Model& model, const String& sceneFilename)
         if (defaultCamera.type == "perspective")
         {
             Camera::GetInstance().ConfigurePerspective(static_cast<f32>(defaultCamera.perspective.aspectRatio), static_cast<f32>(defaultCamera.perspective.yfov),
-                                                       static_cast<f32>(defaultCamera.perspective.znear), static_cast<f32>(defaultCamera.perspective.zfar));
+                                                       static_cast<f32>(defaultCamera.perspective.yfov), static_cast<f32>(defaultCamera.perspective.znear), 0, 0);
         }
         else
         {
-            Camera::GetInstance().ConfigureOrthographic(static_cast<f32>(defaultCamera.orthographic.xmag), static_cast<f32>(defaultCamera.orthographic.ymag),
-                                                        static_cast<f32>(defaultCamera.orthographic.znear), static_cast<f32>(defaultCamera.orthographic.zfar));
+            IE_Assert(false); // not implemented!
         }
     }
 }
@@ -131,7 +130,7 @@ void World::InitNodes(const tinygltf::Model& model, Scene& scene, i32 nodeIndex,
             scale[2][2] = static_cast<f32>(node.scale[2]);
         }
 
-        nodeTransform = translation * rotation * scale;
+        nodeTransform = scale * rotation * translation;
     }
 
     const SharedPtr<Node> newNode = IE_MakeSharedPtr<Node>();
@@ -143,7 +142,7 @@ void World::InitNodes(const tinygltf::Model& model, Scene& scene, i32 nodeIndex,
     {
         const tinygltf::Mesh& mesh = model.meshes[node.mesh];
 
-        SharedPtr<Mesh> newMesh = IE_MakeSharedPtr<Mesh>(newNode);
+        SharedPtr<Mesh> newMesh = IE_MakeSharedPtr<Mesh>(newNode, node.mesh);
         newMesh->SetPrimitives(mesh);
         newNode->mesh = newMesh;
     }

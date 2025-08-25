@@ -6,7 +6,6 @@
 #define CATCH_CONFIG_MAIN
 #define CATCH_CONFIG_DISABLE_EXCEPTIONS
 #include <DirectXMath.h>
-#include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
@@ -97,11 +96,6 @@ TEST_CASE("float4x4 multiplication", "[float4x4]")
         REQUIRE_THAT(result[3][2], WithinAbs(444.0f, 1e-5f));
         REQUIRE_THAT(result[3][3], WithinAbs(386.0f, 1e-5f));
     }
-
-    BENCHMARK("Matrix multiplication operator")
-    {
-        return a * b;
-    };
 }
 
 TEST_CASE("float4x4 transposition", "[float4x4]")
@@ -132,11 +126,6 @@ TEST_CASE("float4x4 transposition", "[float4x4]")
         REQUIRE_THAT(result[3][2], WithinAbs(12.0f, 1e-5f));
         REQUIRE_THAT(result[3][3], WithinAbs(16.0f, 1e-5f));
     }
-
-    BENCHMARK("Transposition")
-    {
-        return m.Transposed();
-    };
 }
 
 TEST_CASE("Matrix perspective fov", "[float4x4]")
@@ -156,11 +145,6 @@ TEST_CASE("Matrix perspective fov", "[float4x4]")
             REQUIRE_THAT(value[i][3], WithinAbs(r.w, 1e-5f));
         }
     }
-
-    BENCHMARK("Perspective fov")
-    {
-        return float4x4::PerspectiveFovRH(3.14159265358979323846f / 3.0f, 2560.f / 1440.f, 0.1f, 100000.f);
-    };
 }
 
 TEST_CASE("Matrix perspective", "[float4x4]")
@@ -180,11 +164,6 @@ TEST_CASE("Matrix perspective", "[float4x4]")
             REQUIRE_THAT(value[i][3], WithinAbs(r.w, 1e-5f));
         }
     }
-
-    BENCHMARK("Orthographic")
-    {
-        return float4x4::OrthographicRH(3.14159265358979323846f / 3.0f, 2560.f / 1440.f, 0.1f, 100000.f);
-    };
 }
 
 TEST_CASE("Matrix LookAt", "[float4x4]")
@@ -208,9 +187,4 @@ TEST_CASE("Matrix LookAt", "[float4x4]")
             REQUIRE_THAT(value[i][3], WithinAbs(r.w, 1e-5f));
         }
     }
-
-    BENCHMARK("LookAt")
-    {
-        return float4x4::LookAtRH({32.0f, 128.0f, -512.0f}, {0, 0, 0}, {0, 1, 0});
-    };
 }

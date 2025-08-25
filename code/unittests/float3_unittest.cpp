@@ -5,7 +5,6 @@
 
 #define CATCH_CONFIG_MAIN
 #define CATCH_CONFIG_DISABLE_EXCEPTIONS
-#include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
@@ -53,18 +52,6 @@ TEST_CASE("float3 addition", "[float3]")
         REQUIRE_THAT(a.y, WithinAbs(7.0f, 1e-5f));
         REQUIRE_THAT(a.z, WithinAbs(9.0f, 1e-5f));
     }
-
-    BENCHMARK("Addition operator")
-    {
-        return a + b;
-    };
-
-    BENCHMARK("Addition-assignment operator")
-    {
-        float3 temp = a;
-        temp += b;
-        return temp;
-    };
 }
 
 TEST_CASE("float3 subtraction", "[float3]")
@@ -87,18 +74,6 @@ TEST_CASE("float3 subtraction", "[float3]")
         REQUIRE_THAT(a.y, WithinAbs(4.0f, 1e-5f));
         REQUIRE_THAT(a.z, WithinAbs(5.0f, 1e-5f));
     }
-
-    BENCHMARK("Subtraction operator")
-    {
-        return a - b;
-    };
-
-    BENCHMARK("Subtraction-assignment operator")
-    {
-        float3 temp = a;
-        temp -= b;
-        return temp;
-    };
 }
 
 TEST_CASE("float3 scalar multiplication", "[float3]")
@@ -121,18 +96,6 @@ TEST_CASE("float3 scalar multiplication", "[float3]")
         REQUIRE_THAT(a.y, WithinAbs(4.0f, 1e-5f));
         REQUIRE_THAT(a.z, WithinAbs(6.0f, 1e-5f));
     }
-
-    BENCHMARK("Scalar multiplication operator")
-    {
-        return a * scalar;
-    };
-
-    BENCHMARK("Scalar multiplication-assignment operator")
-    {
-        float3 temp = a;
-        temp *= scalar;
-        return temp;
-    };
 }
 
 TEST_CASE("float3 normalization", "[float3]")
@@ -156,11 +119,6 @@ TEST_CASE("float3 normalization", "[float3]")
         REQUIRE_THAT(normalized.z, WithinAbs(0.0f, 1e-5f));
     }
 
-    BENCHMARK("Normalization")
-    {
-        return a.Normalized();
-    };
-
     SECTION("Length and squared length are computed correctly")
     {
         float3 v(3.0f, 4.0f, 12.0f);
@@ -178,11 +136,6 @@ TEST_CASE("float3 dot product", "[float3]")
     {
         REQUIRE_THAT(float3::Dot(a, b), WithinAbs(32.0f, 1e-5f));
     }
-
-    BENCHMARK("Dot product")
-    {
-        return float3::Dot(a, b);
-    };
 }
 
 TEST_CASE("float3 cross product", "[float3]")
@@ -197,11 +150,6 @@ TEST_CASE("float3 cross product", "[float3]")
         REQUIRE_THAT(cross.y, WithinAbs(0.0f, 1e-5f));
         REQUIRE_THAT(cross.z, WithinAbs(1.0f, 1e-5f));
     }
-
-    BENCHMARK("Cross product")
-    {
-        return float3::Cross(a, b);
-    };
 }
 
 TEST_CASE("float3 unary negation", "[float3]")

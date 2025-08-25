@@ -15,17 +15,17 @@ LPCWSTR ToTargetName(const ShaderType type)
     switch (type)
     {
     case IE_SHADER_TYPE_VERTEX:
-        return L"vs_6_6";
+        return L"vs_6_7";
     case IE_SHADER_TYPE_PIXEL:
-        return L"ps_6_6";
+        return L"ps_6_7";
     case IE_SHADER_TYPE_COMPUTE:
         return L"cs_6_6";
     case IE_SHADER_TYPE_MESH:
-        return L"ms_6_6";
+        return L"ms_6_7";
     case IE_SHADER_TYPE_AMPLIFICATION:
-        return L"as_6_6";
+        return L"as_6_7";
     case IE_SHADER_TYPE_LIB:
-        return L"lib_6_6";
+        return L"lib_6_7";
     }
     return L"undefined";
 }
@@ -87,7 +87,7 @@ class IncludeHandler : public IDxcIncludeHandler
 };
 } // namespace
 
-IDxcBlob* CompileShader(ShaderType type, const WString& filename, const Vector<WString>& extraArguments)
+ComPtr<IDxcBlob> CompileShader(ShaderType type, const WString& filename, const Vector<WString>& extraArguments)
 {
     IDxcLibrary* library;
     IE_Check(DxcCreateInstance(CLSID_DxcLibrary, IID_PPV_ARGS(&library)));
@@ -133,6 +133,8 @@ IDxcBlob* CompileShader(ShaderType type, const WString& filename, const Vector<W
     {
         arguments.Add(extraArg.Data());
     }
+    arguments.Add(L"-enable-16bit-types");
+    arguments.Add(L"-Zpr");
 
     IncludeHandler includeHandler;
     IDxcResult* compileResult;

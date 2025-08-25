@@ -7,16 +7,18 @@
 
 #include "Node.h"
 
-Mesh::Mesh(const SharedPtr<Node>& parentNode)
+Mesh::Mesh(const SharedPtr<Node>& parentNode, i32 meshIndex)
 {
     m_ParentNode = parentNode;
+    m_Index = meshIndex;
 }
 
 void Mesh::SetPrimitives(const tinygltf::Mesh& mesh)
 {
-    for (const tinygltf::Primitive& gltfPrimitive : mesh.primitives)
+    for (u32 i = 0; i < mesh.primitives.size(); ++i)
     {
-        SharedPtr<Primitive> primitive = IE_MakeSharedPtr<Primitive>(gltfPrimitive, shared_from_this());
+        const tinygltf::Primitive& gltfPrimitive = mesh.primitives[i];
+        SharedPtr<Primitive> primitive = IE_MakeSharedPtr<Primitive>(gltfPrimitive, shared_from_this(), m_Index, i);
         m_Primitives.Add(primitive);
     }
 }
@@ -29,11 +31,11 @@ const Vector<SharedPtr<Primitive>>& Mesh::GetPrimitives()
 float4x4 Mesh::GetTransform() const
 {
     float4x4 transform = float4x4::Identity();
-    SharedPtr<Node> parentNode = m_ParentNode;
+    SharedPtr<Node> parentNode = m_ParentNode.lock();
     while (parentNode)
     {
-        transform = transform * parentNode->localTransform;
-        parentNode = parentNode->parentNode;
+        transform = parentNode->localTransform * transform;
+        parentNode = parentNode->parentNode.lock();
     }
     return transform;
 }

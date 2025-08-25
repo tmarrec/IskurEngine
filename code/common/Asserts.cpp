@@ -7,9 +7,9 @@
 
 #include "Log.h"
 
-void IE_Assert(bool assert)
+void IE_Assert(bool condition)
 {
-    if (!assert)
+    if (!condition)
     {
         abort();
     }

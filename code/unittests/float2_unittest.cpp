@@ -5,7 +5,6 @@
 
 #define CATCH_CONFIG_MAIN
 #define CATCH_CONFIG_DISABLE_EXCEPTIONS
-#include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
@@ -49,18 +48,6 @@ TEST_CASE("float2 addition", "[float2]")
         REQUIRE_THAT(a.x, WithinAbs(4.0f, 1e-5f));
         REQUIRE_THAT(a.y, WithinAbs(6.0f, 1e-5f));
     }
-
-    BENCHMARK("Addition operator")
-    {
-        return a + b;
-    };
-
-    BENCHMARK("Addition-assignment operator")
-    {
-        float2 temp = a;
-        temp += b;
-        return temp;
-    };
 }
 
 TEST_CASE("float2 subtraction", "[float2]")
@@ -81,18 +68,6 @@ TEST_CASE("float2 subtraction", "[float2]")
         REQUIRE_THAT(a.x, WithinAbs(3.0f, 1e-5f));
         REQUIRE_THAT(a.y, WithinAbs(4.0f, 1e-5f));
     }
-
-    BENCHMARK("Subtraction operator")
-    {
-        return a - b;
-    };
-
-    BENCHMARK("Subtraction-assignment operator")
-    {
-        float2 temp = a;
-        temp -= b;
-        return temp;
-    };
 }
 
 TEST_CASE("float2 scalar multiplication", "[float2]")
@@ -113,18 +88,6 @@ TEST_CASE("float2 scalar multiplication", "[float2]")
         REQUIRE_THAT(a.x, WithinAbs(2.0f, 1e-5f));
         REQUIRE_THAT(a.y, WithinAbs(4.0f, 1e-5f));
     }
-
-    BENCHMARK("Scalar multiplication operator")
-    {
-        return a * scalar;
-    };
-
-    BENCHMARK("Scalar multiplication-assignment operator")
-    {
-        float2 temp = a;
-        temp *= scalar;
-        return temp;
-    };
 }
 
 TEST_CASE("float2 normalization", "[float2]")
@@ -145,11 +108,6 @@ TEST_CASE("float2 normalization", "[float2]")
         REQUIRE_THAT(normalized.x, WithinAbs(0.0f, 1e-5f));
         REQUIRE_THAT(normalized.y, WithinAbs(0.0f, 1e-5f));
     }
-
-    BENCHMARK("Normalization")
-    {
-        return a.Normalized();
-    };
 }
 
 TEST_CASE("float2 dot product", "[float2]")
@@ -161,11 +119,6 @@ TEST_CASE("float2 dot product", "[float2]")
     {
         REQUIRE_THAT(float2::Dot(a, b), WithinAbs(11.0f, 1e-5f));
     }
-
-    BENCHMARK("Dot product")
-    {
-        return float2::Dot(a, b);
-    };
 }
 
 TEST_CASE("float2 unary negation", "[float2]")

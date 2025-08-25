@@ -5,12 +5,89 @@
 
 #include "Camera.h"
 
+#include "../common/Asserts.h"
 #include "../window/Window.h"
+
+#include <DirectXMath.h>
 
 void Camera::Init()
 {
     const f32 aspectRatio = Window::GetInstance().GetAspectRatio();
-    ConfigurePerspective(aspectRatio, IE_PI_4, 0.01f, 1000.f);
+    ConfigurePerspective(aspectRatio, IE_PI_4, IE_PI_4, 0.01f, 0, 0);
+}
+
+void Camera::LoadSceneConfig(const String& sceneName)
+{
+    if (sceneName == "Bistro")
+    {
+        m_Position = {-17.504068, 6.6169343, -0.6422801};
+        m_Yaw = 360.59894;
+        m_Pitch = -14.899944;
+        m_Front = {0.96632355, -0.2571319, 0.010101734};
+    }
+    else if (sceneName == "Sponza")
+    {
+        m_Position = {-6.7842293, 2.0273955, -1.6356962};
+        m_Yaw = 393.5991;
+        m_Pitch = -2.6999128;
+        m_Front = {0.8320053, -0.04710493, 0.55276424};
+    }
+    else if (sceneName == "Sponza2")
+    {
+        m_Position = {12.435444, 1.1098297, -0.71890974};
+        m_Yaw = 532.3988;
+        m_Pitch = 12.500055;
+        m_Front = {-0.96771693, 0.21644057, 0.12914129};
+    }
+    else if (sceneName == "San-Miguel")
+    {
+        m_Position = {20.144629, 11.589096, 5.851092};
+        m_Yaw = 208.59715;
+        m_Pitch = -34.299847;
+        m_Front = {-0.7253213, -0.5635238, -0.39541113};
+    }
+    else if (sceneName == "AlphaBlendModeTest")
+    {
+        m_Position = {-0.04540815, 2.3986704, 4.6940866};
+        m_Yaw = 270.3981;
+        m_Pitch = -11.699936;
+        m_Front = {0.00680406, -0.20278622, -0.9791994};
+    }
+    else if (sceneName == "NormalTangentTest" || sceneName == "NormalTangentMirrorTest")
+    {
+        m_Position = {0.014327605, 0.088846914, 2.6952298};
+        m_Yaw = 270.79776;
+        m_Pitch = -2.6999424;
+        m_Front = {0.013907751, -0.04710545, -0.9987931};
+    }
+    else if (sceneName == "MetalRoughSpheres" || sceneName == "MetalRoughSpheresNoTextures")
+    {
+        m_Position = {0.28876197, 0.8269017, 10.415524};
+        m_Yaw = 270.1988;
+        m_Pitch = -4.8999395;
+        m_Front = {0.0034567926, -0.08541588, -0.9963394};
+    }
+    else if (sceneName == "DamagedHelmet")
+    {
+        m_Position = {-1.2710273, 1.1039577, 1.8417152};
+        m_Yaw = 303.39874;
+        m_Pitch = -26.899942;
+        m_Front = {0.49090138, -0.45243382, -0.7445263};
+    }
+    else if (sceneName == "SSAO")
+    {
+        m_Position = {1.1467777, -0.1576769, 2.5923784};
+        m_Yaw = 251.5986;
+        m_Pitch = -29.49994;
+        m_Front = {-0.27474692, -0.49242267, -0.8258535};
+    }
+    else if (sceneName == "ABeautifulGame")
+    {
+        m_Position = {-13.332466, 6.18413, -1.7803445};
+        m_Yaw = 373.19904;
+        m_Pitch = -27.699947;
+        m_Front = {0.8620044, -0.46484122, 0.2021658};
+    }
 }
 
 void Camera::Update(f32 elapsedSeconds)
@@ -97,9 +174,19 @@ const float4x4& Camera::GetProjection() const
     return m_Projection;
 }
 
+const float4x4& Camera::GetProjectionNoJitter() const
+{
+    return m_ProjectionNoJitter;
+}
+
+const float4x4& Camera::GetFrustumCullingProjection() const
+{
+    return m_FrustumCullingProjection;
+}
+
 float2 Camera::GetZNearFar() const
 {
-    return {m_Near, m_Far};
+    return m_ZNearFar;
 }
 
 void Camera::OnKeyDown(u64 key)
@@ -225,18 +312,25 @@ void Camera::HandleShowCursor() const
     }
 }
 
-void Camera::ConfigurePerspective(f32 aspectRatio, f32 yfov, f32 znear, f32 zfar)
+void Camera::ConfigurePerspective(f32 aspectRatio, f32 yfov, f32 frustumCullingYfov, f32 znear, f32 jitterX, f32 jitterY)
 {
-    m_Projection = float4x4::PerspectiveFovRH(yfov, aspectRatio, znear, zfar);
-    m_Near = znear;
-    m_Far = zfar;
-}
+    const f32 f = 1.0f / tanf(yfov * 0.5f);
+    const f32 fC = 1.0f / tanf(frustumCullingYfov * 0.5f);
 
-void Camera::ConfigureOrthographic(f32 xmag, f32 ymag, f32 znear, f32 zfar)
-{
-    m_Projection = float4x4::OrthographicRH(xmag, ymag, znear, zfar);
-    m_Near = znear;
-    m_Far = zfar;
+    const float4 col0 = {f / aspectRatio, 0, 0, 0};
+    const float4 col1 = {0, f, 0, 0};
+    const float4 col2 = {0, 0, 0, -1};
+
+    const float4 col3_noj = {0, 0, znear, 0};
+    const float4 col3_jit = {jitterX, jitterY, znear, 0};
+
+    m_ProjectionNoJitter = {col0, col1, col2, col3_noj};
+    m_Projection = {col0, col1, col2, col3_jit};
+
+    const float4 col3C_noj = {0, 0, znear, 0};
+    m_FrustumCullingProjection = {{fC / aspectRatio, 0, 0, 0}, {0, fC, 0, 0}, {0, 0, 0, -1}, col3C_noj};
+
+    m_ZNearFar = {znear, FLT_MAX};
 }
 
 void Camera::SetFocus(bool value)

@@ -10,8 +10,11 @@
 struct CommandLineArguments
 {
     String sceneFile;
+    bool gpuValidation = false;
 };
 
 void ProcessCommandLineArguments(i32 argc, char** argv);
 
 const CommandLineArguments& GetCommandLineArguments();
+
+WString GetWindowTitle();

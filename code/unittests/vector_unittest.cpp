@@ -5,7 +5,6 @@
 
 #define CATCH_CONFIG_MAIN
 #define CATCH_CONFIG_DISABLE_EXCEPTIONS
-#include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include "../common/Vector.h"
@@ -134,44 +133,4 @@ TEST_CASE("Vector<int> basic operations", "[Vector]")
         }
         REQUIRE(sum == 14);
     }
-}
-
-TEST_CASE("Vector<int> performance benchmarks", "[Vector][benchmark]")
-{
-    BENCHMARK("Default construction")
-    {
-        return Vector<int>();
-    };
-
-    BENCHMARK("Push back 1000 ints")
-    {
-        Vector<int> v;
-        for (u16 i = 0; i < 1000; ++i)
-        {
-            v.Add(i);
-        }
-        return v;
-    };
-
-    BENCHMARK("Copy large vector")
-    {
-        Vector<int> big;
-        big.Resize(2000);
-        for (u32 i = 0; i < big.Size(); ++i)
-        {
-            big[i] = static_cast<int>(i);
-        }
-        return Vector<int>(big);
-    };
-
-    BENCHMARK("Move large vector")
-    {
-        Vector<int> big;
-        big.Resize(2000);
-        for (u32 i = 0; i < big.Size(); ++i)
-        {
-            big[i] = static_cast<int>(i);
-        }
-        return Vector<int>(std::move(big));
-    };
 }

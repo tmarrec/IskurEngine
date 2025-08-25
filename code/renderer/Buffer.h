@@ -12,7 +12,9 @@
 
 struct Buffer
 {
+    ComPtr<D3D12MA::Allocation> allocation;
     ComPtr<ID3D12Resource> buffer;
-    D3D12_CPU_DESCRIPTOR_HANDLE srvHandle;
-    u32 index = 0;
+    u32 srvIndex = 0;
+    u32 uavIndex = 0;
+    u32 numElements = 0;
 };

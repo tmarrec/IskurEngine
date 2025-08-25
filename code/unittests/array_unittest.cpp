@@ -5,7 +5,6 @@
 
 #define CATCH_CONFIG_MAIN
 #define CATCH_CONFIG_DISABLE_EXCEPTIONS
-#include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include "../common/Array.h"
@@ -58,32 +57,4 @@ TEST_CASE("Array<i32, 5> basic operations", "[Array]")
         }
         REQUIRE(sum == 5);
     }
-}
-
-TEST_CASE("Array<i32, 100> performance benchmarks", "[Array][benchmark]")
-{
-    BENCHMARK("Default construction")
-    {
-        return Array<i32, 100>();
-    };
-
-    BENCHMARK("Copy construction")
-    {
-        Array<i32, 100> src;
-        for (u32 i = 0; i < src.Size(); ++i)
-        {
-            src[i] = static_cast<i32>(i);
-        }
-        return Array<i32, 100>(src);
-    };
-
-    BENCHMARK("Move construction")
-    {
-        Array<i32, 100> src;
-        for (u32 i = 0; i < src.Size(); ++i)
-        {
-            src[i] = static_cast<i32>(i);
-        }
-        return Array<i32, 100>(std::move(src));
-    };
 }

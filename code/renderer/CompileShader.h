@@ -6,6 +6,14 @@
 #pragma once
 #include <dxcapi.h>
 
-#include "Shader.h"
+enum ShaderType : u8
+{
+    IE_SHADER_TYPE_VERTEX,
+    IE_SHADER_TYPE_PIXEL,
+    IE_SHADER_TYPE_COMPUTE,
+    IE_SHADER_TYPE_MESH,
+    IE_SHADER_TYPE_AMPLIFICATION,
+    IE_SHADER_TYPE_LIB
+};
 
-IDxcBlob* CompileShader(ShaderType type, const WString& filename, const Vector<WString>& extraArguments = {});
+ComPtr<IDxcBlob> CompileShader(ShaderType type, const WString& filename, const Vector<WString>& extraArguments = {});

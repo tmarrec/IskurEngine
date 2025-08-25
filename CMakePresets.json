@@ -1,17 +1,13 @@
 {
   "version": 10,
   "configurePresets": [
-    {
-      "name": "default",
-      "generator": "Visual Studio 17 2022",
-      "architecture": {
-        "value": "x64"
-      },
-      "toolset": "ClangCL",
-      "binaryDir": "${sourceDir}/build",
-      "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
-      }
-    }
+	{
+	  "name": "default",
+	  "generator": "Visual Studio 17 2022",
+	  "architecture": {
+		"value": "x64"
+	  },
+	  "binaryDir": "${sourceDir}/build"
+	}
   ]
 }

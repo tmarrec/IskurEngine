@@ -5,7 +5,6 @@
 
 #define CATCH_CONFIG_MAIN
 #define CATCH_CONFIG_DISABLE_EXCEPTIONS
-#include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <string>
 
@@ -111,63 +110,4 @@ TEST_CASE("String basic operations", "[String]")
         REQUIRE(a == String("blabla"));
         REQUIRE(b == String("hehe"));
     }
-}
-
-TEST_CASE("String performance benchmarks", "[String][benchmark]")
-{
-    BENCHMARK("Default construction")
-    {
-        return String();
-    };
-
-    BENCHMARK("Construction from literal")
-    {
-        return String("benchmark");
-    };
-
-    BENCHMARK("Append single characters 100 times")
-    {
-        String s;
-        for (u8 i = 0; i < 100; ++i)
-        {
-            s.Append("x");
-        }
-        return s;
-    };
-
-    BENCHMARK("Reserve then append 100 chars")
-    {
-        String s;
-        s.Reserve(1000);
-        for (u8 i = 0; i < 100; ++i)
-        {
-            s.Append("y");
-        }
-        return s;
-    };
-
-    BENCHMARK("Copy large string")
-    {
-        String big;
-        for (u16 i = 0; i < 1000; ++i)
-        {
-            big.Append("z");
-        }
-        return String(big);
-    };
-
-    BENCHMARK("Move large string")
-    {
-        String big;
-        for (u16 i = 0; i < 1000; ++i)
-        {
-            big.Append("z");
-        }
-        return String(std::move(big));
-    };
-
-    BENCHMARK("Concatenate two small strings")
-    {
-        return String("blabla") + String("hehe");
-    };
 }

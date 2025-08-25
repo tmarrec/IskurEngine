@@ -8,6 +8,6 @@
 #define NOMINMAX
 #include <Windows.h>
 
-void IE_Assert(bool assert);
+void IE_Assert(bool condition);
 
 void IE_Check(HRESULT hr);

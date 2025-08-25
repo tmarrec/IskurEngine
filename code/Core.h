@@ -13,4 +13,5 @@ class Core
     static void OnInit();
     static void OnUpdate();
     static void OnRender();
+    static void OnTerminate();
 };

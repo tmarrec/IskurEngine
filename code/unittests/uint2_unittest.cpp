@@ -5,7 +5,6 @@
 
 #define CATCH_CONFIG_MAIN
 #define CATCH_CONFIG_DISABLE_EXCEPTIONS
-#include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <limits>
 
@@ -46,11 +45,6 @@ TEST_CASE("uint2 addition", "[uint2]")
         REQUIRE(a.x == 4u);
         REQUIRE(a.y == 6u);
     }
-
-    BENCHMARK("uint2 Addition operator")
-    {
-        return a + b;
-    };
 }
 
 TEST_CASE("uint2 subtraction", "[uint2]")
@@ -71,11 +65,6 @@ TEST_CASE("uint2 subtraction", "[uint2]")
         REQUIRE(a.x == 2u);
         REQUIRE(a.y == 3u);
     }
-
-    BENCHMARK("uint2 Subtraction operator")
-    {
-        return a - b;
-    };
 }
 
 TEST_CASE("uint2 unary negation", "[uint2]")
@@ -87,12 +76,6 @@ TEST_CASE("uint2 unary negation", "[uint2]")
         REQUIRE(neg.x == static_cast<unsigned int>(-static_cast<int>(1)));
         REQUIRE(neg.y == static_cast<unsigned int>(-static_cast<int>(2)));
     }
-
-    BENCHMARK("uint2 Unary negation")
-    {
-        uint2 a(1, 2);
-        return -a;
-    };
 }
 
 TEST_CASE("uint2 scalar multiplication", "[uint2]")
@@ -113,11 +96,6 @@ TEST_CASE("uint2 scalar multiplication", "[uint2]")
         REQUIRE(a.x == 10u);
         REQUIRE(a.y == 15u);
     }
-
-    BENCHMARK("uint2 Scalar multiplication operator")
-    {
-        return a * scalar;
-    };
 }
 
 TEST_CASE("uint2 scalar division", "[uint2]")
@@ -141,9 +119,4 @@ TEST_CASE("uint2 scalar division", "[uint2]")
         REQUIRE(a.x == 5u);
         REQUIRE(a.y == 10u);
     }
-
-    BENCHMARK("uint2 Scalar division operator")
-    {
-        return a / scalar;
-    };
 }

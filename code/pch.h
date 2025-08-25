@@ -20,6 +20,7 @@
 
 #include "common/math/float2.h"
 #include "common/math/float3.h"
+#include "common/math/float3x3.h"
 #include "common/math/float4.h"
 #include "common/math/float4x4.h"
 #include "common/math/uint2.h"

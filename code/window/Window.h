@@ -36,6 +36,9 @@ class Window : public Singleton<Window>
 
     bool IsFullscreen() const;
 
+    static f32 GetFPS();
+    static f32 GetFrameTimeMs();
+
   private:
     HINSTANCE m_Hinstance = nullptr;
     HWND m_Hwnd = nullptr;
