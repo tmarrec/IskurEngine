@@ -10,11 +10,11 @@
 
 #include <format>
 
-#include "String.h"
+#include "Types.h"
 
 static void IE_Log(const String& msg)
 {
-    OutputDebugStringA(msg.Data());
+    OutputDebugStringA(msg.data());
     OutputDebugStringA("\n");
 }
 
@@ -27,7 +27,7 @@ template <typename... Args> static void IE_Log(std::format_string<Args...> fmt, 
 static void IE_Error(const String& msg)
 {
     OutputDebugStringA("Error: ");
-    OutputDebugStringA(msg.Data());
+    OutputDebugStringA(msg.data());
     OutputDebugStringA("\n");
 }
 

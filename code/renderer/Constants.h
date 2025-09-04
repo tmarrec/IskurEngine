@@ -6,7 +6,7 @@
 #pragma once
 
 #include "common/Types.h"
-#include "ffx_api/ffx_upscale.h"
+#include "ffx_upscale.hpp"
 
 namespace IE_Constants
 {

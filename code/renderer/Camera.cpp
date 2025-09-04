@@ -5,8 +5,8 @@
 
 #include "Camera.h"
 
-#include "../common/Asserts.h"
-#include "../window/Window.h"
+#include "common/Asserts.h"
+#include "window/Window.h"
 
 #include <DirectXMath.h>
 
@@ -104,31 +104,37 @@ void Camera::Update(f32 elapsedSeconds)
 
     f32 moveMultiplier = 1.f;
 
-    float3 move;
+    XMVECTOR move = XMVectorZero();
+
+    XMVECTOR front = XMLoadFloat3(&m_Front);
+    XMVECTOR up = XMLoadFloat3(&m_Up);
+    XMVECTOR right = XMVector3Normalize(XMVector3Cross(front, up));
+
     if (m_KeysPressed.w)
     {
-        move += m_Front;
+        move = XMVectorAdd(move, front);
     }
     if (m_KeysPressed.s)
     {
-        move -= m_Front;
+        move = XMVectorSubtract(move, front);
     }
     if (m_KeysPressed.a)
     {
-        move -= float3::Cross(m_Front, m_Up).Normalized();
+        move = XMVectorSubtract(move, right);
     }
     if (m_KeysPressed.d)
     {
-        move += float3::Cross(m_Front, m_Up).Normalized();
+        move = XMVectorAdd(move, right);
     }
     if (m_KeysPressed.e)
     {
-        move += {0, 1, 0};
+        move = XMVectorAdd(move, XMVectorSet(0.f, 1.f, 0.f, 0.f));
     }
     if (m_KeysPressed.q)
     {
-        move += {0, -1, 0};
+        move = XMVectorAdd(move, XMVectorSet(0.f, -1.f, 0.f, 0.f));
     }
+
     if (m_KeysPressed.leftShift)
     {
         moveMultiplier *= 4.f;
@@ -138,27 +144,43 @@ void Camera::Update(f32 elapsedSeconds)
         moveMultiplier *= 0.25f;
     }
 
-    m_Position += move * m_MoveSpeed * moveMultiplier * elapsedSeconds;
+    float scale = m_MoveSpeed * moveMultiplier * elapsedSeconds;
+    XMVECTOR pos = XMLoadFloat3(&m_Position);
+    pos = XMVectorAdd(pos, XMVectorScale(move, scale));
+    XMStoreFloat3(&m_Position, pos);
 
     if (m_MouseOffset.x != 0.0f || m_MouseOffset.y != 0.0f)
     {
         m_Yaw += m_MouseOffset.x * m_MouseSensitivity;
         m_Pitch = IE_Clamp(m_Pitch - m_MouseOffset.y * m_MouseSensitivity, -89.9f, 89.9f);
 
-        const float3 dir = float3(cosf(IE_ToRadians(m_Yaw)) * cosf(IE_ToRadians(m_Pitch)), sinf(IE_ToRadians(m_Pitch)), sinf(IE_ToRadians(m_Yaw)) * cosf(IE_ToRadians(m_Pitch))).Normalized();
-        m_Front = dir;
+        float yawRad = IE_ToRadians(m_Yaw);
+        float pitchRad = IE_ToRadians(m_Pitch);
+
+        float cx = cosf(yawRad) * cosf(pitchRad);
+        float cy = sinf(pitchRad);
+        float cz = sinf(yawRad) * cosf(pitchRad);
+
+        XMVECTOR dir = XMVector3Normalize(XMVectorSet(cx, cy, cz, 0.0f));
+        XMStoreFloat3(&m_Front, dir);
     }
 
     m_MouseOffset.x = 0.0f;
     m_MouseOffset.y = 0.0f;
 }
 
-float4x4 Camera::GetViewMatrix() const
+XMFLOAT4X4 Camera::GetViewMatrix() const
 {
-    return float4x4::LookAtRH(m_Position, m_Position + m_Front, m_Up);
+    XMVECTOR pos = XMLoadFloat3(&m_Position);
+    XMVECTOR dir = XMLoadFloat3(&m_Front);
+    XMVECTOR up = XMLoadFloat3(&m_Up);
+    XMMATRIX view = XMMatrixLookToRH(pos, dir, up);
+    XMFLOAT4X4 out;
+    XMStoreFloat4x4(&out, view);
+    return out;
 }
 
-float3 Camera::GetPosition() const
+XMFLOAT3 Camera::GetPosition() const
 {
     /*
     IE_Log("position: {} {} {}", m_Position.x, m_Position.y, m_Position.z);
@@ -169,22 +191,22 @@ float3 Camera::GetPosition() const
     return m_Position;
 }
 
-const float4x4& Camera::GetProjection() const
+const XMFLOAT4X4& Camera::GetProjection() const
 {
     return m_Projection;
 }
 
-const float4x4& Camera::GetProjectionNoJitter() const
+const XMFLOAT4X4& Camera::GetProjectionNoJitter() const
 {
     return m_ProjectionNoJitter;
 }
 
-const float4x4& Camera::GetFrustumCullingProjection() const
+const XMFLOAT4X4& Camera::GetFrustumCullingProjection() const
 {
     return m_FrustumCullingProjection;
 }
 
-float2 Camera::GetZNearFar() const
+XMFLOAT2 Camera::GetZNearFar() const
 {
     return m_ZNearFar;
 }
@@ -314,23 +336,18 @@ void Camera::HandleShowCursor() const
 
 void Camera::ConfigurePerspective(f32 aspectRatio, f32 yfov, f32 frustumCullingYfov, f32 znear, f32 jitterX, f32 jitterY)
 {
-    const f32 f = 1.0f / tanf(yfov * 0.5f);
-    const f32 fC = 1.0f / tanf(frustumCullingYfov * 0.5f);
+    float f = 1.0f / tanf(yfov * 0.5f);
+    float fC = 1.0f / tanf(frustumCullingYfov * 0.5f);
 
-    const float4 col0 = {f / aspectRatio, 0, 0, 0};
-    const float4 col1 = {0, f, 0, 0};
-    const float4 col2 = {0, 0, 0, -1};
+    XMMATRIX P_jit = XMMatrixSet(f / aspectRatio, 0.f, 0.f, 0.f, 0.f, f, 0.f, 0.f, 0.f, 0.f, 0.f, -1.f, jitterX, jitterY, znear, 0.f);
+    XMMATRIX P_noj = XMMatrixSet(f / aspectRatio, 0.f, 0.f, 0.f, 0.f, f, 0.f, 0.f, 0.f, 0.f, 0.f, -1.f, 0.f, 0.f, znear, 0.f);
+    XMMATRIX P_cull = XMMatrixSet(fC / aspectRatio, 0.f, 0.f, 0.f, 0.f, fC, 0.f, 0.f, 0.f, 0.f, 0.f, -1.f, 0.f, 0.f, znear, 0.f);
 
-    const float4 col3_noj = {0, 0, znear, 0};
-    const float4 col3_jit = {jitterX, jitterY, znear, 0};
+    XMStoreFloat4x4(&m_Projection, P_jit);
+    XMStoreFloat4x4(&m_ProjectionNoJitter, P_noj);
+    XMStoreFloat4x4(&m_FrustumCullingProjection, P_cull);
 
-    m_ProjectionNoJitter = {col0, col1, col2, col3_noj};
-    m_Projection = {col0, col1, col2, col3_jit};
-
-    const float4 col3C_noj = {0, 0, znear, 0};
-    m_FrustumCullingProjection = {{fC / aspectRatio, 0, 0, 0}, {0, fC, 0, 0}, {0, 0, 0, -1}, col3C_noj};
-
-    m_ZNearFar = {znear, FLT_MAX};
+    m_ZNearFar = XMFLOAT2(znear, FLT_MAX);
 }
 
 void Camera::SetFocus(bool value)

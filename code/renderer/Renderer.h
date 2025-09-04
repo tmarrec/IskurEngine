@@ -8,40 +8,53 @@
 #include <D3D12MemAlloc.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <ffx_api.hpp>
 #include <pix.h>
 
-#include "AlphaMode.h"
 #include "BindlessHeaps.h"
 #include "Buffer.h"
+#include "CPUGPU.h"
 #include "CompileShader.h"
 #include "Constants.h"
+#include "GpuTimings.h"
 #include "Shader.h"
-#include "World.h"
 
-#include "../common/Singleton.h"
-#include "ffx_api/ffx_api.hpp"
+#include "common/Singleton.h"
 
-enum class RayTracingResolution : u32
+#include <common/IskurPackFormat.h>
+
+enum AlphaMode : u32
 {
-    Full = 0,        // Full resolution (x, y)
-    FullX_HalfY = 1, // Full resolution in x, half resolution in y
-    Half = 2,        // Both x and y at half resolution
-    Quarter = 3      // Both x and y at quarter resolution
+    AlphaMode_Opaque,
+    AlphaMode_Blend,
+    AlphaMode_Mask,
+
+    AlphaMode_Count,
+};
+
+enum CullMode : u32
+{
+    CullMode_Back,
+    CullMode_None,
+
+    CullMode_Count
 };
 
 struct GBuffer
 {
-    static constexpr u32 targetCount = 4;
+    static constexpr u32 targetCount = 5;
 
     ComPtr<ID3D12Resource> albedo;
     ComPtr<ID3D12Resource> normal;
     ComPtr<ID3D12Resource> material;
     ComPtr<ID3D12Resource> motionVector;
+    ComPtr<ID3D12Resource> ao;
 
     u32 albedoIndex = UINT32_MAX;
     u32 normalIndex = UINT32_MAX;
     u32 materialIndex = UINT32_MAX;
     u32 motionVectorIndex = UINT32_MAX;
+    u32 aoIndex = UINT32_MAX;
 
     ComPtr<ID3D12DescriptorHeap> rtvHeap;
 };
@@ -68,20 +81,6 @@ class Renderer : public Singleton<Renderer>
     void AllocateUploadBuffer(const void* pData, u32 sizeInBytes, u32 offsetInBytes, ComPtr<ID3D12Resource>& resource, ComPtr<D3D12MA::Allocation>& allocation, const wchar_t* resourceName) const;
     void AllocateUAVBuffer(u32 sizeInBytes, ComPtr<ID3D12Resource>& resource, ComPtr<D3D12MA::Allocation>& allocation, D3D12_RESOURCE_STATES initialResourceState, const wchar_t* resourceName) const;
 
-    struct GpuTimers
-    {
-        ComPtr<ID3D12QueryHeap> heap;
-        ComPtr<ID3D12Resource> readback;
-        u32 nextIdx;
-        struct Pass
-        {
-            const char* name;
-            u32 idxBegin;
-            u32 idxEnd;
-            f64 ms;
-        } passes[128];
-        u32 passCount;
-    };
     struct PerFrameData
     {
         ComPtr<ID3D12CommandAllocator> commandAllocator;
@@ -106,7 +105,6 @@ class Renderer : public Singleton<Renderer>
     void SetRenderAndPresentSize();
 
     void CreateGPUTimers();
-    void CollectGpuTimings(PerFrameData& frameData);
 
     void CreateFSRPassResources();
     void CreateDepthPrePassResources(const Vector<WString>& globalDefines);
@@ -115,8 +113,6 @@ class Renderer : public Singleton<Renderer>
     void CreateHistogramPassResources(const Vector<WString>& globalDefines);
     void CreateToneMapPassResources(const Vector<WString>& globalDefines);
     void CreateSSAOResources(const Vector<WString>& globalDefines);
-
-    void SetupImGui();
 
     void LoadScene();
 
@@ -148,15 +144,10 @@ class Renderer : public Singleton<Renderer>
     D3D12_VIEWPORT m_PresentViewport = {0, 0, 0, 0, 0, 0};
     D3D12_RECT m_PresentRect = {0, 0, 0, 0};
 
-    float3 m_SunDir = {0.3f, 1.f, 0.75f};
+    XMFLOAT3 m_SunDir = {0.3f, 1.f, 0.75f};
 
     Vector<Material> m_Materials;
     SharedPtr<Buffer> m_MaterialsBuffer;
-
-    SharedPtr<World> m_World;
-
-    Array<Array<Vector<SharedPtr<Primitive>>, 2>, AlphaMode_Count> m_PrimitivesPerAlphaMode; // not really safe but good enough for now
-    Vector<SharedPtr<Primitive>> m_Primitives;                                               // not really safe but good enough for now
 
     u32 m_LinearSamplerIdx = UINT_MAX;
 
@@ -188,10 +179,11 @@ class Renderer : public Singleton<Renderer>
     u32 m_SrvTempIdx = UINT32_MAX;
     u32 m_UavTempIdx = UINT32_MAX;
 
-    Array<u32, IE_Constants::frameInFlightCount> m_HDRSrvIdx = {UINT32_MAX};
-
     Array<GBuffer, IE_Constants::frameInFlightCount> m_GBuffers = {};
     Array<Array<D3D12_CPU_DESCRIPTOR_HANDLE, GBuffer::targetCount>, IE_Constants::frameInFlightCount> m_GBuffersRTV = {};
+
+    Array<D3D12_RESOURCE_STATES, IE_Constants::frameInFlightCount> m_FsrOutputState = {D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
 
     struct InFlightUpload
     {
@@ -201,7 +193,7 @@ class Renderer : public Singleton<Renderer>
     Vector<InFlightUpload> m_InFlightUploads;
     Vector<ComPtr<ID3D12Resource>> m_Textures;
 
-    float4x4 m_LastViewProjNoJ;
+    XMFLOAT4X4 m_LastViewProjNoJ;
 
     // Cube map
     ComPtr<ID3D12Resource> m_EnvCubeMap;
@@ -214,26 +206,23 @@ class Renderer : public Singleton<Renderer>
     u32 m_BrdfLUTIdx = UINT32_MAX;
 
     // Depth pre pass
-    ComPtr<ID3D12PipelineState> m_DepthPrePassOpaquePSO;
-    ComPtr<ID3D12PipelineState> m_DepthPrePassOpaquePSO_NoCull;
+    Array<ComPtr<ID3D12PipelineState>, CullMode_Count> m_DepthPrePassOpaquePSO;
     ComPtr<ID3D12RootSignature> m_DepthPrePassOpaqueRootSig;
+    Array<ComPtr<ID3D12PipelineState>, CullMode_Count> m_DepthPrePassAlphaTestPSO;
+    ComPtr<ID3D12RootSignature> m_DepthPrePassAlphaTestRootSig;
     Array<ComPtr<D3D12MA::Allocation>, IE_Constants::frameInFlightCount> m_DSVsAllocations;
     Array<ComPtr<ID3D12Resource>, IE_Constants::frameInFlightCount> m_DSVs;
     ComPtr<ID3D12DescriptorHeap> m_DSVsHeap;
     Array<D3D12_CPU_DESCRIPTOR_HANDLE, IE_Constants::frameInFlightCount> m_DSVsHandle;
     Array<u32, IE_Constants::frameInFlightCount> m_DSVsIdx = {UINT32_MAX};
     Shader m_DepthPrePassAlphaTestShader;
-    ComPtr<ID3D12PipelineState> m_DepthPrePassAlphaTestPSO;
-    ComPtr<ID3D12PipelineState> m_DepthPrePassAlphaTestPSO_NoCull;
-    ComPtr<ID3D12RootSignature> m_DepthPrePassAlphaTestRootSig;
 
     // GBuffer pass
     Shader m_AmplificationShader;
     Shader m_MeshShader;
     Array<Shader, AlphaMode_Count> m_PixelShader;
 
-    // one face culled and the other double sided
-    Array<Array<ComPtr<ID3D12PipelineState>, 2>, AlphaMode_Count> m_GBufferPassPSOs;
+    Array<Array<ComPtr<ID3D12PipelineState>, CullMode_Count>, AlphaMode_Count> m_GBufferPassPSOs;
     Array<ComPtr<ID3D12RootSignature>, AlphaMode_Count> m_GBufferPassRootSigs;
 
     // Lighting pass
@@ -273,12 +262,12 @@ class Renderer : public Singleton<Renderer>
 
     // FSR
     ffx::Context m_UpscalingContext;
-    i32 m_JitterPhaseCount;
-    i32 m_JitterIndex;
-    f32 m_JitterX;
-    f32 m_JitterY;
-    uint2 m_RenderSize;
-    uint2 m_PresentSize;
+    i32 m_JitterPhaseCount = 0;
+    i32 m_JitterIndex = 0;
+    f32 m_JitterX = 0.0f;
+    f32 m_JitterY = 0.0f;
+    XMUINT2 m_RenderSize;
+    XMUINT2 m_PresentSize;
     Array<ComPtr<ID3D12Resource>, IE_Constants::frameInFlightCount> m_FsrOutputs;
     Array<u32, IE_Constants::frameInFlightCount> m_FsrSrvIdx;
 
@@ -292,40 +281,44 @@ class Renderer : public Singleton<Renderer>
     ComPtr<ID3D12RootSignature> m_SSAORootSig;
     ComPtr<ID3D12PipelineState> m_SSAOPso;
 
-    // Timings
-    u64 m_TimestampFrequency = 0;
-    struct TimDisp
+    GpuTimingState m_GpuTimingState{};
+
+    //
+    Vector<u32> m_TxhdToSrv;  // TXHD index -> SRV index
+    Vector<u32> m_SampToHeap; // SAMP index -> sampler heap index
+
+    struct GpuPrim
     {
-        const char* name;
-        f64 ms;
-    } m_LastGpuTimings[128];
-    u32 m_LastGpuTimingCount = 0;
-    struct TimingSmoother
-    {
-        const char* name = nullptr; // expected to be a stable literal
-        double value = 0.0;
-        bool initialized = false;
+        u32 materialIdx = 0;
+
+        // GPU buffers (bindless indices)
+        SharedPtr<Buffer> vertices; // stride sizeof(Vertex)
+        SharedPtr<Buffer> meshlets; // bytes
+        SharedPtr<Buffer> mlVerts;  // u32
+        SharedPtr<Buffer> mlTris;   // bytes
+        SharedPtr<Buffer> mlBounds; // sizeof(meshopt_Bounds)
+
+        u32 meshletCount = 0;
+
+        // (For ray tracing build)
+        const Vertex* cpuVertices = nullptr;
+        u32 vertexCount = 0;
+        const u32* cpuIndices = nullptr;
+        u32 indexCount = 0;
+
+        // BLAS resources
+        ComPtr<ID3D12Resource> blas;
+        ComPtr<D3D12MA::Allocation> blasAlloc;
+        ComPtr<ID3D12Resource> scratch;
+        ComPtr<D3D12MA::Allocation> scratchAlloc;
+
+        // temp upload for RT (optional to keep around)
+        ComPtr<ID3D12Resource> rtVB;
+        ComPtr<D3D12MA::Allocation> rtVBAlloc;
+        ComPtr<ID3D12Resource> rtIB;
+        ComPtr<D3D12MA::Allocation> rtIBAlloc;
     };
-    void UpdateGpuTimingAverages(float dtMs);
-    TimingSmoother m_GpuTimingSmooth[128] = {};
-    u32 m_GpuTimingSmoothCount = 0;
+
+    Vector<GpuPrim> m_Primitives;
+    Vector<IEPack::DrawItem> m_Draw[AlphaMode_Count][CullMode_Count];
 };
-
-static void GPU_MARKER_BEGIN(const ComPtr<ID3D12GraphicsCommandList7>& cmd, Renderer::PerFrameData& frameData, const char* name)
-{
-    PIXBeginEvent(cmd.Get(), 0, name);
-
-    u32 pi = frameData.gpuTimers.passCount++;
-    frameData.gpuTimers.passes[pi].name = name;
-    frameData.gpuTimers.passes[pi].idxBegin = frameData.gpuTimers.nextIdx++;
-    cmd->EndQuery(frameData.gpuTimers.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameData.gpuTimers.passes[pi].idxBegin);
-}
-
-static void GPU_MARKER_END(const ComPtr<ID3D12GraphicsCommandList7>& cmd, Renderer::PerFrameData& frameData)
-{
-    Renderer::GpuTimers::Pass& p = frameData.gpuTimers.passes[frameData.gpuTimers.passCount - 1];
-    p.idxEnd = frameData.gpuTimers.nextIdx++;
-    cmd->EndQuery(frameData.gpuTimers.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, p.idxEnd);
-
-    PIXEndEvent(cmd.Get());
-}

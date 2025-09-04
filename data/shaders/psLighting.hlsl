@@ -130,7 +130,7 @@ float3 ComputeDirect(ShadingParams sp)
     return (diffuse + specular) * sp.cosL * sunRadiance;
 }
 
-float3 ComputeIBL(ShadingParams sp, float vis, SamplerState samp)
+float3 ComputeIBL(ShadingParams sp, float vis, SamplerState samp, float aoFactor)
 {
     TextureCube<half4> diffuseIBL = ResourceDescriptorHeap[C.diffuseIBLIndex];
     TextureCube<float4> specularIBL = ResourceDescriptorHeap[C.specularIBLIndex];
@@ -141,13 +141,17 @@ float3 ComputeIBL(ShadingParams sp, float vis, SamplerState samp)
 
     // Fetch maps
     float3 irr = diffuseIBL.Sample(samp, RotateEnv(sp.N)).rgb;
-    float3 pre = specularIBL.SampleLevel(samp, RotateEnv(sp.Lr), sp.roughness * specularLevel).rgb;
+    float lodMax = max(0.0, (float) specularLevel - 1.0);
+    float lod = saturate(sp.roughness) * lodMax;
+    float3 pre = specularIBL.SampleLevel(samp, RotateEnv(sp.Lr), lod).rgb;
     float2 brdf = brdfLUT.Sample(samp, float2(sp.cosV, sp.roughness)).rg;
 
-    float3 F = FresnelSchlick(sp.F0, sp.cosV);
-    float3 kd = lerp(1.0 - F, 0.0, sp.metalness);
+    // For IBL diffuse, use angle-independent Fresnel (1 - F0)
+    float3 kd = lerp(1.0 - sp.F0, 0.0, sp.metalness);
 
     float3 diff = kd * sp.albedo * irr * C.IBLDiffuseIntensity;
+    // Apply AO (material AO/SSAO) to diffuse only
+    diff *= aoFactor;
     float3 spec = (sp.F0 * brdf.x + brdf.y) * pre * C.IBLSpecularIntensity;
 
     // Shadow-strength remap
@@ -184,11 +188,15 @@ float4 main(VSOut input) : SV_TARGET
     float vis = ComputeVis(px);
     ShadingParams sp = Gather(px, world);
     float3 direct = ComputeDirect(sp) * clamp(vis, 0.0, 1.0);
-    float3 ambient = ComputeIBL(sp, vis, samp);
 
+    // GBuffer AO and SSAO
+    Texture2D<float> aoTex = ResourceDescriptorHeap[C.aoTextureIndex];
+    float ao = aoTex.Load(int3(px, 0));
     Texture2D<float> ssaoTex = ResourceDescriptorHeap[C.ssaoTextureIndex];
-    float4 ao = ssaoTex.Load(int3(px, 0));
-    ambient *= ao.x;
+    float ssao = ssaoTex.Load(int3(px, 0));
+    float aoCombined = min(ao, ssao);
+
+    float3 ambient = ComputeIBL(sp, vis, samp, aoCombined);
 
     float3 light = direct + ambient;
 

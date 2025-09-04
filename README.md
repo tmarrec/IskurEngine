@@ -50,7 +50,6 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
 
 ## Dependencies
 
-- [Catch2](https://github.com/catchorg/Catch2)
 - [D3D12 Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/D3D12MemoryAllocator)
 - [DirectX 12](https://learn.microsoft.com/en-us/windows/win32/direct3d12/direct3d-12-graphics)
 - [DirectX-Headers](https://github.com/microsoft/DirectX-Headers)
@@ -77,16 +76,16 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
 
 1. **Clone Repository**
 
-   ```bash
-   git clone https://github.com/tmarrec/IskurEngine.git
-   cd IskurEngine
-   ```
+  ```bash
+  git clone https://github.com/tmarrec/IskurEngine.git
+  cd IskurEngine
+  ```
 
 2. **Generate Project Files**
 
    Execute the provided batch script to generate the Visual Studio solution:
 
-   ```bash
+  ```bash
    build.bat
    ```
 
@@ -104,21 +103,18 @@ You can specify which scene to load at startup using the `--scene` argument. For
 IskurEngine.exe --scene San-Miguel
 ```
 
-## Scene Packer (GLB to DDS + .iskurpack)
+## Scene Packer (GLB to .iskurpack)
 glTF scenes need to be packed using **IskurScenePacker**; it compresses textures and prepares geometry.
 
-Each scene’s .glb file needs to be placed at `data/scenes/<SceneName>/<SceneName>.glb`.
+Place your source `.glb` files in `data/scenes_sources/<SceneName>.glb`.
+Running the packer will generate `data/scenes/<SceneName>.iskurpack`, which the engine loads at runtime.
 
-**Usage**
-```bash
-IskurScenePacker --input <scene> [--fast] [--textures-only | --meshes-only | --skip-textures | --skip-meshes]
-IskurScenePacker --all [--fast] [--textures-only | --meshes-only | --skip-textures | --skip-meshes]
-```
-**Examples**
+Typical usage:
 ```bash
 IskurScenePacker --input San-Miguel --fast
 IskurScenePacker --all --fast
 ```
+
 ## License
 
 Iškur Engine is licensed under the MIT License. See [LICENSE](LICENSE) for more information.

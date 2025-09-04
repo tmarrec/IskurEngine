@@ -53,7 +53,7 @@ VertexOut GetVertexAttributes(uint meshletIndex, uint vertexIndex)
     float3x3 W = (float3x3)Constants.world;
     float3x3 WIT = (float3x3)Constants.worldIT;
 
-    float3 Nw = normalize(mul(v.normal,  WIT));
+    float3 Nw = normalize(mul(WIT, v.normal));
     float3 Tt = mul(v.tangent.xyz,  W);
     float3 Tw = normalize(Tt - Nw * dot(Tt, Nw));
 
@@ -92,7 +92,6 @@ void main(
     
     static const uint MESHLET_BYTE_SIZE = 12;
     ByteAddressBuffer meshletsRaw = ResourceDescriptorHeap[Constants.meshletsBufferIndex];
-    uint byteOffset = meshletIndex * MESHLET_BYTE_SIZE;
     uint3 meshletRaw = meshletsRaw.Load3(meshletIndex * MESHLET_BYTE_SIZE);
 
     uint vertexOffset = meshletRaw.x;

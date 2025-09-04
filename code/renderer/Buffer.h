@@ -8,7 +8,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
-#include "../common/Types.h"
+#include "common/Types.h"
 
 struct Buffer
 {

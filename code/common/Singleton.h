@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "Types.h"
+
 template <typename T> class Singleton
 {
   public:

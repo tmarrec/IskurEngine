@@ -10,10 +10,10 @@
 #include <imgui_impl_win32.h>
 #include <windowsx.h>
 
-#include "../Core.h"
-#include "../common/Asserts.h"
-#include "../common/Log.h"
-#include "../renderer/Camera.h"
+#include "Core.h"
+#include "common/Asserts.h"
+#include "common/Log.h"
+#include "renderer/Camera.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -101,8 +101,8 @@ LRESULT CALLBACK loc_WndProc(const HWND hWnd, const UINT msg, const WPARAM wPara
 void Window::Run(const RunInfo& runInfo)
 {
     m_Fullscreen = runInfo.fullscreen;
-    m_Name = runInfo.name.Data();
-    m_Title = runInfo.title.Data();
+    m_Name = runInfo.name.data();
+    m_Title = runInfo.title.data();
     m_Resolution = runInfo.resolution;
     m_Hinstance = runInfo.hInstance;
 
@@ -181,7 +181,7 @@ const HWND& Window::GetHwnd() const
     return m_Hwnd;
 }
 
-const uint2& Window::GetResolution() const
+const XMUINT2& Window::GetResolution() const
 {
     return m_Resolution;
 }

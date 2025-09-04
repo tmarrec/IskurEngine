@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "../common/Singleton.h"
+#include "common/Singleton.h"
 
 class Camera : public Singleton<Camera>
 {
@@ -16,12 +16,12 @@ class Camera : public Singleton<Camera>
 
     void Update(f32 elapsedSeconds);
 
-    float4x4 GetViewMatrix() const;
-    float3 GetPosition() const;
-    const float4x4& GetProjection() const;
-    const float4x4& GetProjectionNoJitter() const;
-    const float4x4& GetFrustumCullingProjection() const;
-    float2 GetZNearFar() const;
+    XMFLOAT4X4 GetViewMatrix() const;
+    XMFLOAT3 GetPosition() const;
+    const XMFLOAT4X4& GetProjection() const;
+    const XMFLOAT4X4& GetProjectionNoJitter() const;
+    const XMFLOAT4X4& GetFrustumCullingProjection() const;
+    XMFLOAT2 GetZNearFar() const;
 
     void OnKeyDown(u64 key);
     void OnKeyUp(u64 key);
@@ -50,22 +50,22 @@ class Camera : public Singleton<Camera>
         bool escape = false;
     };
 
-    float3 m_Position = {-25.53637f, 3.5737517f, -3.990844f};
+    XMFLOAT3 m_Position = {-25.53637f, 3.5737517f, -3.990844f};
     f32 m_Yaw = 374.79907f;
     f32 m_Pitch = -4.89994f;
-    float3 m_Front = {0.9632942f, -0.085415885f, 0.25449646f};
+    XMFLOAT3 m_Front = {0.9632942f, -0.085415885f, 0.25449646f};
     f32 m_MoveSpeed = 10.f;
 
-    float3 m_Up = {0.f, 1.f, 0.f};
+    XMFLOAT3 m_Up = {0.f, 1.f, 0.f};
     f32 m_MouseSensitivity = 0.2f;
 
-    float2 m_MouseOffset = {0.f, 0.f};
+    XMFLOAT2 m_MouseOffset = {0.f, 0.f};
 
-    float4x4 m_Projection = float4x4::Identity();
-    float4x4 m_ProjectionNoJitter = float4x4::Identity();
-    float2 m_ZNearFar = {0, 0};
+    XMFLOAT4X4 m_Projection = {};
+    XMFLOAT4X4 m_ProjectionNoJitter = {};
+    XMFLOAT2 m_ZNearFar = {0, 0};
 
-    float4x4 m_FrustumCullingProjection = float4x4::Identity();
+    XMFLOAT4X4 m_FrustumCullingProjection = {};
 
     KeysPressed m_KeysPressed;
     bool m_IsFocused = false;

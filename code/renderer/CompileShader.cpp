@@ -5,8 +5,10 @@
 
 #include "CompileShader.h"
 
-#include "../common/Asserts.h"
-#include "../common/Log.h"
+#include "common/Asserts.h"
+#include "common/Log.h"
+
+#include <algorithm>
 
 namespace
 {
@@ -49,18 +51,21 @@ class IncludeHandler : public IDxcIncludeHandler
         }
 
         IDxcBlobEncoding* pEncoding;
-        if (m_IncludedFiles.Find(pFilename))
+        for (const WString& includedFile : m_IncludedFiles)
         {
-            constexpr char nullStr[] = " ";
-            IE_Check(m_Utils->CreateBlobFromPinned(nullStr, ARRAYSIZE(nullStr), DXC_CP_ACP, &pEncoding));
-            *ppIncludeSource = pEncoding;
-            return S_OK;
+            if (includedFile == pFilename)
+            {
+                constexpr char nullStr[] = " ";
+                IE_Check(m_Utils->CreateBlobFromPinned(nullStr, ARRAYSIZE(nullStr), DXC_CP_ACP, &pEncoding));
+                *ppIncludeSource = pEncoding;
+                return S_OK;
+            }
         }
 
         const HRESULT hr = m_Utils->LoadFile(pFilename, nullptr, &pEncoding);
         if (SUCCEEDED(hr))
         {
-            m_IncludedFiles.Add(pFilename);
+            m_IncludedFiles.push_back(pFilename);
             *ppIncludeSource = pEncoding;
         }
         return hr;
@@ -101,7 +106,7 @@ ComPtr<IDxcBlob> CompileShader(ShaderType type, const WString& filename, const V
     IDxcBlobEncoding* sourceBlob;
 
     const WString shaderPath = L"data/shaders/" + filename;
-    IE_Check(library->CreateBlobFromFile(shaderPath.Data(), &codePage, &sourceBlob));
+    IE_Check(library->CreateBlobFromFile(shaderPath.data(), &codePage, &sourceBlob));
     IE_Assert(sourceBlob);
 
     const DxcBuffer sourceBuffer = {
@@ -112,7 +117,7 @@ ComPtr<IDxcBlob> CompileShader(ShaderType type, const WString& filename, const V
 
     // Add arguments
     Vector<LPCWSTR> arguments;
-    arguments.Add(filename.Data());
+    arguments.push_back(filename.data());
     switch (type)
     {
     case IE_SHADER_TYPE_AMPLIFICATION:
@@ -120,25 +125,25 @@ ComPtr<IDxcBlob> CompileShader(ShaderType type, const WString& filename, const V
     case IE_SHADER_TYPE_PIXEL:
     case IE_SHADER_TYPE_VERTEX:
     case IE_SHADER_TYPE_COMPUTE:
-        arguments.Add(L"-E");
-        arguments.Add(L"main");
+        arguments.push_back(L"-E");
+        arguments.push_back(L"main");
         break;
     case IE_SHADER_TYPE_LIB:
         break;
     }
-    arguments.Add(L"-T");
-    arguments.Add(ToTargetName(type));
-    arguments.Add(L"-I shaders");
+    arguments.push_back(L"-T");
+    arguments.push_back(ToTargetName(type));
+    arguments.push_back(L"-I shaders");
     for (const WString& extraArg : extraArguments)
     {
-        arguments.Add(extraArg.Data());
+        arguments.push_back(extraArg.data());
     }
-    arguments.Add(L"-enable-16bit-types");
-    arguments.Add(L"-Zpr");
+    arguments.push_back(L"-enable-16bit-types");
+    arguments.push_back(L"-Zpr");
 
     IncludeHandler includeHandler;
     IDxcResult* compileResult;
-    IE_Check(compiler->Compile(&sourceBuffer, arguments.Data(), arguments.Size(), &includeHandler, IID_PPV_ARGS(&compileResult)));
+    IE_Check(compiler->Compile(&sourceBuffer, arguments.data(), arguments.size(), &includeHandler, IID_PPV_ARGS(&compileResult)));
     IE_Assert(compileResult);
 
     IDxcBlobUtf8* errors;

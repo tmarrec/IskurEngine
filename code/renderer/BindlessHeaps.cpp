@@ -5,7 +5,7 @@
 
 #include "BindlessHeaps.h"
 
-#include "../common/Asserts.h"
+#include "common/Asserts.h"
 
 void BindlessHeaps::Init(const ComPtr<ID3D12Device14>& device)
 {

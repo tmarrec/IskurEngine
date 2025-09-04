@@ -4,6 +4,7 @@
 // See the LICENSE file in the project root for license information.
 
 #pragma once
+
 #include <dxcapi.h>
 
 enum ShaderType : u8

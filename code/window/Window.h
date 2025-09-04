@@ -8,8 +8,8 @@
 #define NOMINMAX
 #include <Windows.h>
 
-#include "../common/Singleton.h"
-#include "../common/Types.h"
+#include "common/Singleton.h"
+#include "common/Types.h"
 
 class Core;
 
@@ -18,7 +18,7 @@ class Window : public Singleton<Window>
   public:
     struct RunInfo
     {
-        uint2 resolution;
+        XMUINT2 resolution;
         WString name;
         WString title;
         bool fullscreen;
@@ -31,7 +31,7 @@ class Window : public Singleton<Window>
 
     const HINSTANCE& GetHinstance() const;
     const HWND& GetHwnd() const;
-    const uint2& GetResolution() const;
+    const XMUINT2& GetResolution() const;
     f32 GetAspectRatio() const;
 
     bool IsFullscreen() const;
@@ -45,7 +45,7 @@ class Window : public Singleton<Window>
 
     LPCWSTR m_Name = L"undefined";
     LPCWSTR m_Title = L"undefined";
-    uint2 m_Resolution = {1, 1};
+    XMUINT2 m_Resolution = {1, 1};
     f32 m_AspectRatio = 1;
 
     bool m_Fullscreen = false;

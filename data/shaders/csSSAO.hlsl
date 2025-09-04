@@ -11,25 +11,36 @@ ConstantBuffer<SSAOConstants> Constants : register(b0);
 #define ROOT_SIG "RootFlags( CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED ), \
                   RootConstants(num32BitConstants=58, b0)"
 
-static const int sampleCount = 32;
-static const float3 SSAOKernel[32] = {
-    float3( 0.2024, -0.0815,  0.0312), float3(-0.0758, -0.1956,  0.0205),
-    float3(-0.0884,  0.2946,  0.0647), float3( 0.3185, -0.2533,  0.0896),
-    float3(-0.4002,  0.1394,  0.1578), float3( 0.1292,  0.4756,  0.1823),
-    float3( 0.5923, -0.3129,  0.3254), float3(-0.2045, -0.6233,  0.2896),
-    float3(-0.7854,  0.2146,  0.4123), float3( 0.3865,  0.7429,  0.4534),
-    float3( 0.2547, -0.8965,  0.5234), float3(-0.6754, -0.5023,  0.3865),
-    float3( 0.9254,  0.1865,  0.6234), float3(-0.4123,  0.8956,  0.5896),
-    float3(-0.3685, -0.9234,  0.6425), float3( 0.7854, -0.6123,  0.4896),
-    float3( 0.0451,  0.0892,  0.7854), float3(-0.1254, -0.0685,  0.8234),
-    float3( 0.0896,  0.2045,  0.9123), float3(-0.2234,  0.1685,  0.8756),
-    float3( 0.1854, -0.2896,  0.9456), float3(-0.3254, -0.1896,  0.9234),
-    float3( 0.2685,  0.3854,  0.8965), float3(-0.4123,  0.2896,  0.8234),
-    float3( 0.3896, -0.4523,  0.7854), float3(-0.5234, -0.3685,  0.7456),
-    float3( 0.4523,  0.5896,  0.6854), float3(-0.6123,  0.4523,  0.6234),
-    float3( 0.5896, -0.6854,  0.5623), float3(-0.7234, -0.5896,  0.4956),
-    float3( 0.6854,  0.7456,  0.4123), float3(-0.8123,  0.6854,  0.3254)
+static const int sampleCount = 24;
+static const float3 SSAOKernel[24] = {
+    // Ring 1 (z≈0.15, scale 0.2)
+    float3( 0.1977,  0.0000,  0.0300), float3( 0.0989,  0.1712,  0.0300),
+    float3(-0.0989,  0.1712,  0.0300), float3(-0.1977,  0.0000,  0.0300),
+    float3(-0.0989, -0.1712,  0.0300), float3( 0.0989, -0.1712,  0.0300),
+
+    // Ring 2 (z≈0.40, scale 0.45)
+    float3( 0.3574,  0.2062,  0.1800), float3( 0.0000,  0.4124,  0.1800),
+    float3(-0.3574,  0.2062,  0.1800), float3(-0.3574, -0.2062,  0.1800),
+    float3( 0.0000, -0.4124,  0.1800), float3( 0.3574, -0.2062,  0.1800),
+
+    // Ring 3 (z≈0.70, scale 0.70)
+    float3( 0.4999,  0.0000,  0.4900), float3( 0.2500,  0.4330,  0.4900),
+    float3(-0.2500,  0.4330,  0.4900), float3(-0.4999,  0.0000,  0.4900),
+    float3(-0.2500, -0.4330,  0.4900), float3( 0.2500, -0.4330,  0.4900),
+
+    // Ring 4 (z≈0.90, scale 1.0)
+    float3( 0.3770,  0.2179,  0.9000), float3( 0.0000,  0.4359,  0.9000),
+    float3(-0.3770,  0.2179,  0.9000), float3(-0.3770, -0.2179,  0.9000),
+    float3( 0.0000, -0.4359,  0.9000), float3( 0.3770, -0.2179,  0.9000)
 };
+
+// Simple hash for per-pixel random in [0,1)
+static float Hash12(float2 p)
+{
+    float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
+}
 
 float3x3 BuildTBN(in float3 N)
 {
@@ -53,8 +64,6 @@ float3x3 BuildTBN(in float3 N)
     );
 }
 
-inline float ViewZ_FromReversedDepth(float d) { return Constants.zNear / max(d, 1e-6); }
-
 [RootSignature(ROOT_SIG)]
 [NumThreads(16, 16, 1)]
 void main(uint3 tid : SV_DispatchThreadID,
@@ -75,13 +84,7 @@ void main(uint3 tid : SV_DispatchThreadID,
     // linear view-space depth (positive distance from camera)
     float viewZ = Constants.zNear / depthR;
 
-    // view ray through this pixel (direction where z==1 in view space)
-    float2 ndcXY = uv * 2.0f - 1.0f;
-    float4 H = float4(ndcXY, 1.0f, 1.0f);
-    float3 rayVS = mul(H, Constants.invProj).xyz;
-
     // position in view space: scale the ray so its z equals viewZ
-    float depthNdc = depthR; // D3D NDC in [0,1]
     float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     float4 vH = mul(float4(ndc, depthR, 1.0), Constants.invProj);
     float3 viewPos = vH.xyz / max(vH.w, 1e-6);
@@ -89,21 +92,37 @@ void main(uint3 tid : SV_DispatchThreadID,
     // hemisphere sample in view-space
     float3 N_world = DecodeNormal(normalTex.Load(int3(pix,0)));
     float3 N_view = normalize(mul(float4(N_world,0), Constants.view).xyz);
-    float3x3 TBN = BuildTBN(N_view);
+    // Build tangent basis inline to avoid matrix mul per sample
+    float3 T0 = (abs(N_view.z) < 0.999f) ? float3(0, 0, 1) : float3(1, 0, 0);
+    float3 T = normalize(T0 - dot(T0, N_view) * N_view);
+    float3 B = cross(N_view, T);
+
+    // Rotate tangent basis around N to break directional banding
+    float angle = Hash12((float2)pix) * 6.2831853f;
+    float s, c; sincos(angle, s, c);
+    float3 Tr = c * T + s * B;
+    float3 Br = -s * T + c * B;
+
+    // Per-pixel invariants (don’t depend on sample i)
+    float px = 2.0 * viewZ / Constants.proj._11 / Constants.renderTargetSize.x;
+    float py = 2.0 * viewZ / Constants.proj._22 / Constants.renderTargetSize.y;
+    float pixelVS = 0.5 * (px + py);
+    float biasVS = max(Constants.bias, 0.5 * pixelVS);
 
     float occlusion = 0.0f;
     for (int i = 0; i < sampleCount; ++i)
     {
-        // Hemisphere sample in view space
-        float3 sampleVec = mul(SSAOKernel[i], TBN);  // tangent -> view
+    // Hemisphere sample in view space (rotate in tangent to reduce banding)
+    float3 k = SSAOKernel[i];
+    float3 sampleVec = Tr * k.x + Br * k.y + N_view * k.z;  // tangent -> view
         float3 samplePos = viewPos + sampleVec * Constants.radius;
 
         // project sample to screen
         float4 clipS = mul(float4(samplePos, 1.0f), Constants.proj);
-        float3 ndcS = clipS.xyz / max(clipS.w, 1e-6);
-        float2 uvS = float2(ndcS.x * 0.5 + 0.5, 0.5 - ndcS.y * 0.5);
+        float invW = 1.0f / max(clipS.w, 1e-6);
+        float2 uvS = float2(clipS.x * 0.5f * invW + 0.5f, 0.5f - clipS.y * 0.5f * invW);
 
-        if (any(uvS <= 0.0f) || any(uvS >= 1.0f)) continue;
+    if (uvS.x <= 0.0f || uvS.x >= 1.0f || uvS.y <= 0.0f || uvS.y >= 1.0f) continue;
 
         uint2 sp = (uint2)(uvS * Constants.renderTargetSize);
         float sceneDepthR = depthTex.Load(int3(sp, 0));
@@ -112,14 +131,6 @@ void main(uint3 tid : SV_DispatchThreadID,
         // compare in the same metric (view-space Z, positive)
         float sceneViewZ = Constants.zNear / sceneDepthR;
         float samplePosViewZ = -samplePos.z;            // if your view uses -Z forward, use: -samplePos.z
-
-        // pixel size (avg) in view-space at this depth
-        float px = 2.0 * viewZ / Constants.proj._11 / Constants.renderTargetSize.x;
-        float py = 2.0 * viewZ / Constants.proj._22 / Constants.renderTargetSize.y;
-        float pixelVS = 0.5 * (px + py);
-
-        // make bias at least a fraction of a pixel in view space
-        float biasVS = max(Constants.bias, 0.5 * pixelVS);
 
         float rangeCheck = smoothstep(0.0, 1.0, Constants.radius / abs(viewZ - sceneViewZ));
         occlusion += (sceneViewZ <= (samplePosViewZ - biasVS) ? 1.0 : 0.0) * rangeCheck;

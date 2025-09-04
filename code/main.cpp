@@ -18,7 +18,7 @@ i32 WINAPI WinMain(const HINSTANCE hInstance, HINSTANCE, LPSTR, const i32 nShowC
     const WString windowTitle = GetWindowTitle();
 
     Window::GetInstance().Run({
-        .resolution = {2560, 1440},
+        .resolution = {2560, 1440}, // 3840, 2160
         .name = L"Iškur Engine",
         .title = windowTitle,
         .fullscreen = false,

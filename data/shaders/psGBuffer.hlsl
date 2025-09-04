@@ -15,6 +15,7 @@ struct PSOut
     float2 normal : SV_Target1;
     float2 material : SV_Target2;
     float2 motion : SV_Target3;
+    float ao : SV_Target4;
 };
 
 PSOut main(VertexOut input, bool isFrontFace : SV_IsFrontFace)
@@ -68,7 +69,6 @@ PSOut main(VertexOut input, bool isFrontFace : SV_IsFrontFace)
 
     // Normal
     float3 N = normalize(input.normal);
-    
     if (material.normalTextureIndex != -1)
     {
         Texture2D<float2> normalTex = ResourceDescriptorHeap[material.normalTextureIndex];
@@ -97,14 +97,25 @@ PSOut main(VertexOut input, bool isFrontFace : SV_IsFrontFace)
         float3x3 TBN = float3x3(T, B, Ng);
         N = normalize(mul(nTS, TBN));
     }
-    
     // Octahedral Normal Encoding
     float2 encodedNormal = EncodeNormal(N);
+
+    // AO
+    float ao = 1.f;
+    if (material.aoTextureIndex != -1)
+    {
+        Texture2D<float2> aoTex = ResourceDescriptorHeap[material.aoTextureIndex];
+        SamplerState aoSmp = SamplerDescriptorHeap[material.aoSamplerIndex];
+        ao = aoTex.Sample(aoSmp, input.texCoord.xy).r;
+    }
     
     PSOut output;
     output.albedo = float4(baseColor.rgb, baseColor.a);
     output.normal = encodedNormal;
     output.material = float2(metallic, roughness);
-    output.motion = (input.currentClipPosNoJ.xy / input.currentClipPosNoJ.w) - (input.prevClipPosNoJ.xy / input.prevClipPosNoJ.w);
+    float2 mv = (input.prevClipPosNoJ.xy / input.prevClipPosNoJ.w) - (input.currentClipPosNoJ.xy / input.currentClipPosNoJ.w);
+    mv *= float2(0.5f, -0.5f); // FSR spec
+    output.motion = mv;
+    output.ao = ao;
     return output;
 }
