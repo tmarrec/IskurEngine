@@ -23,6 +23,10 @@ typedef float2 XMFLOAT2;
 typedef float3 XMFLOAT3;
 typedef float4 XMFLOAT4;
 typedef float4x4 XMFLOAT4X4;
+
+typedef uint2 XMUINT2;
+typedef uint3 XMUINT3;
+typedef uint4 XMUINT4;
 #endif
 
 struct Meshlet
@@ -230,14 +234,16 @@ struct RtShadowsTraceConstants
 
 	u32 outputTextureIndex;
 	u32 tlasIndex;
-	u32 depthSamplerIndex;
-	u32 resolutionType;
-
-	XMFLOAT3 sunDir;
-	u32 frameIndex;
+	XMUINT2 ditherOffset;
 
 	XMFLOAT3 cameraPos;
 	u32 depthTextureIndex;
+
+	XMFLOAT2 fullDimInv;
+	XMUINT2 ditherFactors;
+
+	XMFLOAT3 sunDir;
+	u32 unused;
 };
 
 struct SSAOConstants

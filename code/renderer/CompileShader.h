@@ -5,8 +5,6 @@
 
 #pragma once
 
-#include <dxcapi.h>
-
 enum ShaderType : u8
 {
     IE_SHADER_TYPE_VERTEX,

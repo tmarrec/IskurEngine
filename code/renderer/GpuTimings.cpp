@@ -68,23 +68,29 @@ void GpuTimings_Collect(GpuTimers& timers, GpuTimingState& s)
 {
     s.lastCount = 0;
     if (!timers.nextIdx || !s.timestampFrequency)
+    {
         return;
-
+    }
     const f64 to_ms = 1000.0 / static_cast<f64>(s.timestampFrequency);
 
     u64* ticks = nullptr;
-    D3D12_RANGE r{0, timers.nextIdx * (u32)sizeof(u64)};
-    timers.readback->Map(0, &r, reinterpret_cast<void**>(&ticks));
+    D3D12_RANGE r{0, static_cast<size_t>(timers.nextIdx) * sizeof(u64)};
+    IE_Check(timers.readback->Map(0, &r, reinterpret_cast<void**>(&ticks)));
 
     for (u32 i = 0; i < timers.passCount && i < 128; ++i)
     {
         const GpuTimers::Pass& p = timers.passes[i];
         if (p.idxEnd <= p.idxBegin)
+        {
             continue;
+        }
         const u64 t0 = ticks[p.idxBegin];
         const u64 t1 = ticks[p.idxEnd];
         const f64 dt = static_cast<f64>(t1 - t0) * to_ms;
-        s.last[s.lastCount++] = {p.name, dt};
+
+        GpuTimingState::TimDisp& ts = s.last[s.lastCount++];
+        ts.name = p.name;
+        ts.ms = dt;
     }
 
     D3D12_RANGE w{0, 0};

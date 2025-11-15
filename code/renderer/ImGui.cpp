@@ -196,6 +196,10 @@ void ImGui_Render(const ImGui_RenderParams& p)
 
         ImGui::EndTable();
     }
+
+    // Grab final Stats pos/size before ending the window
+    ImVec2 statsPos = ImGui::GetWindowPos();
+    ImVec2 statsSize = ImGui::GetWindowSize();
     ImGui::End();
 
     // Texture debug window: select one texture from a dropdown and preview it
@@ -256,6 +260,11 @@ void ImGui_Render(const ImGui_RenderParams& p)
                 sSrvCache.emplace(res, gpu);
                 return gpu;
             };
+
+            // Dock GBuffer just under Stats
+            const ImVec2 bottomLeft(vp->WorkPos.x, vp->WorkPos.y + vp->WorkSize.y);
+            ImGui::SetNextWindowPos(bottomLeft, ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+            ImGui::SetNextWindowSize(ImVec2(640.0f, 426.0f), ImGuiCond_Always);
 
             ImGui::Begin("GBuffer", nullptr, ImGuiWindowFlags_NoSavedSettings);
 

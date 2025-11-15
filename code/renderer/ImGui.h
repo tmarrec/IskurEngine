@@ -5,12 +5,7 @@
 
 #pragma once
 
-#include <Windows.h>
-#include <d3d12.h>
-#include <dxgiformat.h>
-#include <stdint.h>
-
-enum class RayTracingResolution : u32
+enum class RayTracingResolution : u8
 {
     Full = 0,        // Full resolution (x, y)
     FullX_HalfY = 1, // Full resolution in x, half resolution in y

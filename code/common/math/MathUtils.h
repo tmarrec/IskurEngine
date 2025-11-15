@@ -33,3 +33,8 @@ template <typename T> constexpr T IE_ToDegrees(T radians)
 {
     return radians * static_cast<T>(180) / static_cast<T>(IE_PI);
 }
+
+constexpr u32 IE_DivRoundUp(u32 value, u32 divisor)
+{
+    return (value + divisor - 1) / divisor;
+}

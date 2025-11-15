@@ -30,19 +30,19 @@ void BindlessHeaps::Init(const ComPtr<ID3D12Device14>& device)
     IE_Check(m_SamplerHeap->SetName(L"Sampler Heap"));
 }
 
-u32 BindlessHeaps::CreateSRV(ComPtr<ID3D12Resource> resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& srvDesc)
+u32 BindlessHeaps::CreateSRV(const ComPtr<ID3D12Resource>& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& srvDesc)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE handle = m_CbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
-    handle.ptr += m_CbvSrvUavNextIndex * m_CbvSrvUavHandleSize;
+    handle.ptr += static_cast<size_t>(m_CbvSrvUavNextIndex) * m_CbvSrvUavHandleSize;
     m_CbvSrvUavNextIndex++;
     m_Device->CreateShaderResourceView(resource.Get(), &srvDesc, handle);
     return m_CbvSrvUavNextIndex - 1;
 }
 
-u32 BindlessHeaps::CreateUAV(ComPtr<ID3D12Resource> resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC& uavDesc)
+u32 BindlessHeaps::CreateUAV(const ComPtr<ID3D12Resource>& resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC& uavDesc)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE handle = m_CbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
-    handle.ptr += m_CbvSrvUavNextIndex * m_CbvSrvUavHandleSize;
+    handle.ptr += static_cast<size_t>(m_CbvSrvUavNextIndex) * m_CbvSrvUavHandleSize;
     m_CbvSrvUavNextIndex++;
     m_Device->CreateUnorderedAccessView(resource.Get(), nullptr, &uavDesc, handle);
     return m_CbvSrvUavNextIndex - 1;
@@ -51,8 +51,13 @@ u32 BindlessHeaps::CreateUAV(ComPtr<ID3D12Resource> resource, const D3D12_UNORDE
 u32 BindlessHeaps::CreateSampler(const D3D12_SAMPLER_DESC& samplerDesc)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE handle = m_SamplerHeap->GetCPUDescriptorHandleForHeapStart();
-    handle.ptr += m_SamplerNextIndex * m_SamplerHandleSize;
+    handle.ptr += static_cast<size_t>(m_SamplerNextIndex) * m_SamplerHandleSize;
     m_SamplerNextIndex++;
     m_Device->CreateSampler(&samplerDesc, handle);
     return m_SamplerNextIndex - 1;
+}
+
+Array<ID3D12DescriptorHeap*, 2> BindlessHeaps::GetDescriptorHeaps() const
+{
+    return {m_CbvSrvUavHeap.Get(), m_SamplerHeap.Get()};
 }

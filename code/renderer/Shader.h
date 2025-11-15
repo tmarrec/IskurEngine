@@ -5,8 +5,6 @@
 
 #pragma once
 
-#include <d3d12.h>
-
 struct Shader
 {
     D3D12_SHADER_BYTECODE bytecode = {};

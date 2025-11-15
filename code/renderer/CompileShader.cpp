@@ -140,7 +140,11 @@ ComPtr<IDxcBlob> CompileShader(ShaderType type, const WString& filename, const V
     }
     arguments.push_back(L"-enable-16bit-types");
     arguments.push_back(L"-Zpr");
-
+#ifdef _DEBUG
+    arguments.push_back(L"-Zi");
+    arguments.push_back(L"-Qembed_debug");
+    // arguments.push_back(L"-Od"); // disable optimization
+#endif
     IncludeHandler includeHandler;
     IDxcResult* compileResult;
     IE_Check(compiler->Compile(&sourceBuffer, arguments.data(), arguments.size(), &includeHandler, IID_PPV_ARGS(&compileResult)));

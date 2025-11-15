@@ -3,7 +3,7 @@
 # Licensed under the MIT License.
 # See the LICENSE file in the project root for license information.
 
-cmake_minimum_required(VERSION 4.1)
+cmake_minimum_required(VERSION 4.2)
 project(IskurEngine LANGUAGES CXX)
 
 # C++ Settings
@@ -20,6 +20,8 @@ foreach(OUTPUTCONFIG Debug Release RelWithDebInfo MinSizeRel)
   set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${OUTPUTCONFIG_UPPER} ${CMAKE_SOURCE_DIR}/bin/${OUTPUTCONFIG})
   set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${OUTPUTCONFIG_UPPER} ${CMAKE_SOURCE_DIR}/bin/${OUTPUTCONFIG})
 endforeach()
+set(CMAKE_MSVC_RUNTIME_LIBRARY
+    "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # DXC (DirectX Shader Compiler)
 set(DXC_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc_2025_07_14")
@@ -33,16 +35,16 @@ set_target_properties(dxcompiler PROPERTIES
 set(DIRECTX_DXC_PATH "${DXC_BIN_DIR}" CACHE PATH "Directory containing dxc.exe")
 
 # Third-Party Dependencies
-add_subdirectory(third_party/DirectX-Headers-1.616.0 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/DirectX-Headers-1.618.2 EXCLUDE_FROM_ALL)
 add_subdirectory(third_party/meshoptimizer-0.25 EXCLUDE_FROM_ALL)
 add_subdirectory(third_party/D3D12MemoryAllocator-3.0.1 EXCLUDE_FROM_ALL)
-add_subdirectory(third_party/tinygltf-2.9.6 EXCLUDE_FROM_ALL)
-add_subdirectory(third_party/DirectXTex-jul2025 EXCLUDE_FROM_ALL)
-add_subdirectory(third_party/DirectXMesh-jul2025 EXCLUDE_FROM_ALL)
-add_subdirectory(third_party/DirectXTK12-jul2025 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/tinygltf-2.9.7 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/DirectXTex-oct2025 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/DirectXMesh-oct2025 EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/DirectXTK12-oct2025 EXCLUDE_FROM_ALL)
 
 # ImGui
-set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui-1.92.2b")
+set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui-1.92.4")
 add_library(imgui STATIC
   ${IMGUI_DIR}/imgui.cpp
   ${IMGUI_DIR}/imgui_draw.cpp

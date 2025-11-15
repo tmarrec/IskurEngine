@@ -9,61 +9,10 @@
 
 ConstantBuffer<RtShadowsTraceConstants> Constants : register(b0);
 
-static const uint invBayer2[4] = { 0, 3, 1, 2 };
-static const uint invBayer4[16] = { 0,10,2,8, 5,15,7,13, 1,11,3,9, 4,14,6,12 };
-
-static const uint2 rtFactors[4] =
-{
-    uint2(1, 1),   // full
-    uint2(1, 2),   // fullX_halfY
-    uint2(2, 2),   // half
-    uint2(4, 4)    // quarter
-};
-static const uint rtTileCount[4] =
-{
-    1,  // full
-    2,  // fullX_halfY
-    4,  // half
-    16  // quarter
-};
-
 struct [raypayload] RayPayload
 {
-    uint hitCount : read(caller, closesthit) : write(caller, closesthit);
+    uint shadowed : read(caller, anyhit) : write(caller, anyhit);
 };
-
-void GetDitherOffset(out uint2 fullPxOut, out float2 fullDimInvOut)
-{
-    uint2 px = DispatchRaysIndex().xy;
-    float2 dim = DispatchRaysDimensions().xy;
-
-    uint2 factor = rtFactors[Constants.resolutionType];
-    uint tileCount = rtTileCount[Constants.resolutionType];
-
-    uint slot = Constants.frameIndex % tileCount;
-
-    uint idx;
-    if (tileCount < 4)
-    {
-        idx = slot;
-    }
-    else if (tileCount == 4)
-    {
-        idx = invBayer2[slot];
-    }
-    else
-    {
-        idx = invBayer4[slot];
-    }
-
-    uint shift = factor.x >> 1;  
-    uint mask = factor.x - 1;
-
-    uint2 ditherOffset = uint2(idx & mask, idx >> shift);
-
-    fullPxOut = px * factor + ditherOffset;
-    fullDimInvOut = 1.f / (dim * factor); 
-}
 
 [shader("raygeneration")]
 void Raygen()
@@ -71,33 +20,33 @@ void Raygen()
     RaytracingAccelerationStructure scene = ResourceDescriptorHeap[Constants.tlasIndex];
     RWTexture2D<half> output = ResourceDescriptorHeap[Constants.outputTextureIndex];
 
-    uint2 fullPx;
-    float2 fullDimInv;
-    GetDitherOffset(fullPx, fullDimInv);
+    // Dithered pixel
+    uint2 fullPx = DispatchRaysIndex().xy * Constants.ditherFactors + Constants.ditherOffset;
 
-    RayPayload payload = { 0 };
-
-    float2 centerUV = (float2(fullPx) + 0.5f) * fullDimInv;
+    float2 centerUV = (float2(fullPx) + 0.5f) * Constants.fullDimInv;
     Texture2D<float> depthTexture = ResourceDescriptorHeap[Constants.depthTextureIndex];
-    SamplerState depthSampler = SamplerDescriptorHeap[Constants.depthSamplerIndex];
     float depth = depthTexture.Load(int3(fullPx, 0)).r;
     float3 worldPos = ReconstructWorldPos(centerUV, depth, Constants.invViewProj);
 
+    RayPayload payload;
+    payload.shadowed = 0;
+
     RayDesc ray;
-    ray.Origin = worldPos + normalize(Constants.cameraPos - worldPos) * 0.025;
+    ray.Origin = worldPos;
     ray.Direction = -Constants.sunDir;
-    ray.TMin = 0.01f;
+    ray.TMin = 0.025f;
     ray.TMax = 1e6f;
 
-    TraceRay(scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, 0, 1, 0, ray, payload);
+    TraceRay(scene, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_NON_OPAQUE, 0xFF, 0, 1, 0, ray, payload);
 
-    output[fullPx] = half(payload.hitCount);
+    output[fullPx] = half(payload.shadowed);
 }
 
-[shader("closesthit")]
-void ClosestHit(inout RayPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+[shader("anyhit")]
+void AnyHit(inout RayPayload payload, in BuiltInTriangleIntersectionAttributes attr)
 {
-    payload.hitCount++;
+    payload.shadowed = 1;
+    AcceptHitAndEndSearch();
 }
 
 [shader("miss")]

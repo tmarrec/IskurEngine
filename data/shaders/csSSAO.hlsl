@@ -34,7 +34,7 @@ static const float3 SSAOKernel[24] = {
     float3( 0.0000, -0.4359,  0.9000), float3( 0.3770, -0.2179,  0.9000)
 };
 
-// Simple hash for per-pixel random in [0,1)
+// Hash for per-pixel random in [0,1)
 static float Hash12(float2 p)
 {
     float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
@@ -44,17 +44,10 @@ static float Hash12(float2 p)
 
 float3x3 BuildTBN(in float3 N)
 {
-    // Ensure N is normalized
     N = normalize(N);
-    
-    // Choose initial tangent vector
     float3 T = abs(N.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
-    
-    // Gram-Schmidt orthogonalization
-    T = T - dot(T, N) * N;  // Remove component parallel to N
+    T = T - dot(T, N) * N; 
     T = normalize(T);
-    
-    // Bitangent completes the orthonormal basis
     float3 B = cross(N, T);
     
     return float3x3(
@@ -92,6 +85,7 @@ void main(uint3 tid : SV_DispatchThreadID,
     // hemisphere sample in view-space
     float3 N_world = DecodeNormal(normalTex.Load(int3(pix,0)));
     float3 N_view = normalize(mul(float4(N_world,0), Constants.view).xyz);
+    
     // Build tangent basis inline to avoid matrix mul per sample
     float3 T0 = (abs(N_view.z) < 0.999f) ? float3(0, 0, 1) : float3(1, 0, 0);
     float3 T = normalize(T0 - dot(T0, N_view) * N_view);
@@ -103,7 +97,7 @@ void main(uint3 tid : SV_DispatchThreadID,
     float3 Tr = c * T + s * B;
     float3 Br = -s * T + c * B;
 
-    // Per-pixel invariants (don’t depend on sample i)
+    // Per-pixel invariants
     float px = 2.0 * viewZ / Constants.proj._11 / Constants.renderTargetSize.x;
     float py = 2.0 * viewZ / Constants.proj._22 / Constants.renderTargetSize.y;
     float pixelVS = 0.5 * (px + py);
@@ -112,9 +106,9 @@ void main(uint3 tid : SV_DispatchThreadID,
     float occlusion = 0.0f;
     for (int i = 0; i < sampleCount; ++i)
     {
-    // Hemisphere sample in view space (rotate in tangent to reduce banding)
-    float3 k = SSAOKernel[i];
-    float3 sampleVec = Tr * k.x + Br * k.y + N_view * k.z;  // tangent -> view
+        // Hemisphere sample in view space (rotate in tangent to reduce banding)
+        float3 k = SSAOKernel[i];
+        float3 sampleVec = Tr * k.x + Br * k.y + N_view * k.z;  // tangent -> view
         float3 samplePos = viewPos + sampleVec * Constants.radius;
 
         // project sample to screen
@@ -122,16 +116,20 @@ void main(uint3 tid : SV_DispatchThreadID,
         float invW = 1.0f / max(clipS.w, 1e-6);
         float2 uvS = float2(clipS.x * 0.5f * invW + 0.5f, 0.5f - clipS.y * 0.5f * invW);
 
-    if (uvS.x <= 0.0f || uvS.x >= 1.0f || uvS.y <= 0.0f || uvS.y >= 1.0f) continue;
+        if (uvS.x <= 0.0f || uvS.x >= 1.0f || uvS.y <= 0.0f || uvS.y >= 1.0f)
+        {
+            continue;
+        }
 
         uint2 sp = (uint2)(uvS * Constants.renderTargetSize);
         float sceneDepthR = depthTex.Load(int3(sp, 0));
-        if (sceneDepthR <= 1e-6) continue;
+        if (sceneDepthR <= 1e-6)
+        {
+            continue;
+        }
 
-        // compare in the same metric (view-space Z, positive)
         float sceneViewZ = Constants.zNear / sceneDepthR;
-        float samplePosViewZ = -samplePos.z;            // if your view uses -Z forward, use: -samplePos.z
-
+        float samplePosViewZ = -samplePos.z;
         float rangeCheck = smoothstep(0.0, 1.0, Constants.radius / abs(viewZ - sceneViewZ));
         occlusion += (sceneViewZ <= (samplePosViewZ - biasVS) ? 1.0 : 0.0) * rangeCheck;
     }

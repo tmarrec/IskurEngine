@@ -5,23 +5,37 @@
 
 #pragma once
 
-#include "common/Singleton.h"
-
 class Camera : public Singleton<Camera>
 {
   public:
+    struct FrameData
+    {
+        XMFLOAT3 position;
+        XMFLOAT2 znearfar;
+
+        XMFLOAT4X4 view;
+        XMFLOAT4X4 projection;
+        XMFLOAT4X4 projectionNoJitter;
+        XMFLOAT4X4 frustumCullingProjection;
+
+        XMFLOAT4X4 invView;
+        XMFLOAT4X4 invProjJ;
+        XMFLOAT4X4 invViewProj;
+
+        XMFLOAT4X4 viewProj;
+        XMFLOAT4X4 viewProjNoJ;
+        XMFLOAT4X4 prevViewProjNoJ;
+
+        XMFLOAT4 frustumCullingPlanes[6];
+    };
+
     void Init();
 
     void LoadSceneConfig(const String& sceneName);
 
     void Update(f32 elapsedSeconds);
 
-    XMFLOAT4X4 GetViewMatrix() const;
-    XMFLOAT3 GetPosition() const;
-    const XMFLOAT4X4& GetProjection() const;
-    const XMFLOAT4X4& GetProjectionNoJitter() const;
-    const XMFLOAT4X4& GetFrustumCullingProjection() const;
-    XMFLOAT2 GetZNearFar() const;
+    const FrameData& GetFrameData() const;
 
     void OnKeyDown(u64 key);
     void OnKeyUp(u64 key);
@@ -50,6 +64,9 @@ class Camera : public Singleton<Camera>
         bool escape = false;
     };
 
+    KeysPressed m_KeysPressed;
+    bool m_IsFocused = false;
+
     XMFLOAT3 m_Position = {-25.53637f, 3.5737517f, -3.990844f};
     f32 m_Yaw = 374.79907f;
     f32 m_Pitch = -4.89994f;
@@ -61,12 +78,17 @@ class Camera : public Singleton<Camera>
 
     XMFLOAT2 m_MouseOffset = {0.f, 0.f};
 
-    XMFLOAT4X4 m_Projection = {};
-    XMFLOAT4X4 m_ProjectionNoJitter = {};
-    XMFLOAT2 m_ZNearFar = {0, 0};
+    XMFLOAT4 m_FrustumCullingPlanes[6] = {};
 
-    XMFLOAT4X4 m_FrustumCullingProjection = {};
+    f32 m_AspectRatio = -1;
+    f32 m_Yfov = -1;
+    f32 m_FrustumCullingYfov = -1;
+    f32 m_Znear = -1;
+    f32 m_JitterX = -1;
+    f32 m_JitterY = -1;
 
-    KeysPressed m_KeysPressed;
-    bool m_IsFocused = false;
+    XMFLOAT4X4 m_PrevViewProjNoJ = {};
+    bool m_HavePrevVP = false; // Set to false when camera teleports
+
+    FrameData m_FrameData = {};
 };

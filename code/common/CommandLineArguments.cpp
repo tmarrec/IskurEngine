@@ -6,7 +6,6 @@
 #include "CommandLineArguments.h"
 
 #include <Windows.h>
-#include <string.h>
 
 void ProcessCommandLineArguments(i32 argc, char** argv)
 {

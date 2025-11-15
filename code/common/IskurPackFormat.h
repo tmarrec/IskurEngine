@@ -1,7 +1,11 @@
-﻿// Iškur Engine - Shared pack format
-// MIT License
+﻿// Iškur Engine - Scene Packer
+// Copyright (c) 2025 Tristan Marrec
+// Licensed under the MIT License.
+// See the LICENSE file in the project root for license information.
+
 #pragma once
 
+#include <DirectXMath.h>
 #include <cstdint>
 
 namespace IEPack
@@ -12,13 +16,12 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using i32 = std::int32_t;
 
-// Utility
 constexpr u32 FourCC(char a, char b, char c, char d)
 {
-    return (u32(u8(a))) | (u32(u8(b)) << 8) | (u32(u8(c)) << 16) | (u32(u8(d)) << 24);
+    return static_cast<u32>(static_cast<u8>(a)) | (static_cast<u32>(static_cast<u8>(b)) << 8) | (static_cast<u32>(static_cast<u8>(c)) << 16) | (static_cast<u32>(static_cast<u8>(d)) << 24);
 }
 
-// Chunk IDs (v5)
+// Chunk IDs
 enum : u32
 {
     CH_PRIM = FourCC('P', 'R', 'I', 'M'),
@@ -37,22 +40,6 @@ enum : u32
     CH_SAMP = FourCC('S', 'A', 'M', 'P'),
     CH_MATL = FourCC('M', 'A', 'T', 'L'),
     CH_INST = FourCC('I', 'N', 'S', 'T'),
-
-    // Draw lists (culled)
-    CH_DRL0 = FourCC('D', 'R', 'L', '0'),
-    CH_DRI0 = FourCC('D', 'R', 'I', '0'),
-    CH_DRL1 = FourCC('D', 'R', 'L', '1'),
-    CH_DRI1 = FourCC('D', 'R', 'I', '1'),
-    CH_DRL2 = FourCC('D', 'R', 'L', '2'),
-    CH_DRI2 = FourCC('D', 'R', 'I', '2'),
-
-    // Draw lists (no-cull)
-    CH_DNL0 = FourCC('D', 'N', 'L', '0'),
-    CH_DNI0 = FourCC('D', 'N', 'I', '0'),
-    CH_DNL1 = FourCC('D', 'N', 'L', '1'),
-    CH_DNI1 = FourCC('D', 'N', 'I', '1'),
-    CH_DNL2 = FourCC('D', 'N', 'L', '2'),
-    CH_DNI2 = FourCC('D', 'N', 'I', '2'),
 };
 
 // Texture/material flags
@@ -73,19 +60,6 @@ enum : u32
     MATF_UV_XFORM = 1u << 8,
 };
 
-// Keep D3D12 sampler encodings as-is (on-disk representation)
-enum : u32
-{
-    D3D12_TAM_WRAP = 1,
-    D3D12_TAM_MIRROR = 2,
-    D3D12_TAM_CLAMP = 3,
-    D3D12_TAM_BORDER = 4,
-    D3D12_CF_NEVER = 1,
-    D3D12_FILTER_MIN_MAG_MIP_POINT = 0x00,
-    D3D12_FILTER_MIN_MAG_MIP_LINEAR = 0x15,
-    D3D12_FILTER_ANISOTROPIC = 0x55,
-};
-
 #pragma pack(push, 1)
 
 // Chunk table entry (no crc/flags)
@@ -96,10 +70,9 @@ struct ChunkRecord
     u64 size;
 };
 
-// File header (v5)
 struct PackHeader
 {
-    char magic[8];
+    char magic[9];
     u32 version;
     u32 primCount;
     u32 chunkCount;
@@ -113,7 +86,6 @@ struct PackHeader
     u64 mlTrisOffset;
     u64 mlBoundsOffset;
 };
-using PackHeaderV5 = PackHeader; // alias used by the loader
 
 struct PrimRecord
 {
@@ -130,15 +102,6 @@ struct TextureRecord
     u64 byteOffset, byteSize;
 };
 
-// Sampler table entry (D3D12 encoding)
-struct SamplerDisk
-{
-    u32 d3d12Filter, addressU, addressV, addressW;
-    float mipLODBias, minLOD, maxLOD;
-    u32 maxAnisotropy, comparisonFunc;
-    float borderColor[4];
-};
-
 // On-disk Material
 struct MaterialRecord
 {
@@ -153,26 +116,15 @@ struct MaterialRecord
     u32 _pad1;
 };
 
-// On-disk Instance
 struct InstanceRecord
 {
-    u32 primIndex, materialOverride; // primIndex is GLOBAL packed-prim id
-    XMFLOAT4X4 world;                // row-major 3x4
-    float aabbMin[3], aabbMax[3];
-    float bsCenter[3];
-    float bsRadius;
-    float maxScale; // spectral norm of linear part
-};
-
-// On-disk Draw item
-struct DrawItem
-{
-    u32 primIndex, firstIndex, indexCount, instanceBegin, instanceCount, materialIndex;
-    u64 sortKey;
-    XMFLOAT4X4 world;
-    u32 doubleSided;
-    u32 alphaMode;
+    u32 primIndex;     // global prim index into PRIM table
+    u32 materialIndex; // final resolved material for this instance
+    XMFLOAT4X4 world;  // row-major 3x4
 };
 
 #pragma pack(pop)
+
+static_assert(sizeof(InstanceRecord) == (sizeof(u32) * 2 + sizeof(XMFLOAT4X4)), "InstanceRecord size mismatch (v9)");
+
 } // namespace IEPack

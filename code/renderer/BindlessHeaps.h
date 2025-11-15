@@ -5,19 +5,16 @@
 
 #pragma once
 
-#include <d3d12.h>
-
 class BindlessHeaps
 {
   public:
     void Init(const ComPtr<ID3D12Device14>& device);
 
-    u32 CreateSRV(ComPtr<ID3D12Resource> resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& srvDesc);
-    u32 CreateUAV(ComPtr<ID3D12Resource> resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC& uavDesc);
+    u32 CreateSRV(const ComPtr<ID3D12Resource>& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& srvDesc);
+    u32 CreateUAV(const ComPtr<ID3D12Resource>& resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC& uavDesc);
     u32 CreateSampler(const D3D12_SAMPLER_DESC& samplerDesc);
 
-    ComPtr<ID3D12DescriptorHeap> m_CbvSrvUavHeap;
-    ComPtr<ID3D12DescriptorHeap> m_SamplerHeap;
+    Array<ID3D12DescriptorHeap*, 2> GetDescriptorHeaps() const;
 
   private:
     ComPtr<ID3D12Device14> m_Device;
@@ -27,4 +24,7 @@ class BindlessHeaps
 
     u32 m_CbvSrvUavHandleSize = 0;
     u32 m_SamplerHandleSize = 0;
+
+    ComPtr<ID3D12DescriptorHeap> m_CbvSrvUavHeap;
+    ComPtr<ID3D12DescriptorHeap> m_SamplerHeap;
 };

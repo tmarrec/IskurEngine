@@ -5,11 +5,6 @@
 
 #pragma once
 
-#include <d3d12.h>
-#include <wrl/client.h>
-
-#include "common/Types.h"
-
 struct GpuTimers
 {
     ComPtr<ID3D12QueryHeap> heap;

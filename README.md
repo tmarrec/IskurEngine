@@ -68,9 +68,9 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
 ### Prerequisites
 
 - Windows 11
-- Visual Studio 2022 (ensure the following components are installed)
+- Visual Studio 2026 (ensure the following components are installed)
    - Windows 11 SDK (10.0.26100.X)
-- CMake 4.1 or higher
+- CMake 4.2 or higher
 
 ### Setup Instructions
 
@@ -81,19 +81,23 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
   cd IskurEngine
   ```
 
-2. **Generate Project Files**
+2. **Execute Setup Script**
 
-   Execute the provided batch script to generate the Visual Studio solution:
+  ```bash
+   setup.bat
+   ```
+
+3. **Generate Project Files**
 
   ```bash
    build.bat
    ```
 
-   This creates the solution file (`build/IskurEngine.sln`).
+   This creates the Visual Studio solution file (`build/IskurEngine.slnx`).
 
-3. **Build Project**
+4. **Build Project**
 
-   Open `build/IskurEngine.sln` in Visual Studio and build the solution.
+   Open `build/IskurEngine.slnx` in Visual Studio and build the solution.
 
 ## Command-Line Arguments
 
@@ -111,7 +115,7 @@ Running the packer will generate `data/scenes/<SceneName>.iskurpack`, which the 
 
 Typical usage:
 ```bash
-IskurScenePacker --input San-Miguel --fast
+IskurScenePacker --scene San-Miguel --fast
 IskurScenePacker --all --fast
 ```
 
