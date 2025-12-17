@@ -5,7 +5,6 @@
 
 #include "Camera.h"
 
-#include "common/Asserts.h"
 #include "window/Window.h"
 
 #include <DirectXMath.h>

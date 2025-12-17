@@ -38,3 +38,8 @@ constexpr u32 IE_DivRoundUp(u32 value, u32 divisor)
 {
     return (value + divisor - 1) / divisor;
 }
+
+constexpr u32 IE_AlignUp(u32 value, u32 alignment)
+{
+    return (value + alignment - 1u) / alignment * alignment;
+}

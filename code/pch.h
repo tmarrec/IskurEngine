@@ -1,4 +1,4 @@
-﻿// Iškur Engine
+// Iškur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
@@ -6,7 +6,7 @@
 #pragma once
 
 #define NOMINMAX
-#include <windows.h>
+#include <Windows.h>
 #include <wrl/client.h>
 
 #include <directx/d3d12.h>
@@ -14,6 +14,7 @@
 
 #include <D3D12MemAlloc.h>
 #include <array>
+#include <cstring>
 #include <dxcapi.h>
 #include <dxgiformat.h>
 #include <vector>

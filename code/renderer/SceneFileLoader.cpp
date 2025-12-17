@@ -5,9 +5,9 @@
 
 #include "SceneFileLoader.h"
 
-#include "CPUGPU.h"
 #include "common/Asserts.h"
 #include "common/IskurPackFormat.h"
+#include "shaders/CPUGPU.h"
 
 #include <filesystem>
 #include <fstream>
@@ -18,7 +18,7 @@ using namespace IEPack;
 
 bool magic_ok(const char magic[9])
 {
-    static const char mk[9] = {'I', 'S', 'K', 'U', 'R', 'P', 'A', 'C', 'K'};
+    constexpr char mk[9] = {'I', 'S', 'K', 'U', 'R', 'P', 'A', 'C', 'K'};
     return std::memcmp(magic, mk, 9) == 0;
 }
 
@@ -71,7 +71,7 @@ template <typename T> void CopyChunkArray(Vector<T>& dst, const ChunkRecord* ch,
 
     dst.resize(count);
     if (count)
-        std::memcpy(dst.data(), src, size_t(count) * sizeof(T));
+        std::memcpy(dst.data(), src, static_cast<size_t>(count) * sizeof(T));
 }
 
 } // namespace

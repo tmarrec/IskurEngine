@@ -13,6 +13,16 @@ enum class RayTracingResolution : u8
     Quarter = 3      // Both x and y at quarter resolution
 };
 
+enum class EnvironmentFile : u8
+{
+    AutumnField = 0,
+    BelfastSunset = 1,
+    PartlyCloudy = 2,
+    OvercastSoil = 3,
+
+    Count = 4,
+};
+
 // Timing
 extern f32 g_Timing_AverageWindowMs;
 
@@ -31,7 +41,6 @@ extern f32 g_Sun_Elevation; // radians
 extern f32 g_Sun_Intensity;
 
 // IBL
-extern f32 g_IBL_DiffuseIntensity;
 extern f32 g_IBL_SpecularIntensity;
 extern f32 g_IBL_SkyIntensity;
 
@@ -50,13 +59,26 @@ extern f32 g_AutoExposure_TauDark;
 // RT shadows
 extern bool g_RTShadows_Enabled;
 extern RayTracingResolution g_RTShadows_Type;
-extern f32 g_RTShadows_IBLDiffuseIntensity;
-extern f32 g_RTShadows_IBLSpecularIntensity;
 
-// SSAO
-extern f32 g_SSAO_SampleRadius;
-extern f32 g_SSAO_SampleBias;
-extern f32 g_SSAO_Power;
+// Environment
+extern EnvironmentFile g_EnvironmentFile_Type;
+
+extern bool g_ShadersCompilationSuccess;
+
+// Path Tracing
+extern u32 g_PathTrace_SppCached;
+extern u32 g_PathTrace_SppNotCached;
+extern u32 g_PathTrace_BounceCount;
+extern bool g_RadianceCache_Trilinear;
+extern u32 g_RadianceCache_TrilinearMinCornerSamples;
+extern u32 g_RadianceCache_TrilinearMinHits;
+extern u32 g_RadianceCache_TrilinearPresentMinSamples;
+extern u32 g_RadianceCache_NormalBinRes;
+extern u32 g_RadianceCache_MinExtraSppCount;
+extern u32 g_RadianceCache_MaxAge;
+extern u32 g_RadianceCache_MaxProbes;
+extern u32 g_RadianceCache_MaxSamples;
+extern f32 g_RadianceCache_CellSize;
 
 struct ImGui_InitParams
 {
@@ -64,7 +86,7 @@ struct ImGui_InitParams
     ID3D12CommandQueue* queue;
     DXGI_FORMAT rtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     const char* fontPath = "C:/Windows/Fonts/segoeui.ttf";
-    f32 fontSize = 21.0f;
+    f32 fontSize = 22.0f;
 };
 
 struct ImGui_TimingRaw
@@ -100,14 +122,15 @@ struct ImGui_RenderParams
     // Optional: GBuffer debug preview
     ID3D12Resource* gbufferAlbedo = nullptr;
     ID3D12Resource* gbufferNormal = nullptr;
+    ID3D12Resource* gbufferNormalGeo = nullptr;
     ID3D12Resource* gbufferMaterial = nullptr;
     ID3D12Resource* gbufferMotion = nullptr;
     ID3D12Resource* gbufferAO = nullptr;
-    ID3D12Resource* depth = nullptr;     // R32_TYPELESS depth buffer (viewed as R32_FLOAT)
-    ID3D12Resource* rtShadows = nullptr; // R16_FLOAT ray-traced shadows output
-    ID3D12Resource* ssao = nullptr;      // R8_UNORM SSAO texture (optional)
-    u32 renderWidth = 0;                 // for aspect ratio of previews
-    u32 renderHeight = 0;                // for aspect ratio of previews
+    ID3D12Resource* depth = nullptr;             // R32_TYPELESS depth buffer (viewed as R32_FLOAT)
+    ID3D12Resource* rtShadows = nullptr;         // R16_FLOAT ray-traced shadows output
+    ID3D12Resource* rtIndirectDiffuse = nullptr; // R16_FLOAT indirect diffuse output
+    u32 renderWidth = 0;                         // for aspect ratio of previews
+    u32 renderHeight = 0;                        // for aspect ratio of previews
 };
 
 void ImGui_Init(const ImGui_InitParams& p);

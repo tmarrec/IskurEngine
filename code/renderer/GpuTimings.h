@@ -1,4 +1,4 @@
-// IÅ¡kur Engine
+// Iškur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
@@ -49,4 +49,4 @@ void GPU_MARKER_END(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& ti
 void GpuTimings_UpdateAverages(GpuTimingState& s, float dtMs, float windowMs);
 
 // Read back timestamp data from the given timers and populate the "last" timings in the state
-void GpuTimings_Collect(GpuTimers& timers, GpuTimingState& s);
+void GpuTimings_Collect(const GpuTimers& timers, GpuTimingState& s);

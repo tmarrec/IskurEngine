@@ -1,4 +1,4 @@
-﻿// Iškur Engine
+// Iškur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
@@ -12,7 +12,6 @@
 
 #include "Core.h"
 #include "common/Asserts.h"
-#include "common/Log.h"
 #include "renderer/Camera.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -106,18 +105,6 @@ void Window::Run(const RunInfo& runInfo)
     m_Resolution = runInfo.resolution;
     m_Hinstance = runInfo.hInstance;
 
-    if (m_Fullscreen)
-    {
-        const HMONITOR hmonitor = MonitorFromWindow(m_Hwnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO monitorInfo = {.cbSize = sizeof(monitorInfo), .rcMonitor = {0, 0, 0, 0}, .rcWork = {0, 0, 0, 0}, .dwFlags = 0};
-        GetMonitorInfo(hmonitor, &monitorInfo);
-
-        m_Resolution.x = monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left;
-        m_Resolution.y = monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top;
-    }
-
-    m_AspectRatio = static_cast<f32>(m_Resolution.x) / static_cast<f32>(m_Resolution.y);
-
     const WNDCLASSEX windowClass = {
         .cbSize = sizeof(WNDCLASSEX),
         .style = CS_HREDRAW | CS_VREDRAW,
@@ -144,16 +131,23 @@ void Window::Run(const RunInfo& runInfo)
 
     if (m_Fullscreen)
     {
+        const HMONITOR hmonitor = MonitorFromWindow(m_Hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitorInfo = {.cbSize = sizeof(monitorInfo), .rcMonitor = {0, 0, 0, 0}, .rcWork = {0, 0, 0, 0}, .dwFlags = 0};
+        GetMonitorInfo(hmonitor, &monitorInfo);
+
+        m_Resolution.x = monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left;
+        m_Resolution.y = monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top;
         SetWindowLong(m_Hwnd, GWL_STYLE, 0);
     }
+
+    m_AspectRatio = static_cast<f32>(m_Resolution.x) / static_cast<f32>(m_Resolution.y);
 
     Core::OnInit();
 
     ShowWindow(m_Hwnd, runInfo.nShowCmd);
 
     const Camera& camera = Camera::GetInstance();
-    static MSG msg;
-    ZeroMemory(&msg, sizeof(MSG));
+    MSG msg{};
     while (msg.message != WM_QUIT)
     {
         if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))

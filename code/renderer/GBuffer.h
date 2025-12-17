@@ -7,16 +7,18 @@
 
 struct GBuffer
 {
-    static constexpr u32 targetCount = 5;
+    static constexpr u32 targetCount = 6;
 
     ComPtr<ID3D12Resource> albedo;
     ComPtr<ID3D12Resource> normal;
+    ComPtr<ID3D12Resource> normalGeo;
     ComPtr<ID3D12Resource> material;
     ComPtr<ID3D12Resource> motionVector;
     ComPtr<ID3D12Resource> ao;
 
     u32 albedoIndex = UINT32_MAX;
     u32 normalIndex = UINT32_MAX;
+    u32 normalGeoIndex = UINT32_MAX;
     u32 materialIndex = UINT32_MAX;
     u32 motionVectorIndex = UINT32_MAX;
     u32 aoIndex = UINT32_MAX;

@@ -5,12 +5,13 @@
 
 #pragma once
 
+#include <ffx_upscale.hpp>
+
 #include "common/Types.h"
-#include "ffx_upscale.hpp"
 
 namespace IE_Constants
 {
 constexpr u32 frameInFlightCount = 3;
-constexpr FfxApiUpscaleQualityMode upscalingMode = FFX_UPSCALE_QUALITY_MODE_NATIVEAA;
+constexpr FfxApiUpscaleQualityMode upscalingMode = FFX_UPSCALE_QUALITY_MODE_QUALITY;
 
 } // namespace IE_Constants

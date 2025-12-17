@@ -11,13 +11,13 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
 - **Mesh Shaders**
 - **Meshlet Frustum Culling:** engine-generated meshlets are culled on the GPU
 - **Ray-Traced Shadows (DXR):** BLAS and TLAS are built at runtime
+- **Diffuse GI via Path Tracing (DXR) + Radiance Cache:** caches radiance in a spatial hash keyed by quantized world-space grid cell and surface normal bin
 - **Bindless Resources:** textures, samplers, and buffers
 - **PBR Shading**
 - **HDR Pipeline:** full FP16 render targets with ACES tone mapping  
 - **Auto-Exposure**
-- **Runtime Shader Compilation (DXC)**
+- **Runtime Shader Compilation (DXC)** with hot-reload
 - **Reverse-Z**
-- **SSAO**
 - **FidelityFX Super Resolution (FSR)**
 - **Scene Packer:** compresses textures and generates meshlets
 - **Render pass live profiler**
@@ -34,6 +34,12 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
 <p align="center">
   <img src="screenshots/bistro.png" alt="Bistro scene"><br/>
   <em>Bistro scene</em>
+</p>
+<br/>
+
+<p align="center">
+  <img src="screenshots/sponza.png" alt="Sponza scene"><br/>
+  <em>Sponza scene</em>
 </p>
 <br/>
 

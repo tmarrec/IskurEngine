@@ -1,4 +1,4 @@
-﻿// Iškur Engine
+// Iškur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
@@ -20,8 +20,8 @@ void Core::OnInit()
 void Core::OnUpdate()
 {
     using namespace std::chrono;
-    static time_point<steady_clock> lastTime = high_resolution_clock::now();
-    const time_point<steady_clock> currentTime = high_resolution_clock::now();
+    static time_point<steady_clock> lastTime = steady_clock::now();
+    const time_point<steady_clock> currentTime = steady_clock::now();
     const f32 elapsedSeconds = duration<f32>(currentTime - lastTime).count();
     lastTime = currentTime;
 

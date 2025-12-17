@@ -118,13 +118,10 @@ struct MaterialRecord
 
 struct InstanceRecord
 {
-    u32 primIndex;     // global prim index into PRIM table
-    u32 materialIndex; // final resolved material for this instance
-    XMFLOAT4X4 world;  // row-major 3x4
+    u32 primIndex;             // global prim index into PRIM table
+    u32 materialIndex;         // final resolved material for this instance
+    DirectX::XMFLOAT4X4 world; // row-major 3x4
 };
 
 #pragma pack(pop)
-
-static_assert(sizeof(InstanceRecord) == (sizeof(u32) * 2 + sizeof(XMFLOAT4X4)), "InstanceRecord size mismatch (v9)");
-
 } // namespace IEPack

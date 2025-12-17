@@ -36,14 +36,12 @@ WString GetWindowTitle()
 {
     const LPWSTR cmdLine = GetCommandLineW();
 
-    // Skip over the program name (handles quoted or unquoted exe path)
+    // Skip the executable name (quoted or not)
     LPWSTR argsStart = cmdLine;
     if (*argsStart == L'"')
     {
-        // Skip opening quote
         argsStart++;
 
-        // Find closing quote
         while (*argsStart && *argsStart != L'"')
         {
             argsStart++;
@@ -62,18 +60,17 @@ WString GetWindowTitle()
         }
     }
 
-    // Skip any whitespace before the real args
+    // Trim leading whitespace before the actual arguments
     while (*argsStart == L' ' || *argsStart == L'\t')
     {
         argsStart++;
     }
 
-    // Now argsStart points to the arguments (or an empty string)
     WString title = L"Iškur Engine";
     if (*argsStart)
     {
         title += L" ";
-        title += argsStart; // Append everything after the exe name
+        title += argsStart; // Append the raw arguments
     }
 
     return title;

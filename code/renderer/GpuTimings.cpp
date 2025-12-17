@@ -1,4 +1,4 @@
-// IÅ¡kur Engine
+// Iškur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
@@ -64,7 +64,7 @@ void GpuTimings_UpdateAverages(GpuTimingState& s, float dtMs, float windowMs)
     }
 }
 
-void GpuTimings_Collect(GpuTimers& timers, GpuTimingState& s)
+void GpuTimings_Collect(const GpuTimers& timers, GpuTimingState& s)
 {
     s.lastCount = 0;
     if (!timers.nextIdx || !s.timestampFrequency)

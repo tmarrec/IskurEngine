@@ -80,6 +80,7 @@ void SceneLoader::Load(Renderer& renderer, const String& sceneFile)
 
         Raytracing::RTInstance rti{};
         rti.primIndex = localPrimId;
+        rti.materialIndex = pc.materialIdx;
         rti.world = pc.world;
         rtInstances.push_back(rti);
     }
@@ -87,8 +88,6 @@ void SceneLoader::Load(Renderer& renderer, const String& sceneFile)
     SetupDepthResourcesAndLinearSampler(renderer);
 
     Raytracing::GetInstance().Init(cmd, renderer.m_Primitives, rtInstances);
-
-    renderer.CreateEnvMapResources(L"kloofendal_48d_partly_cloudy_puresky");
 
     SubmitAndSync(renderer, frameData, cmd);
 }
@@ -163,11 +162,8 @@ void SceneLoader::LoadMaterials(Renderer& renderer, const SceneFileData& scene, 
         m.normalScale = mr.normalScale;
         m.alphaCutoff = mr.alphaCutoff;
 
-        if (mr.flags & IEPack::MATF_ALPHA_BLEND)
-        {
-            m.alphaMode = AlphaMode_Mask; // BLEND not supported -> treat as mask
-        }
-        else if (mr.flags & IEPack::MATF_ALPHA_MASK)
+        // BLEND not supported -> treat as mask
+        if (mr.flags & IEPack::MATF_ALPHA_BLEND || mr.flags & IEPack::MATF_ALPHA_MASK)
         {
             m.alphaMode = AlphaMode_Mask;
         }
@@ -181,13 +177,13 @@ void SceneLoader::LoadMaterials(Renderer& renderer, const SceneFileData& scene, 
             if (txhdIdx < 0)
                 return -1;
             IE_Assert(static_cast<size_t>(txhdIdx) < renderer.m_TxhdToSrv.size());
-            return (i32)renderer.m_TxhdToSrv[(u32)txhdIdx];
+            return static_cast<i32>(renderer.m_TxhdToSrv[static_cast<u32>(txhdIdx)]);
         };
         auto mapSamp = [&](u32 sampIdx, int txhdIdx) -> i32 {
             if (txhdIdx < 0 || sampIdx == UINT32_MAX)
                 return -1;
             IE_Assert(static_cast<size_t>(sampIdx) < renderer.m_SampToHeap.size());
-            return (i32)renderer.m_SampToHeap[sampIdx];
+            return static_cast<i32>(renderer.m_SampToHeap[sampIdx]);
         };
 
         m.baseColorTextureIndex = mapTex(mr.baseColorTx);
@@ -204,8 +200,20 @@ void SceneLoader::LoadMaterials(Renderer& renderer, const SceneFileData& scene, 
 
     if (!renderer.m_Materials.empty())
     {
-        const u32 byteSize = u32(renderer.m_Materials.size() * sizeof(Material));
-        renderer.m_MaterialsBuffer = renderer.CreateStructuredBuffer(byteSize, sizeof(Material), L"Materials");
+        const u32 byteSize = static_cast<u32>(renderer.m_Materials.size() * sizeof(Material));
+
+        BufferCreateDesc bufferDesc{};
+        bufferDesc.heapType = D3D12_HEAP_TYPE_DEFAULT;
+        bufferDesc.viewKind = BufferCreateDesc::ViewKind::Structured;
+        bufferDesc.createSRV = true;
+        bufferDesc.createUAV = false;
+        bufferDesc.resourceFlags = D3D12_RESOURCE_FLAG_NONE;
+        bufferDesc.initialState = D3D12_RESOURCE_STATE_COMMON;
+        bufferDesc.finalState = bufferDesc.initialState;
+        bufferDesc.sizeInBytes = byteSize;
+        bufferDesc.strideInBytes = sizeof(Material);
+        bufferDesc.name = L"Materials";
+        renderer.m_MaterialsBuffer = renderer.CreateBuffer(nullptr, bufferDesc);
 
         renderer.SetBufferData(cmd, renderer.m_MaterialsBuffer, renderer.m_Materials.data(), byteSize, 0);
     }
@@ -243,21 +251,44 @@ void SceneLoader::BuildPrimitives(Renderer& renderer, const SceneFileData& scene
         prim.materialIdx = r.materialIndex;
         prim.meshletCount = r.meshletCount;
 
-        // GPU buffers
-        prim.vertices = renderer.CreateStructuredBuffer(r.vertexCount * sizeof(Vertex), sizeof(Vertex), L"Pack/Vertices");
+        // Structured
+        BufferCreateDesc bufferDesc{};
+        bufferDesc.heapType = D3D12_HEAP_TYPE_DEFAULT;
+        bufferDesc.viewKind = BufferCreateDesc::ViewKind::Structured;
+        bufferDesc.createSRV = true;
+        bufferDesc.createUAV = false;
+        bufferDesc.resourceFlags = D3D12_RESOURCE_FLAG_NONE;
+        bufferDesc.initialState = D3D12_RESOURCE_STATE_COMMON;
+        bufferDesc.finalState = bufferDesc.initialState;
+        bufferDesc.sizeInBytes = r.vertexCount * sizeof(Vertex);
+        bufferDesc.strideInBytes = sizeof(Vertex);
+        bufferDesc.name = L"SceneLoader/Vertices";
+        prim.vertices = renderer.CreateBuffer(nullptr, bufferDesc);
         renderer.SetBufferData(cmd, prim.vertices, vtx, r.vertexCount * sizeof(Vertex), 0);
 
-        prim.meshlets = renderer.CreateBytesBuffer(r.meshletCount * sizeof(Meshlet), L"Pack/Meshlets");
-        renderer.SetBufferData(cmd, prim.meshlets, mlt, r.meshletCount * sizeof(Meshlet), 0);
-
-        prim.mlVerts = renderer.CreateStructuredBuffer(r.mlVertsCount * sizeof(u32), sizeof(u32), L"Pack/MeshletVerts");
+        bufferDesc.sizeInBytes = r.mlVertsCount * sizeof(u32);
+        bufferDesc.strideInBytes = sizeof(u32);
+        bufferDesc.name = L"SceneLoader/MeshletVerts";
+        prim.mlVerts = renderer.CreateBuffer(nullptr, bufferDesc);
         renderer.SetBufferData(cmd, prim.mlVerts, mlv, r.mlVertsCount * sizeof(u32), 0);
 
-        prim.mlTris = renderer.CreateBytesBuffer(r.mlTrisByteCount, L"Pack/MeshletTris");
-        renderer.SetBufferData(cmd, prim.mlTris, mltb, r.mlTrisByteCount, 0);
-
-        prim.mlBounds = renderer.CreateStructuredBuffer(r.meshletCount * sizeof(meshopt_Bounds), sizeof(meshopt_Bounds), L"Pack/MeshletBounds");
+        bufferDesc.sizeInBytes = r.meshletCount * sizeof(meshopt_Bounds);
+        bufferDesc.strideInBytes = sizeof(meshopt_Bounds);
+        bufferDesc.name = L"SceneLoader/MeshletBounds";
+        prim.mlBounds = renderer.CreateBuffer(nullptr, bufferDesc);
         renderer.SetBufferData(cmd, prim.mlBounds, mlb, r.meshletCount * sizeof(meshopt_Bounds), 0);
+
+        // Raw
+        bufferDesc.viewKind = BufferCreateDesc::ViewKind::Raw;
+        bufferDesc.sizeInBytes = r.meshletCount * sizeof(Meshlet);
+        bufferDesc.name = L"SceneLoader/Meshlets";
+        prim.meshlets = renderer.CreateBuffer(nullptr, bufferDesc);
+        renderer.SetBufferData(cmd, prim.meshlets, mlt, r.meshletCount * sizeof(Meshlet), 0);
+
+        bufferDesc.sizeInBytes = r.mlTrisByteCount * sizeof(u32);
+        bufferDesc.name = L"SceneLoader/MeshletTris";
+        prim.mlTris = renderer.CreateBuffer(nullptr, bufferDesc);
+        renderer.SetBufferData(cmd, prim.mlTris, mltb, r.mlTrisByteCount, 0);
 
         // CPU data for RT BLAS
         prim.cpuVertices = vtx;
@@ -307,6 +338,4 @@ void SceneLoader::SubmitAndSync(Renderer& renderer, Renderer::PerFrameData& fram
     IE_Check(frameData.frameFence->SetEventOnCompletion(fenceToWait, evt));
     WaitForSingleObject(evt, INFINITE);
     CloseHandle(evt);
-
-    renderer.m_InFlightUploads.clear();
 }

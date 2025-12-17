@@ -5,6 +5,7 @@
 
 #include "ImGui.h"
 
+#include "Renderer.h"
 #include "window/Window.h"
 
 #include <cassert>
@@ -14,7 +15,6 @@
 #include <unordered_map>
 #include <vector>
 
-// ========= TWEAKABLE DEFINITIONS =========
 f32 g_Timing_AverageWindowMs = 2000.0f;
 
 f32 g_ToneMapping_WhitePoint = 1.0f;
@@ -28,7 +28,6 @@ f32 g_Sun_Azimuth = 210.0f * (3.1415926535f / 180.f);
 f32 g_Sun_Elevation = -48.0f * (3.1415926535f / 180.f);
 f32 g_Sun_Intensity = 1.0f;
 
-f32 g_IBL_DiffuseIntensity = 1.0f;
 f32 g_IBL_SpecularIntensity = 1.0f;
 f32 g_IBL_SkyIntensity = 1.0f;
 
@@ -44,13 +43,27 @@ f32 g_AutoExposure_TauBright = 0.20f;
 f32 g_AutoExposure_TauDark = 1.50f;
 
 bool g_RTShadows_Enabled = true;
-RayTracingResolution g_RTShadows_Type = RayTracingResolution::FullX_HalfY;
-f32 g_RTShadows_IBLDiffuseIntensity = 0.25f;
-f32 g_RTShadows_IBLSpecularIntensity = 0.75f;
+RayTracingResolution g_RTShadows_Type = RayTracingResolution::Full;
 
-f32 g_SSAO_SampleRadius = 0.05f;
-f32 g_SSAO_SampleBias = 0.0001f;
-f32 g_SSAO_Power = 1.35f;
+EnvironmentFile g_EnvironmentFile_Type = EnvironmentFile::OvercastSoil;
+
+bool g_ShadersCompilationSuccess = true;
+
+u32 g_PathTrace_SppCached = 1;    // SPP when the cache already has enough samples
+u32 g_PathTrace_SppNotCached = 1; // SPP while the cache is still filling
+u32 g_PathTrace_BounceCount = 2;  // Diffuse bounce count
+
+bool g_RadianceCache_Trilinear = true;               // Enable trilinear lookup across neighboring cells
+u32 g_RadianceCache_TrilinearMinCornerSamples = 128; // Minimum samples at a cache corner before blending
+u32 g_RadianceCache_TrilinearMinHits = 2;            // Required neighboring corners for trilinear lookup
+u32 g_RadianceCache_TrilinearPresentMinSamples = 64; // Samples needed for a corner to count as present
+
+u32 g_RadianceCache_NormalBinRes = 16;      // Normal bin resolution for cache keying
+u32 g_RadianceCache_MinExtraSppCount = 16u; // Samples required before trusting cache results
+u32 g_RadianceCache_MaxAge = 256u;          // Frames before a cache entry is treated as stale
+u32 g_RadianceCache_MaxProbes = 16;         // Max probe attempts in the cache hash table
+u32 g_RadianceCache_MaxSamples = 8192u;     // Per-entry sample cap
+f32 g_RadianceCache_CellSize = 0.3f;        // Cache cell size in meters
 
 namespace
 {
@@ -58,17 +71,17 @@ struct ImGuiAllocCtx
 {
     D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
     D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
-    uint32_t next = 0;
-    uint32_t capacity = 0;
-    uint32_t inc = 0;
+    u32 next = 0;
+    u32 capacity = 0;
+    u32 inc = 0;
 };
 
 ID3D12DescriptorHeap* gSrvHeap = nullptr;
 ImGuiAllocCtx gAlloc{};
 
-double FindSmooth(const char* name, const ImGui_TimingSmooth* arr, uint32_t n, double fallback)
+double FindSmooth(const char* name, const ImGui_TimingSmooth* arr, u32 n, double fallback)
 {
-    for (uint32_t i = 0; i < n; ++i)
+    for (u32 i = 0; i < n; ++i)
     {
         if (std::strcmp(arr[i].name, name) == 0)
         {
@@ -159,7 +172,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
     ImGui::SliderFloat("GPU timing avg window (ms)", &g_Timing_AverageWindowMs, 0.0f, 5000.0f, "%.0f");
 
     double totalSmooth = 0.0;
-    for (uint32_t i = 0; i < p.timingsRawCount; ++i)
+    for (u32 i = 0; i < p.timingsRawCount; ++i)
     {
         const auto& r = p.timingsRaw[i];
         totalSmooth += FindSmooth(r.name, p.timingsSmooth, p.timingsSmoothCount, r.ms);
@@ -172,7 +185,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
         ImGui::TableSetupColumn("% of total", ImGuiTableColumnFlags_WidthFixed, 90.0f);
         ImGui::TableHeadersRow();
 
-        for (uint32_t i = 0; i < p.timingsRawCount; ++i)
+        for (u32 i = 0; i < p.timingsRawCount; ++i)
         {
             const auto& r = p.timingsRaw[i];
             const double avg = FindSmooth(r.name, p.timingsSmooth, p.timingsSmoothCount, r.ms);
@@ -198,8 +211,6 @@ void ImGui_Render(const ImGui_RenderParams& p)
     }
 
     // Grab final Stats pos/size before ending the window
-    ImVec2 statsPos = ImGui::GetWindowPos();
-    ImVec2 statsSize = ImGui::GetWindowSize();
     ImGui::End();
 
     // Texture debug window: select one texture from a dropdown and preview it
@@ -216,12 +227,13 @@ void ImGui_Render(const ImGui_RenderParams& p)
         };
         maybe_add("Albedo", p.gbufferAlbedo);
         maybe_add("Normal", p.gbufferNormal);
+        maybe_add("NormalGeo", p.gbufferNormalGeo);
         maybe_add("Material", p.gbufferMaterial);
         maybe_add("Motion", p.gbufferMotion);
         maybe_add("AO", p.gbufferAO);
         maybe_add("Depth", p.depth);
         maybe_add("RT Shadows", p.rtShadows);
-        maybe_add("SSAO", p.ssao);
+        maybe_add("Indirect Diffuse", p.rtIndirectDiffuse);
 
         if (!labels.empty())
         {
@@ -236,8 +248,8 @@ void ImGui_Render(const ImGui_RenderParams& p)
                 {
                     return D3D12_GPU_DESCRIPTOR_HANDLE{}; // out of descriptors
                 }
-                D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
-                D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
+                D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+                D3D12_GPU_DESCRIPTOR_HANDLE gpu;
                 cpu.ptr = gAlloc.cpu.ptr + static_cast<size_t>(gAlloc.next) * gAlloc.inc;
                 gpu.ptr = gAlloc.gpu.ptr + static_cast<size_t>(gAlloc.next) * gAlloc.inc;
                 gAlloc.next++;
@@ -264,24 +276,25 @@ void ImGui_Render(const ImGui_RenderParams& p)
             // Dock GBuffer just under Stats
             const ImVec2 bottomLeft(vp->WorkPos.x, vp->WorkPos.y + vp->WorkSize.y);
             ImGui::SetNextWindowPos(bottomLeft, ImGuiCond_Always, ImVec2(0.0f, 1.0f));
-            ImGui::SetNextWindowSize(ImVec2(640.0f, 426.0f), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(640.0f, 428.0f), ImGuiCond_Always);
+            // ImGui::SetNextWindowSize(ImVec2(640.0f * 2, 428.0f * 2), ImGuiCond_Always); // for debug
 
             ImGui::Begin("GBuffer", nullptr, ImGuiWindowFlags_NoSavedSettings);
 
-            static int selected = 0;
-            if (selected < 0 || selected >= (int)labels.size())
+            static i32 selected = 0;
+            if (selected < 0 || selected >= static_cast<i32>(labels.size()))
                 selected = 0;
-            ImGui::Combo("Texture", &selected, labels.data(), (int)labels.size());
+            ImGui::Combo("Texture", &selected, labels.data(), static_cast<i32>(labels.size()));
 
             ID3D12Resource* res = textures[selected];
             D3D12_GPU_DESCRIPTOR_HANDLE h = getSrv(res);
 
-            const float avail = ImGui::GetContentRegionAvail().x;
-            const float aspect = (p.renderHeight > 0 && p.renderWidth > 0) ? (float)p.renderHeight / (float)p.renderWidth : 1.0f;
+            const f32 avail = ImGui::GetContentRegionAvail().x;
+            const f32 aspect = (p.renderHeight > 0 && p.renderWidth > 0) ? static_cast<f32>(p.renderHeight) / static_cast<f32>(p.renderWidth) : 1.0f;
             ImVec2 sz(avail, avail * aspect);
 
             if (h.ptr)
-                ImGui::Image((ImTextureID)h.ptr, sz);
+                ImGui::Image(h.ptr, sz);
             else
                 ImGui::TextUnformatted("<no descriptor available>");
 
@@ -293,25 +306,24 @@ void ImGui_Render(const ImGui_RenderParams& p)
     ImGuiWindowFlags settingsFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
     ImGui::Begin("Settings", nullptr, settingsFlags);
 
-    if (ImGui::CollapsingHeader("Tone Mapping", ImGuiTreeNodeFlags_DefaultOpen))
+    if (ImGui::Button("Reload Shaders"))
     {
-        ImGui::SliderFloat("White Point", &g_ToneMapping_WhitePoint, 0.0f, 32.0f);
-        ImGui::SliderFloat("Contrast", &g_ToneMapping_Contrast, 0.0f, 3.0f);
-        ImGui::SliderFloat("Saturation", &g_ToneMapping_Saturation, 0.0f, 3.0f);
+        Renderer::GetInstance().RequestShaderReload();
+    }
+    if (!g_ShadersCompilationSuccess)
+    {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Failed!");
     }
 
-    if (ImGui::CollapsingHeader("Auto-Exposure", ImGuiTreeNodeFlags_DefaultOpen))
+    if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::SliderFloat("Target %", &g_AutoExposure_TargetPct, 0.0f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Low Reject", &g_AutoExposure_LowReject, 0.0f, 0.2f, "%.2f");
-        ImGui::SliderFloat("High Reject", &g_AutoExposure_HighReject, 0.8f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Grey (Key)", &g_AutoExposure_Key, 0.05f, 0.50f, "%.2f");
-        ImGui::SliderFloat("Min Log Lum", &g_AutoExposure_MinLogLum, -16.0f, 0.0f, "%.1f");
-        ImGui::SliderFloat("Max Log Lum", &g_AutoExposure_MaxLogLum, 0.0f, 16.0f, "%.1f");
-        ImGui::SliderFloat("Light Adapt Time (s)", &g_AutoExposure_TauBright, 0.05f, 0.5f, "%.2f");
-        ImGui::SliderFloat("Dark  Adapt Time (s)", &g_AutoExposure_TauDark, 0.5f, 6.0f, "%.2f");
-        ImGui::SliderFloat("Clamp Min", &g_AutoExposure_ClampMin, 1.0f / 256.0f, 1.0f, "%.5f");
-        ImGui::SliderFloat("Clamp Max", &g_AutoExposure_ClampMax, 1.0f, 256.0f, "%.1f");
+        const char* environmentFileLabels[] = {"AutumnField", "BelfastSunset", "PartlyCloudy", "OvercastSoil"};
+        static i32 currentEnvironmentFIle = static_cast<i32>(g_EnvironmentFile_Type);
+        if (ImGui::Combo("Environment Name", &currentEnvironmentFIle, environmentFileLabels, IM_ARRAYSIZE(environmentFileLabels)))
+        {
+            g_EnvironmentFile_Type = static_cast<EnvironmentFile>(currentEnvironmentFIle);
+        }
     }
 
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen))
@@ -329,29 +341,95 @@ void ImGui_Render(const ImGui_RenderParams& p)
 
     if (ImGui::CollapsingHeader("IBL", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::SliderFloat("Diffuse Intensity", &g_IBL_DiffuseIntensity, 0.f, 2.f);
         ImGui::SliderFloat("Specular Intensity", &g_IBL_SpecularIntensity, 0.f, 2.f);
         ImGui::SliderFloat("Sky Intensity", &g_IBL_SkyIntensity, 0.f, 2.f);
+    }
+
+    if (ImGui::CollapsingHeader("Path Trace", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        {
+            const u32 minv = 0, maxv = 8;
+            ImGui::SliderScalar("Spp cached", ImGuiDataType_U32, &g_PathTrace_SppCached, &minv, &maxv);
+        }
+        {
+            const u32 minv = 0, maxv = 8;
+            ImGui::SliderScalar("Spp not cached", ImGuiDataType_U32, &g_PathTrace_SppNotCached, &minv, &maxv);
+        }
+        {
+            const u32 minv = 0, maxv = 8;
+            ImGui::SliderScalar("Bounce count", ImGuiDataType_U32, &g_PathTrace_BounceCount, &minv, &maxv);
+        }
+        {
+            const u32 minv = 0u, maxv = 256u;
+            ImGui::SliderScalar("RC min extra spp count", ImGuiDataType_U32, &g_RadianceCache_MinExtraSppCount, &minv, &maxv);
+        }
+        {
+            const u32 minv = 0u, maxv = 4096u;
+            ImGui::SliderScalar("RC max age", ImGuiDataType_U32, &g_RadianceCache_MaxAge, &minv, &maxv);
+        }
+        {
+            const u32 minv = 1, maxv = 64;
+            ImGui::SliderScalar("RC normal bin res", ImGuiDataType_U32, &g_RadianceCache_NormalBinRes, &minv, &maxv);
+        }
+        {
+            const u32 minv = 0u, maxv = 64u;
+            ImGui::SliderScalar("RC max probes", ImGuiDataType_U32, &g_RadianceCache_MaxProbes, &minv, &maxv);
+        }
+        {
+            const u32 minv = 1u, maxv = 16384u;
+            ImGui::SliderScalar("RC max samples", ImGuiDataType_U32, &g_RadianceCache_MaxSamples, &minv, &maxv);
+        }
+        {
+            ImGui::SliderFloat("RC cell size", &g_RadianceCache_CellSize, 0.01f, 2.0f);
+        }
+        ImGui::Checkbox("RC trilinear", &g_RadianceCache_Trilinear);
+
+        ImGui::BeginDisabled(!g_RadianceCache_Trilinear);
+        {
+            const u32 minv = 0, maxv = 4096;
+            ImGui::SliderScalar("RC min corner samples", ImGuiDataType_U32, &g_RadianceCache_TrilinearMinCornerSamples, &minv, &maxv);
+        }
+        {
+            const u32 minv = 0, maxv = 8;
+            ImGui::SliderScalar("RC min hits", ImGuiDataType_U32, &g_RadianceCache_TrilinearMinHits, &minv, &maxv);
+        }
+        {
+            const u32 minv = 0, maxv = 4096;
+            ImGui::SliderScalar("RC present min samples", ImGuiDataType_U32, &g_RadianceCache_TrilinearPresentMinSamples, &minv, &maxv);
+        }
+        ImGui::EndDisabled();
     }
 
     if (ImGui::CollapsingHeader("RT Shadows", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Checkbox("RT Shadows Enabled", &g_RTShadows_Enabled);
-        const char* RTResLabels[] = {"Full", "FullX_HalfY", "Half", "Quarter"};
-        static int currentRTRes = static_cast<int>(g_RTShadows_Type);
-        if (ImGui::Combo("Ray-trace Resolution", &currentRTRes, RTResLabels, IM_ARRAYSIZE(RTResLabels)))
+        const char* rtResLabels[] = {"Full", "FullX_HalfY", "Half", "Quarter"};
+        static i32 currentRTRes = static_cast<i32>(g_RTShadows_Type);
+        if (ImGui::Combo("Ray-trace Resolution", &currentRTRes, rtResLabels, IM_ARRAYSIZE(rtResLabels)))
         {
             g_RTShadows_Type = static_cast<RayTracingResolution>(currentRTRes);
         }
-        ImGui::SliderFloat("IBL Diffuse Intensity", &g_RTShadows_IBLDiffuseIntensity, 0.f, 1.f);
-        ImGui::SliderFloat("IBL Specular Intensity", &g_RTShadows_IBLSpecularIntensity, 0.f, 1.f);
     }
 
-    if (ImGui::CollapsingHeader("SSAO", ImGuiTreeNodeFlags_DefaultOpen))
+    if (ImGui::CollapsingHeader("Tone Mapping", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::SliderFloat("Sample Radius", &g_SSAO_SampleRadius, 0.f, 0.1f, "%.6f");
-        ImGui::SliderFloat("Sample Bias", &g_SSAO_SampleBias, 0.f, 0.001f, "%.8f");
-        ImGui::SliderFloat("Power", &g_SSAO_Power, 0.f, 3.f);
+        ImGui::SliderFloat("White Point", &g_ToneMapping_WhitePoint, 0.0f, 32.0f);
+        ImGui::SliderFloat("Contrast", &g_ToneMapping_Contrast, 0.0f, 3.0f);
+        ImGui::SliderFloat("Saturation", &g_ToneMapping_Saturation, 0.0f, 3.0f);
+    }
+
+    if (ImGui::CollapsingHeader("Auto-Exposure"))
+    {
+        ImGui::SliderFloat("Target %", &g_AutoExposure_TargetPct, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Low Reject", &g_AutoExposure_LowReject, 0.0f, 0.2f, "%.2f");
+        ImGui::SliderFloat("High Reject", &g_AutoExposure_HighReject, 0.8f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Grey (Key)", &g_AutoExposure_Key, 0.05f, 0.50f, "%.2f");
+        ImGui::SliderFloat("Min Log Lum", &g_AutoExposure_MinLogLum, -16.0f, 0.0f, "%.1f");
+        ImGui::SliderFloat("Max Log Lum", &g_AutoExposure_MaxLogLum, 0.0f, 16.0f, "%.1f");
+        ImGui::SliderFloat("Light Adapt Time (s)", &g_AutoExposure_TauBright, 0.05f, 0.5f, "%.2f");
+        ImGui::SliderFloat("Dark  Adapt Time (s)", &g_AutoExposure_TauDark, 0.5f, 6.0f, "%.2f");
+        ImGui::SliderFloat("Clamp Min", &g_AutoExposure_ClampMin, 1.0f / 256.0f, 1.0f, "%.5f");
+        ImGui::SliderFloat("Clamp Max", &g_AutoExposure_ClampMax, 1.0f, 256.0f, "%.1f");
     }
 
     ImGui::End();
@@ -364,12 +442,4 @@ void ImGui_Render(const ImGui_RenderParams& p)
     p.cmd->SetDescriptorHeaps(1, heaps);
 
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), p.cmd);
-
-    D3D12_RESOURCE_BARRIER b = {};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = p.rtvResource;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    p.cmd->ResourceBarrier(1, &b);
 }

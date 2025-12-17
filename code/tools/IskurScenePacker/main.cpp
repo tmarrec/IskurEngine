@@ -3,8 +3,8 @@
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
 
-#include "CPUGPU.h"
 #include "common/IskurPackFormat.h"
+#include "shaders/CPUGPU.h"
 #include <DirectXMath.h>
 #include <DirectXTex.h>
 #include <Objbase.h>
@@ -13,8 +13,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
-#include <cstring>
 #include <d3d12.h>
 #include <filesystem>
 #include <fstream>

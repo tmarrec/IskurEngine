@@ -6,13 +6,13 @@
 #pragma once
 
 #include "Buffer.h"
-#include "CPUGPU.h"
+#include "shaders/CPUGPU.h"
 
 struct Primitive
 {
     u32 materialIdx = 0;
 
-    // GPU buffers (bindless indices)
+    // GPU buffers
     SharedPtr<Buffer> vertices; // stride sizeof(Vertex)
     SharedPtr<Buffer> meshlets; // bytes
     SharedPtr<Buffer> mlVerts;  // u32
@@ -21,21 +21,15 @@ struct Primitive
 
     u32 meshletCount = 0;
 
-    // (For ray tracing build)
     const Vertex* cpuVertices = nullptr;
     u32 vertexCount = 0;
     const u32* cpuIndices = nullptr;
     u32 indexCount = 0;
 
     // BLAS resources
-    ComPtr<ID3D12Resource> blas;
-    ComPtr<D3D12MA::Allocation> blasAlloc;
-    ComPtr<ID3D12Resource> scratch;
-    ComPtr<D3D12MA::Allocation> scratchAlloc;
+    SharedPtr<Buffer> blas;
+    SharedPtr<Buffer> blasScratch;
 
-    // temp upload for RT (optional to keep around)
-    ComPtr<ID3D12Resource> rtVB;
-    ComPtr<D3D12MA::Allocation> rtVBAlloc;
-    ComPtr<ID3D12Resource> rtIB;
-    ComPtr<D3D12MA::Allocation> rtIBAlloc;
+    SharedPtr<Buffer> rtVertices;
+    SharedPtr<Buffer> rtIndices;
 };

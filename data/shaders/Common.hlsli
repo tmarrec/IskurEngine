@@ -13,7 +13,7 @@ struct VertexOut
     float2 texCoord : TEXCOORD4;
     float3 T : TEXCOORD5;
     float3 N : TEXCOORD6;
-    nointerpolation  float Tw : TEXCOORD7;
+    nointerpolation float Tw : TEXCOORD7;
 };
 
 struct Payload
