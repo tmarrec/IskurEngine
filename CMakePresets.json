@@ -7,7 +7,7 @@
 	  "architecture": {
 		"value": "x64"
 	  },
-	  "binaryDir": "${sourceDir}/build"
+	  "binaryDir": "${sourceDir}/build/engine"
 	}
   ]
 }

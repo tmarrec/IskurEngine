@@ -1,8 +1,0 @@
-{
-    "Format": "github-actions",
-    "exclude": [
-        ".git",
-        "LICENSE",
-        "Tests"
-    ]
-}

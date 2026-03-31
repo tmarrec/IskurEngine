@@ -1,4 +1,4 @@
-// Iškur Engine
+// Iskur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
@@ -8,11 +8,9 @@
 #include <bit>
 #include <chrono>
 #include <imgui_impl_win32.h>
-#include <windowsx.h>
 
 #include "Core.h"
-#include "common/Asserts.h"
-#include "renderer/Camera.h"
+#include "common/UtfConversion.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -20,31 +18,69 @@ namespace
 {
 using namespace std::chrono;
 
-steady_clock::time_point g_LastFrameTime = steady_clock::now();
-steady_clock::time_point g_LastFpsTime = g_LastFrameTime;
-u32 g_FrameCount = 0;
-f32 g_FrameTimeMs = 0.0f;
-f32 g_Fps = 0.0f;
+void RegisterRawMouseInput(HWND hwnd)
+{
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = 0x01; // Generic Desktop Controls
+    rid.usUsage = 0x02;     // Mouse
+    rid.dwFlags = 0;
+    rid.hwndTarget = hwnd;
+    IE_Assert(RegisterRawInputDevices(&rid, 1, sizeof(rid)) == TRUE);
+}
+
+void HandleRawMouseInput(const LPARAM lParam, Camera& camera)
+{
+    RAWINPUT raw{};
+    UINT rawSize = sizeof(raw);
+    if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &rawSize, sizeof(RAWINPUTHEADER)) == UINT(-1))
+    {
+        return;
+    }
+
+    if (raw.header.dwType != RIM_TYPEMOUSE)
+    {
+        return;
+    }
+
+    const LONG dx = raw.data.mouse.lLastX;
+    const LONG dy = raw.data.mouse.lLastY;
+    if (dx != 0 || dy != 0)
+    {
+        camera.OnRawMouseDelta(static_cast<i32>(dx), static_cast<i32>(dy));
+    }
+}
 
 LRESULT CALLBACK loc_WndProc(const HWND hWnd, const UINT msg, const WPARAM wParam, const LPARAM lParam)
 {
+    const Window* window = std::bit_cast<const Window*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
+    if (window && msg == WM_INPUT)
+    {
+        Camera& camera = window->GetCore()->GetRenderer().GetCamera();
+        HandleRawMouseInput(lParam, camera);
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
     {
         return true;
     }
 
-    const Window* window = std::bit_cast<const Window*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
+    window = std::bit_cast<const Window*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
     if (!window)
     {
         return DefWindowProc(hWnd, msg, wParam, lParam);
     }
 
-    Camera& camera = Camera::GetInstance();
+    Camera& camera = window->GetCore()->GetRenderer().GetCamera();
 
     switch (msg)
     {
+    case WM_CLOSE:
+        window->Terminate();
+        break;
+
     case WM_DESTROY:
-        Core::OnTerminate();
+        window->GetCore()->OnTerminate();
         PostQuitMessage(0);
         break;
 
@@ -54,10 +90,6 @@ LRESULT CALLBACK loc_WndProc(const HWND hWnd, const UINT msg, const WPARAM wPara
 
     case WM_KEYUP:
         camera.OnKeyUp(wParam);
-        break;
-
-    case WM_MOUSEMOVE:
-        camera.OnMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
         break;
 
     case WM_ACTIVATE:
@@ -72,41 +104,33 @@ LRESULT CALLBACK loc_WndProc(const HWND hWnd, const UINT msg, const WPARAM wPara
         break;
 
     case WM_PAINT:
-        Core::OnUpdate();
-        Core::OnRender();
+    {
+        PAINTSTRUCT ps{};
+        BeginPaint(hWnd, &ps);
+        EndPaint(hWnd, &ps);
         break;
+    }
 
     default:
         return DefWindowProc(hWnd, msg, wParam, lParam);
-    }
-
-    const steady_clock::time_point now = steady_clock::now();
-    g_FrameTimeMs = std::chrono::duration<f32, std::milli>(now - g_LastFrameTime).count();
-    g_LastFrameTime = now;
-
-    g_FrameCount++;
-    const f32 elapsedSec = std::chrono::duration<f32>(now - g_LastFpsTime).count();
-    if (elapsedSec >= 1.0f)
-    {
-        g_Fps = static_cast<f32>(g_FrameCount) / elapsedSec;
-        g_FrameCount = 0;
-        g_LastFpsTime = now;
     }
 
     return 0;
 }
 } // namespace
 
-void Window::Run(const RunInfo& runInfo)
+void Window::Run(Core& core, const RunInfo& runInfo)
 {
-    m_Fullscreen = runInfo.fullscreen;
-    m_Name = runInfo.name.data();
-    m_Title = runInfo.title.data();
+    m_Core = &core;
+    m_Name = runInfo.name;
+    m_Title = runInfo.title;
     m_Resolution = runInfo.resolution;
     m_Hinstance = runInfo.hInstance;
+    const std::wstring wideName = Utf8ToWide(m_Name);
+    const std::wstring wideTitle = Utf8ToWide(m_Title);
 
-    const WNDCLASSEX windowClass = {
-        .cbSize = sizeof(WNDCLASSEX),
+    const WNDCLASSEXW windowClass = {
+        .cbSize = sizeof(WNDCLASSEXW),
         .style = CS_HREDRAW | CS_VREDRAW,
         .lpfnWndProc = loc_WndProc,
         .cbClsExtra = NULL,
@@ -116,37 +140,36 @@ void Window::Run(const RunInfo& runInfo)
         .hCursor = LoadCursor(nullptr, IDC_ARROW),
         .hbrBackground = nullptr,
         .lpszMenuName = nullptr,
-        .lpszClassName = m_Name,
+        .lpszClassName = wideName.c_str(),
         .hIconSm = LoadIcon(nullptr, IDI_APPLICATION),
     };
     IE_Assert(RegisterClassExW(&windowClass));
 
-    SetProcessDPIAware();
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    m_Hwnd = CreateWindowEx(NULL, m_Name, m_Title, WS_OVERLAPPED | WS_MINIMIZEBOX | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, static_cast<i32>(m_Resolution.x), static_cast<i32>(m_Resolution.y),
-                            nullptr, nullptr, m_Hinstance, nullptr);
+    constexpr DWORD windowStyle = WS_OVERLAPPED | WS_MINIMIZEBOX | WS_SYSMENU;
+    RECT windowRect = {0, 0, static_cast<LONG>(m_Resolution.x), static_cast<LONG>(m_Resolution.y)};
+    IE_Assert(AdjustWindowRectExForDpi(&windowRect, windowStyle, FALSE, 0, GetDpiForSystem()) == TRUE);
+
+    m_Hwnd = CreateWindowExW(0, wideName.c_str(), wideTitle.c_str(), windowStyle, CW_USEDEFAULT, CW_USEDEFAULT, windowRect.right - windowRect.left,
+                             windowRect.bottom - windowRect.top, nullptr, nullptr, m_Hinstance, nullptr);
     IE_Assert(m_Hwnd);
 
     SetWindowLongPtr(m_Hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-
-    if (m_Fullscreen)
-    {
-        const HMONITOR hmonitor = MonitorFromWindow(m_Hwnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO monitorInfo = {.cbSize = sizeof(monitorInfo), .rcMonitor = {0, 0, 0, 0}, .rcWork = {0, 0, 0, 0}, .dwFlags = 0};
-        GetMonitorInfo(hmonitor, &monitorInfo);
-
-        m_Resolution.x = monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left;
-        m_Resolution.y = monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top;
-        SetWindowLong(m_Hwnd, GWL_STYLE, 0);
-    }
+    RegisterRawMouseInput(m_Hwnd);
 
     m_AspectRatio = static_cast<f32>(m_Resolution.x) / static_cast<f32>(m_Resolution.y);
 
-    Core::OnInit();
-
     ShowWindow(m_Hwnd, runInfo.nShowCmd);
+    UpdateWindow(m_Hwnd);
 
-    const Camera& camera = Camera::GetInstance();
+    m_Core->OnInit();
+    m_LastFrameTime = steady_clock::now();
+    m_LastFpsTime = m_LastFrameTime;
+    m_FrameCount = 0;
+    m_FrameTimeMs = 0.0f;
+    m_Fps = 0.0f;
+
     MSG msg{};
     while (msg.message != WM_QUIT)
     {
@@ -155,19 +178,41 @@ void Window::Run(const RunInfo& runInfo)
             TranslateMessage(&msg);
             DispatchMessage(&msg);
 
-            camera.HandleShowCursor();
+            m_Core->GetRenderer().GetCamera().HandleShowCursor();
+        }
+        else
+        {
+            if (IsIconic(m_Hwnd))
+            {
+                m_LastFrameTime = steady_clock::now();
+                continue;
+            }
+
+            m_Core->OnUpdate();
+            m_Core->OnRender();
+
+            const steady_clock::time_point now = steady_clock::now();
+            m_FrameTimeMs = std::chrono::duration<f32, std::milli>(now - m_LastFrameTime).count();
+            m_LastFrameTime = now;
+
+            m_FrameCount++;
+            const f32 elapsedSec = std::chrono::duration<f32>(now - m_LastFpsTime).count();
+            if (elapsedSec >= 1.0f)
+            {
+                m_Fps = static_cast<f32>(m_FrameCount) / elapsedSec;
+                m_FrameCount = 0;
+                m_LastFpsTime = now;
+            }
         }
     }
 }
 
 void Window::Terminate() const
 {
-    CloseWindow(m_Hwnd);
-}
-
-const HINSTANCE& Window::GetHinstance() const
-{
-    return m_Hinstance;
+    if (m_Hwnd)
+    {
+        DestroyWindow(m_Hwnd);
+    }
 }
 
 const HWND& Window::GetHwnd() const
@@ -185,17 +230,18 @@ f32 Window::GetAspectRatio() const
     return m_AspectRatio;
 }
 
-bool Window::IsFullscreen() const
+Core* Window::GetCore() const
 {
-    return m_Fullscreen;
+    return m_Core;
 }
 
-f32 Window::GetFPS()
+f32 Window::GetFPS() const
 {
-    return g_Fps;
+    return m_Fps;
 }
 
-f32 Window::GetFrameTimeMs()
+f32 Window::GetFrameTimeMs() const
 {
-    return g_FrameTimeMs;
+    return m_FrameTimeMs;
 }
+

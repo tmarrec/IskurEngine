@@ -1,4 +1,4 @@
-// Iškur Engine
+// Iskur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
@@ -7,14 +7,18 @@
 
 #include <chrono>
 
-#include "renderer/Camera.h"
-#include "renderer/Renderer.h"
-#include "window/Window.h"
+Core::Core() : m_Window(), m_Renderer(m_Window)
+{
+}
+
+void Core::Run(const Window::RunInfo& runInfo)
+{
+    m_Window.Run(*this, runInfo);
+}
 
 void Core::OnInit()
 {
-    Camera::GetInstance().Init();
-    Renderer::GetInstance().Init();
+    m_Renderer.Init();
 }
 
 void Core::OnUpdate()
@@ -25,16 +29,21 @@ void Core::OnUpdate()
     const f32 elapsedSeconds = duration<f32>(currentTime - lastTime).count();
     lastTime = currentTime;
 
-    Camera::GetInstance().Update(elapsedSeconds);
+    m_Renderer.GetCamera().Update(elapsedSeconds);
 }
 
 void Core::OnRender()
 {
-    Renderer::GetInstance().Render();
+    m_Renderer.Render();
 }
 
 void Core::OnTerminate()
 {
-    Renderer::GetInstance().Terminate();
-    Renderer::DestroyInstance();
+    m_Renderer.Terminate();
 }
+
+Renderer& Core::GetRenderer()
+{
+    return m_Renderer;
+}
+

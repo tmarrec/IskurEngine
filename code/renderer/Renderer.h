@@ -1,4 +1,4 @@
-﻿// Iškur Engine
+// Iskur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
@@ -7,75 +7,84 @@
 
 #include <dxgi1_6.h>
 
+#include "AutoExposure.h"
 #include "BindlessHeaps.h"
 #include "Buffer.h"
 #include "Camera.h"
 #include "Constants.h"
+#include "Culling.h"
+#include "DLSS.h"
 #include "Environments.h"
 #include "GBuffer.h"
-#include "GpuTimings.h"
+#include "GpuResource.h"
 #include "Primitive.h"
+#include "Raytracing.h"
+#include "RenderDevice.h"
+#include "RenderSceneTypes.h"
+#include "SceneResources.h"
 #include "Shader.h"
+#include "Sky.h"
+#include "Texture.h"
+#include "Timings.h"
 #include "common/IskurPackFormat.h"
 #include "shaders/CPUGPU.h"
 
-class SceneLoader;
+class Window;
+struct LoadedScene;
 
-enum AlphaMode : u8
-{
-    AlphaMode_Opaque,
-    AlphaMode_Blend,
-    AlphaMode_Mask,
-
-    AlphaMode_Count,
-};
-
-enum CullMode : u8
-{
-    CullMode_Back,
-    CullMode_None,
-
-    CullMode_Count
-};
-
-class Renderer : public Singleton<Renderer>
+class Renderer
 {
   public:
+    explicit Renderer(Window& window);
+
     void Init();
     void Terminate();
 
     void Render();
+    void MarkInstancesDirty();
 
     SharedPtr<Buffer> CreateBuffer(ID3D12GraphicsCommandList7* cmd, const BufferCreateDesc& createDesc);
     void SetBufferData(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const SharedPtr<Buffer>& dst, const void* data, u32 sizeInBytes, u32 offsetInBytes = 0);
 
-    static void Barrier(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const ComPtr<ID3D12Resource>& resource, D3D12_RESOURCE_STATES stateBefore, D3D12_RESOURCE_STATES stateAfter);
-    static void UAVBarrier(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const ComPtr<ID3D12Resource>& resource);
-
     BindlessHeaps& GetBindlessHeaps();
     const ComPtr<ID3D12Device14>& GetDevice() const;
+    Window& GetWindow();
+    const Window& GetWindow() const;
     XMUINT2 GetRenderSize() const;
+    Camera& GetCamera();
+    const Camera& GetCamera() const;
 
-    struct PerFrameData
-    {
-        ComPtr<ID3D12CommandAllocator> commandAllocator;
-        ComPtr<ID3D12GraphicsCommandList7> cmd;
-
-        ComPtr<ID3D12Fence> frameFence;
-        u64 frameFenceValue;
-
-        GpuTimers gpuTimers;
-    };
+    using PerFrameData = RenderDevice::PerFrameData;
     PerFrameData& GetCurrentFrameData();
 
+    Environment& GetCurrentEnvironment();
     const Environment& GetCurrentEnvironment() const;
+    const Vector<String>& GetEnvironmentNames() const;
+    const String& GetCurrentEnvironmentName() const;
+    i32 GetCurrentEnvironmentIndex() const;
+    void SetCurrentEnvironmentIndex(i32 index);
 
     void RequestShaderReload();
+    void RequestSceneSwitch(const String& sceneFile);
+    void RequestDLSSMode(DLSS::Mode mode);
+    DLSS::Mode GetDLSSMode() const;
+    bool HasPendingSceneSwitch() const;
+    const String& GetPendingSceneFile() const;
+    const String& GetCurrentSceneFile() const;
+    const Vector<String>& GetAvailableScenes() const;
 
   private:
-    friend class SceneLoader;
+    Window& m_Window;
 
-    SharedPtr<Buffer> m_MaterialsBuffer;
+    void ApplyTestInstanceMotion();
+    void CreateSceneDepthSRVs();
+    void PresentLoadingFrame();
+    void SubmitSceneUploadAndSync(PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd);
+
+    // Keep the device layer declared before allocator-backed resources so it outlives them.
+    RenderDevice m_RenderDevice;
+    BindlessHeaps m_BindlessHeaps;
+    SceneResources m_SceneResources;
 
     struct DepthPreResources
     {
@@ -83,11 +92,10 @@ class Renderer : public Singleton<Renderer>
         ComPtr<ID3D12RootSignature> opaqueRootSig;
         Array<ComPtr<ID3D12PipelineState>, CullMode_Count> alphaTestPSO;
         ComPtr<ID3D12RootSignature> alphaTestRootSig;
-        Array<ComPtr<D3D12MA::Allocation>, IE_Constants::frameInFlightCount> dsvAllocs;
-        Array<ComPtr<ID3D12Resource>, IE_Constants::frameInFlightCount> dsvs;
+        Array<DepthTexture, IE_Constants::frameInFlightCount> dsvs;
         ComPtr<ID3D12DescriptorHeap> dsvHeap;
-        Array<D3D12_CPU_DESCRIPTOR_HANDLE, IE_Constants::frameInFlightCount> dsvHandles;
-        Array<u32, IE_Constants::frameInFlightCount> dsvSrvIdx = {UINT32_MAX};
+        SharedPtr<Shader> opaqueMeshShader;
+        SharedPtr<Shader> alphaTestMeshShader;
         SharedPtr<Shader> alphaTestShader;
     } m_DepthPre{};
 
@@ -98,8 +106,6 @@ class Renderer : public Singleton<Renderer>
         Array<SharedPtr<Shader>, AlphaMode_Count> pixelShaders;
 
         Array<GBuffer, IE_Constants::frameInFlightCount> gbuffers = {};
-        Array<Array<D3D12_CPU_DESCRIPTOR_HANDLE, GBuffer::targetCount>, IE_Constants::frameInFlightCount> rtvHandles = {};
-
         Array<Array<ComPtr<ID3D12PipelineState>, CullMode_Count>, AlphaMode_Count> psos;
         Array<ComPtr<ID3D12RootSignature>, AlphaMode_Count> rootSigs;
     } m_GBuf{};
@@ -111,118 +117,84 @@ class Renderer : public Singleton<Renderer>
         SharedPtr<Shader> pxShader;
         SharedPtr<Shader> vxShader;
 
-        Array<ComPtr<ID3D12Resource>, IE_Constants::frameInFlightCount> hdrRt;
+        Array<RenderTarget, IE_Constants::frameInFlightCount> hdrRt;
         ComPtr<ID3D12DescriptorHeap> rtvHeap;
-        Array<D3D12_CPU_DESCRIPTOR_HANDLE, IE_Constants::frameInFlightCount> rtvHandles;
 
         Array<ComPtr<ID3D12Resource>, IE_Constants::frameInFlightCount> cb;
         Array<u8*, IE_Constants::frameInFlightCount> cbMapped;
     } m_Light{};
-
-    struct HistogramResources
-    {
-        u32 numBuckets = 256;
-        SharedPtr<Buffer> histogramBuffer;
-
-        SharedPtr<Shader> clearUintShader;
-        ComPtr<ID3D12RootSignature> clearUintRootSig;
-        ComPtr<ID3D12PipelineState> clearUintPso;
-
-        SharedPtr<Shader> histogramShader;
-        ComPtr<ID3D12RootSignature> histogramRootSig;
-        ComPtr<ID3D12PipelineState> histogramPso;
-
-        SharedPtr<Buffer> exposureBuffer;
-        SharedPtr<Shader> exposureShader;
-        ComPtr<ID3D12RootSignature> exposureRootSig;
-        ComPtr<ID3D12PipelineState> exposurePso;
-
-        SharedPtr<Buffer> adaptExposureBuffer;
-        SharedPtr<Shader> adaptExposureShader;
-        ComPtr<ID3D12RootSignature> adaptExposureRootSig;
-        ComPtr<ID3D12PipelineState> adaptExposurePso;
-    } m_Histo{};
 
     struct ToneMapResources
     {
         ComPtr<ID3D12RootSignature> rootSig;
         ComPtr<ID3D12PipelineState> pso;
 
-        Array<ComPtr<ID3D12Resource>, IE_Constants::frameInFlightCount> sdrRt;
+        Array<RenderTarget, IE_Constants::frameInFlightCount> sdrRt;
         ComPtr<ID3D12DescriptorHeap> rtvHeap;
-        Array<D3D12_CPU_DESCRIPTOR_HANDLE, IE_Constants::frameInFlightCount> rtvHandles;
         SharedPtr<Shader> vxShader;
         SharedPtr<Shader> pxShader;
     } m_Tonemap{};
 
-    struct FsrResources
+    struct BloomResources
     {
-        ffx::Context context;
-        i32 jitterPhaseCount = 0;
-        i32 jitterIndex = 0;
-        f32 jitterX = 0.0f;
-        f32 jitterY = 0.0f;
+        static constexpr u32 kMaxMipCount = 6;
+        u32 mipCount = 0;
+        Array<XMUINT2, kMaxMipCount> mipSizes{};
+        Array<Array<Texture, kMaxMipCount>, IE_Constants::frameInFlightCount> downChain{};
+        Array<Array<Texture, kMaxMipCount>, IE_Constants::frameInFlightCount> upChain{};
+
+        ComPtr<ID3D12RootSignature> downsampleRootSig;
+        ComPtr<ID3D12PipelineState> downsamplePso;
+        SharedPtr<Shader> downsampleCs;
+
+        ComPtr<ID3D12RootSignature> upsampleRootSig;
+        ComPtr<ID3D12PipelineState> upsamplePso;
+        SharedPtr<Shader> upsampleCs;
+    } m_Bloom{};
+
+    struct UpscaleResources
+    {
         XMUINT2 renderSize{};
         XMUINT2 presentSize{};
-        Array<ComPtr<ID3D12Resource>, IE_Constants::frameInFlightCount> outputs;
-        Array<u32, IE_Constants::frameInFlightCount> srvIdx;
-        Array<D3D12_RESOURCE_STATES, IE_Constants::frameInFlightCount> outputState;
-    } m_Fsr{};
+        Array<Texture, IE_Constants::frameInFlightCount> outputs;
+    } m_Upscale{};
 
-    void CreateDevice();
-    void CreateAllocator();
-    void CreateCommandQueue();
-    void CreateSwapchain();
-    void CreateFrameSynchronizationFences();
-    void CreateCommands();
     void CreateRTVs();
     void CreateDSV();
 
     void SetRenderAndPresentSize();
 
-    void CreateGPUTimers();
-
-    void CreateFSRPassResources();
+    void CreateUpscaleResources();
+    void CreateBloomResources();
     void CreateGBufferPassResources();
     void CreateLightingPassResources();
-    void CreateHistogramPassResources();
 
-    void CreateDepthPrePassPipelines(const Vector<WString>& globalDefines);
-    void CreateGBufferPassPipelines(const Vector<WString>& globalDefines);
-    void CreateLightingPassPipelines(const Vector<WString>& globalDefines);
-    void CreateHistogramPassPipelines(const Vector<WString>& globalDefines);
-    void CreateToneMapPassPipelines(const Vector<WString>& globalDefines);
+    void CreateDepthPrePassPipelines(const Vector<String>& globalDefines);
+    void CreateGBufferPassPipelines(const Vector<String>& globalDefines);
+    void CreateLightingPassPipelines(const Vector<String>& globalDefines);
+    void CreateBloomPassPipelines(const Vector<String>& globalDefines);
+    void CreateToneMapPassPipelines(const Vector<String>& globalDefines);
 
-    void LoadScene();
-
-    static void WaitOnFence(const ComPtr<ID3D12Fence>& fence, u64& fenceValue);
+    void ReloadRuntimeAndScene(const String& sceneFile);
+    void ReloadRuntimeForDLSSModeChange();
+    void LoadScene(const String& sceneFile);
+    void ProcessPendingSceneSwitch();
 
     void BeginFrame(PerFrameData& frameData, ComPtr<ID3D12GraphicsCommandList7>& cmd, Camera::FrameData& cameraFrameData, f32& jitterNormX, f32& jitterNormY);
     void Pass_DepthPre(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
-    void Pass_Shadows(const ComPtr<ID3D12GraphicsCommandList7>& cmd) const;
+    void Pass_Shadows(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
     void Pass_GBuffer(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
-    void Pass_PathTrace(const ComPtr<ID3D12GraphicsCommandList7>& cmd) const;
+    void Pass_PathTrace(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
+    void Pass_RTSpecular(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
     void Pass_Lighting(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const Camera::FrameData& cameraFrameData);
-    void Pass_FSR(const ComPtr<ID3D12GraphicsCommandList7>& cmd, f32 jitterNormX, f32 jitterNormY, const Camera::FrameData& cameraFrameData);
-    void Pass_Histogram(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
+    void Pass_Upscale(const ComPtr<ID3D12GraphicsCommandList7>& cmd, f32 jitterNormX, f32 jitterNormY, const Camera::FrameData& cameraFrameData);
+    void Pass_Bloom(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
     void Pass_Tonemap(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
     void Pass_ImGui(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const Camera::FrameData& cameraFrameData);
     void EndFrame(const PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd);
 
     void WaitForGpuIdle();
     void ReloadShaders();
-
-    ComPtr<ID3D12Device14> m_Device;
-    ComPtr<ID3D12Debug> m_Debug;
-    ComPtr<IDXGIFactory6> m_DxgiFactory;
-    ComPtr<D3D12MA::Allocator> m_Allocator;
-    ComPtr<IDXGIAdapter1> m_Adapter;
-    ComPtr<ID3D12CommandQueue> m_CommandQueue;
-    ComPtr<IDXGISwapChain4> m_Swapchain;
-
-    BindlessHeaps m_BindlessHeaps;
-
-    Array<PerFrameData, IE_Constants::frameInFlightCount> m_AllFrameData{};
 
     u32 m_FrameInFlightIdx = 0;
     u32 m_FrameIndex = 0;
@@ -236,38 +208,25 @@ class Renderer : public Singleton<Renderer>
     D3D12_VIEWPORT m_PresentViewport = {0, 0, 0, 0, 0, 0};
     D3D12_RECT m_PresentRect = {0, 0, 0, 0};
 
-    Vector<Material> m_Materials;
+    TimingState m_GpuTimingState{};
+    CpuTimers m_CpuTimers{};
+    TimingState m_CpuTimingState{};
 
-    u32 m_LinearSamplerIdx = UINT_MAX;
-
-    // Frame timing
-    GpuTimingState m_GpuTimingState{};
-
-    // Bindless indices maps
-    Vector<u32> m_TxhdToSrv;  // TXHD index -> SRV index
-    Vector<u32> m_SampToHeap; // SAMP index -> sampler heap index
-
-    // Scene
-    Vector<Primitive> m_Primitives;
-
-    struct PrimitiveRenderData
-    {
-        u32 primIndex;
-        PrimitiveConstants primConstants;
-    };
-    Vector<PrimitiveRenderData> m_PrimitivesRenderData[AlphaMode_Count][CullMode_Count];
-
-    Vector<ComPtr<ID3D12Resource>> m_Textures;
-
-    struct UploadTemp
-    {
-        ComPtr<ID3D12Resource> resource;
-        ComPtr<D3D12MA::Allocation> allocation;
-    };
-    Array<Vector<UploadTemp>, IE_Constants::frameInFlightCount> m_InFlightUploads;
-
-    // ImGui
-    ComPtr<ID3D12DescriptorHeap> m_ImGuiSrvHeap;
+    Camera m_Camera;
+    Raytracing m_Raytracing;
+    Culling m_Culling;
+    AutoExposure m_AutoExposure;
+    Sky m_Sky;
+    f32 m_LastSkyIntensityForRadianceCache = -1.0f;
+    u32 m_LastRadianceCacheMaxSamples = 0u;
+    u32 m_LastRadianceCacheNormalBinRes = 0u;
+    f32 m_LastRadianceCacheCellSize = -1.0f;
+    bool m_TestMovePrev = false;
+    Vector<XMFLOAT4X4> m_TestBaseWorlds;
+    DLSS::Mode m_DLSSMode = DLSS::Mode::Quality;
+    DLSS::Mode m_PendingDLSSMode = DLSS::Mode::Quality;
+    bool m_HasPendingDLSSModeChange = false;
+    u32 m_PendingSceneSwitchDelayFrames = 0;
 
     Environments m_Environments;
 

@@ -1,4 +1,4 @@
-﻿// Iškur Engine - Scene Packer
+// Iskur Engine - Scene Packer
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
@@ -15,6 +15,10 @@ using u8 = std::uint8_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using i32 = std::int32_t;
+
+inline constexpr char PACK_FILE_EXTENSION[] = ".ikp";
+
+constexpr u32 PACK_VERSION_LATEST = 18;
 
 constexpr u32 FourCC(char a, char b, char c, char d)
 {
@@ -34,6 +38,7 @@ enum : u32
 
     // Textures
     CH_TXHD = FourCC('T', 'X', 'H', 'D'),
+    CH_TXSR = FourCC('T', 'X', 'S', 'R'),
     CH_TXTB = FourCC('T', 'X', 'T', 'B'),
 
     // Samplers / Materials / Instances
@@ -42,22 +47,12 @@ enum : u32
     CH_INST = FourCC('I', 'N', 'S', 'T'),
 };
 
-// Texture/material flags
+// Material flags
 enum : u32
 {
-    TEXFLAG_SRGB = 1u << 0,
-    TEXFLAG_NORMAL = 1u << 1,
-
-    MATF_ALPHA_OPAQUE = 0,
     MATF_ALPHA_MASK = 1u << 0,
     MATF_ALPHA_BLEND = 1u << 1,
     MATF_DOUBLE_SIDED = 1u << 2,
-    MATF_HAS_BC = 1u << 3,
-    MATF_HAS_NORM = 1u << 4,
-    MATF_HAS_MR = 1u << 5,
-    MATF_HAS_OCC = 1u << 6,
-    MATF_HAS_EMISSIVE = 1u << 7,
-    MATF_UV_XFORM = 1u << 8,
 };
 
 #pragma pack(push, 1)
@@ -93,13 +88,37 @@ struct PrimRecord
     u32 vertexCount, indexCount, meshletCount;
     u64 vertexByteOffset, indexByteOffset, meshletsByteOffset, mlVertsByteOffset, mlTrisByteOffset, mlBoundsByteOffset;
     u32 mlVertsCount, mlTrisByteCount;
+
+    // Primitive-local bounding sphere (object space).
+    DirectX::XMFLOAT3 localBoundsCenter;
+    float localBoundsRadius;
 };
+static_assert(sizeof(PrimRecord) == 96);
 
 // Texture table entry
 struct TextureRecord
 {
-    u32 imageIndex, flags;
+    u32 imageIndex;
+    u32 format;
+    u32 dimension;
+    u32 miscFlags;
+    u32 miscFlags2;
+    u32 width;
+    u32 height;
+    u32 depth;
+    u32 arraySize;
+    u32 mipLevels;
+    u32 subresourceOffset;
+    u32 subresourceCount;
     u64 byteOffset, byteSize;
+};
+
+struct TextureSubresourceRecord
+{
+    u64 byteOffset;
+    u64 byteSize;
+    u32 rowPitch;
+    u32 slicePitch;
 };
 
 // On-disk Material
@@ -111,9 +130,7 @@ struct MaterialRecord
     u32 baseColorSampler, normalSampler, metallicRoughSampler, occlusionSampler, emissiveSampler;
 
     float baseColorFactor[4], emissiveFactor[3], metallicFactor, roughnessFactor, normalScale, occlusionStrength, alphaCutoff;
-    u32 flags; // MATF_*
-    float uvScale[2], uvOffset[2], uvRotation;
-    u32 _pad1;
+    u32 flags; // MATF_ALPHA_* | MATF_DOUBLE_SIDED
 };
 
 struct InstanceRecord

@@ -1,0 +1,27 @@
+# scene_name pos_x pos_y pos_z yaw pitch
+alphablendmodetest -0.2 1.8 4.9 270.6 -7.9
+box -1.9 0.8 -1.5 396.0 -19.9
+boxtextured -1.9 0.8 -1.5 396.0 -19.9
+cesiummilktruck 3.6 3.0 3.5 220.4 -23.3
+compareambientocclusion -0.0 0.4 0.8 269.2 -23.1
+compareroughness 0.0 0.3 1.8 269.6 -11.5
+comparemetallic 0.0 0.3 1.8 269.6 -11.5
+comparenormal 0.0 0.3 1.8 269.6 -11.5
+comparebasecolor 0.0 0.4 2.3 -91.4 -11.7
+damagedhelmet -1.4 1.1 2.1 299.4 -24.7
+lantern 21.7 16.4 18.5 226.8 -6.7
+negativescaletest -0.5 0.9 10.0 270.2 -4.7
+normaltangenttest 0.014327605 0.088846914 2.6952298 270.79776 -2.6999424
+normaltangentmirrortest 0.014327605 0.088846914 2.6952298 270.79776 -2.6999424
+simpletexture 0.4 0.5 1.1 270.6 -2.5
+texturecoordinatetest -0.2 0.1 2.8 271.0 -2.9
+texturesettingstest -0.7 -0.1 10.7 270.6 -2.7
+vertexcolortest -0.2 0.2 2.5 270.6 -5.1
+twosidedplane -1.2 1.4 1.7 302.2 -42.3
+orientationtest 10.8 8.8 11.6 586.0 -31.1
+metalroughspheres -0.8 0.8 9.7 270.8 -4.9
+metalroughspheresnotextures -0.8 0.8 9.7 270.8 -4.9
+sponza -10.1 1.2 -0.3 1438.8 3.9
+bistro -20.0 4.3 -1.0 368.4 5.9
+san-miguel 26.9 1.7 2.0 -170.5 2.9
+stanforddragon -19.0 5.0 20.2 310.5 -25.8

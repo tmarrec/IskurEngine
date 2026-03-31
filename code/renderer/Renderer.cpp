@@ -1,38 +1,75 @@
-// Iškur Engine
+// Iskur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
 
 #include "Renderer.h"
 
-#include <directx/d3dx12.h>
-#include <dx12/ffx_api_dx12.hpp>
-
 #include "Camera.h"
 #include "Constants.h"
+#include "Culling.h"
+#include "DLSS.h"
 #include "ImGui.h"
-#include "LoadShader.h"
+#include "PipelineHelpers.h"
 #include "Raytracing.h"
 #include "SceneLoader.h"
-#include "common/Asserts.h"
+#include "Streamline.h"
+#include "TemporalJitter.h"
 #include "common/CommandLineArguments.h"
-#include "common/Types.h"
-#include "common/math/MathUtils.h"
 #include "window/Window.h"
+
+#include <cmath>
+
+namespace
+{
+u32 GetDLSSJitterPhaseCount(const DLSS::Mode mode)
+{
+    switch (mode)
+    {
+    case DLSS::Mode::Disabled:
+    case DLSS::Mode::DLAA:
+        return 32;
+    case DLSS::Mode::Quality:
+        return 48;
+    case DLSS::Mode::Balanced:
+        return 64;
+    case DLSS::Mode::Performance:
+        return 96;
+    case DLSS::Mode::UltraPerformance:
+        return 144;
+    }
+
+    IE_Assert(false);
+    return 8;
+}
+
+f32 GetDLSSMaterialTextureMipBias(const DLSS::Mode mode, const XMUINT2 renderSize, const XMUINT2 outputSize, const f32 biasScale)
+{
+    if (mode == DLSS::Mode::Disabled || renderSize.x == 0u || outputSize.x == 0u)
+    {
+        return 0.0f;
+    }
+
+    const f32 scaleX = static_cast<f32>(renderSize.x) / static_cast<f32>(outputSize.x);
+    return std::log2(scaleX) * biasScale;
+}
+} // namespace
+
+Renderer::Renderer(Window& window)
+    : m_Window(window), m_RenderDevice(), m_BindlessHeaps(), m_SceneResources(m_RenderDevice, m_BindlessHeaps), m_Camera(window), m_Raytracing(m_RenderDevice, m_BindlessHeaps, m_Camera)
+{
+}
 
 void Renderer::Init()
 {
-    CreateDevice();
-    CreateAllocator();
-    CreateCommandQueue();
-    CreateCommands();
-    CreateFrameSynchronizationFences();
+    m_Camera.Init();
 
+    m_Upscale.presentSize = m_Window.GetResolution();
+    m_RenderDevice.Init(m_Window, m_Upscale.presentSize);
     SetRenderAndPresentSize();
 
-    m_BindlessHeaps.Init(m_Device);
+    m_BindlessHeaps.Init(m_RenderDevice.GetDevice());
 
-    CreateSwapchain();
     CreateRTVs();
     CreateDSV();
 
@@ -47,354 +84,229 @@ void Renderer::Init()
     d.finalState = D3D12_RESOURCE_STATE_GENERIC_READ;
     d.name = L"Color Constants";
     m_ConstantsBuffer = CreateBuffer(nullptr, d);
-    IE_Check(m_ConstantsBuffer->buffer->Map(0, nullptr, reinterpret_cast<void**>(&m_ConstantsCbMapped)));
+    IE_Check(m_ConstantsBuffer->Map(0, nullptr, reinterpret_cast<void**>(&m_ConstantsCbMapped)));
 
-    LoadScene();
+    m_Environments.Load();
+    m_RenderDevice.CreateGPUTimers(m_GpuTimingState);
 
-    m_Environments.Load(m_CommandQueue.Get());
-
-    CreateGPUTimers();
-
-    CreateFSRPassResources();
-    CreateGBufferPassResources();
-    CreateLightingPassResources();
-    CreateHistogramPassResources();
-
-    ReloadShaders();
-
+    m_SceneResources.RefreshAvailableScenes();
+    const CommandLineArguments& args = GetCommandLineArguments();
+    const String startupSceneArg = args.sceneFile.empty() ? "Sponza" : args.sceneFile;
+    String startupScene = m_SceneResources.ResolveSceneName(startupSceneArg);
+    if (!m_SceneResources.GetAvailableScenes().empty())
+    {
+        const Vector<String>& availableScenes = m_SceneResources.GetAvailableScenes();
+        bool found = false;
+        for (const String& sceneName : availableScenes)
+        {
+            if (sceneName == startupScene)
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+        {
+            IE_LogWarn("Startup scene '{}' not found in data/scenes, falling back to '{}'", startupSceneArg, availableScenes[0]);
+            startupScene = availableScenes[0];
+        }
+    }
     ImGui_InitParams imGuiInitParams;
-    imGuiInitParams.device = m_Device.Get();
-    imGuiInitParams.queue = m_CommandQueue.Get();
+    imGuiInitParams.device = m_RenderDevice.GetDevice().Get();
+    imGuiInitParams.queue = m_RenderDevice.GetCommandQueue().Get();
+    imGuiInitParams.hwnd = m_Window.GetHwnd();
     imGuiInitParams.rtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     ImGui_Init(imGuiInitParams);
+
+    m_SceneResources.RequestSceneSwitch(startupScene);
+    m_PendingSceneSwitchDelayFrames = 0;
+    PresentLoadingFrame();
+
+    ReloadShaders();
 }
 
 void Renderer::Terminate()
 {
-    // Wait for last frame execution
     WaitForGpuIdle();
 
-    if (m_ConstantsBuffer && m_ConstantsBuffer->buffer && m_ConstantsCbMapped)
+    if (m_ConstantsBuffer && m_ConstantsBuffer->resource && m_ConstantsCbMapped)
     {
-        m_ConstantsBuffer->buffer->Unmap(0, nullptr);
+        m_ConstantsBuffer->Unmap(0, nullptr);
         m_ConstantsCbMapped = nullptr;
     }
 
-    // Raytracing
-    Raytracing::DestroyInstance();
-
-    // FSR
-    IE_Assert(ffx::DestroyContext(m_Fsr.context) == ffx::ReturnCode::Ok);
-
-    // ImGui
+    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
+    {
+        if (m_Light.cb[i] && m_Light.cbMapped[i])
+        {
+            m_Light.cb[i]->Unmap(0, nullptr);
+            m_Light.cbMapped[i] = nullptr;
+        }
+    }
+    m_Sky.Terminate();
     ImGui_Shutdown();
+    m_RenderDevice.Terminate();
 }
 
 void Renderer::Render()
 {
-    m_FrameInFlightIdx = m_Swapchain->GetCurrentBackBufferIndex();
+    m_CpuTimers.passCount = 0;
+    m_CpuTimers.openScopeCount = 0;
+    m_FrameInFlightIdx = m_RenderDevice.GetCurrentBackBufferIndex();
+    ProcessPendingSceneSwitch();
+
     PerFrameData& frameData = GetCurrentFrameData();
     ComPtr<ID3D12GraphicsCommandList7> cmd;
     Camera::FrameData cameraFrameData{};
     f32 jitterNormX = 0.f, jitterNormY = 0.f;
 
-    BeginFrame(frameData, cmd, cameraFrameData, jitterNormX, jitterNormY);
+    CPU_MARKER_BEGIN(m_CpuTimers, "Wait for GPU");
+    m_RenderDevice.WaitForFrame(frameData);
+    CPU_MARKER_END(m_CpuTimers);
 
+    CPU_MARKER_BEGIN(m_CpuTimers, "Frame Setup");
+    BeginFrame(frameData, cmd, cameraFrameData, jitterNormX, jitterNormY);
+    CPU_MARKER_END(m_CpuTimers);
+
+    CPU_MARKER_BEGIN(m_CpuTimers, "Instance Motion");
+    ApplyTestInstanceMotion();
+    CPU_MARKER_END(m_CpuTimers);
+
+    const bool updateInstances = m_SceneResources.AreInstancesDirty();
+    const Vector<Primitive>& scenePrimitives = m_SceneResources.GetPrimitives();
+    const Vector<Material>& sceneMaterials = m_SceneResources.GetMaterials();
+    const Vector<InstanceData>& sceneInstances = m_SceneResources.GetInstances();
+    const SharedPtr<Buffer>& materialsBuffer = m_SceneResources.GetMaterialsBuffer();
+
+    BuildParams cullingParams{};
+    cullingParams.primitives = &scenePrimitives;
+    cullingParams.materials = &sceneMaterials;
+    cullingParams.instances = &sceneInstances;
+    cullingParams.view = &cameraFrameData.view;
+    cullingParams.nearPlane = cameraFrameData.znearfar.x;
+    cullingParams.frustumCullFovDeg = g_Settings.cameraFrustumCullingFov;
+    cullingParams.aspectRatio = m_Window.GetAspectRatio();
+    cullingParams.cpuFrustumCullingEnabled = g_Settings.cpuFrustumCulling;
+    cullingParams.updateInstances = updateInstances;
+    cullingParams.debugMeshletColorEnabled = g_Settings.debugMeshletColor;
+    cullingParams.materialsBufferSrvIndex = materialsBuffer->srvIndex;
+    cullingParams.cpuTimers = &m_CpuTimers;
+
+    Culling& culling = m_Culling;
+    culling.Build(cullingParams);
+
+    CPU_MARKER_BEGIN(m_CpuTimers, "Ray Tracing Instance Upload");
+    if (updateInstances)
+    {
+        const Vector<Raytracing::RTInstance>& rtInstances = culling.GetRTInstances();
+        if (!rtInstances.empty())
+        {
+            m_Raytracing.UpdateInstances(cmd, rtInstances);
+        }
+        m_SceneResources.ClearInstancesDirty();
+    }
+    CPU_MARKER_END(m_CpuTimers);
+
+    CPU_MARKER_BEGIN(m_CpuTimers, "Render Pass Recording");
     Pass_DepthPre(cmd);
     Pass_GBuffer(cmd);
+    Array<D3D12_CPU_DESCRIPTOR_HANDLE, GBuffer::targetCount> gbufferRtvs = {
+        m_GBuf.gbuffers[m_FrameInFlightIdx].albedo.rtv,   m_GBuf.gbuffers[m_FrameInFlightIdx].normal.rtv,       m_GBuf.gbuffers[m_FrameInFlightIdx].normalGeo.rtv,
+        m_GBuf.gbuffers[m_FrameInFlightIdx].material.rtv, m_GBuf.gbuffers[m_FrameInFlightIdx].motionVector.rtv, m_GBuf.gbuffers[m_FrameInFlightIdx].ao.rtv,
+    };
+    m_Sky.PassSkyMotion(cmd, frameData.gpuTimers, m_FrameInFlightIdx, cameraFrameData, gbufferRtvs, m_GBuf.gbuffers[m_FrameInFlightIdx].motionVector, m_DepthPre.dsvs[m_FrameInFlightIdx].srvIndex,
+                        m_BindlessHeaps);
     Pass_Shadows(cmd);
+    m_Sky.PassProceduralSkyCube(cmd, frameData.gpuTimers, m_Environments.GetCurrentEnvironment(), m_BindlessHeaps, m_Raytracing);
+    Pass_RTSpecular(cmd);
     Pass_PathTrace(cmd);
     Pass_Lighting(cmd, cameraFrameData);
-    Pass_FSR(cmd, jitterNormX, jitterNormY, cameraFrameData);
-    Pass_Histogram(cmd);
+    m_AutoExposure.Pass(cmd, frameData.gpuTimers, m_BindlessHeaps, m_Light.hdrRt[m_FrameInFlightIdx], m_Light.hdrRt[m_FrameInFlightIdx].srvIndex, m_DepthPre.dsvs[m_FrameInFlightIdx].srvIndex,
+                        m_Upscale.renderSize, m_Window.GetFrameTimeMs());
+    Pass_Upscale(cmd, jitterNormX, jitterNormY, cameraFrameData);
+    Pass_Bloom(cmd);
     Pass_Tonemap(cmd);
+    CPU_MARKER_END(m_CpuTimers);
+
+    Timings_CollectCpu(m_CpuTimers, m_CpuTimingState);
+    Timings_UpdateAverages(m_CpuTimingState, m_Window.GetFrameTimeMs(), g_Settings.timingAverageWindowMs);
     Pass_ImGui(cmd, cameraFrameData);
 
     EndFrame(frameData, cmd);
 }
 
+void Renderer::MarkInstancesDirty()
+{
+    m_SceneResources.MarkInstancesDirty();
+}
+
 SharedPtr<Buffer> Renderer::CreateBuffer(ID3D12GraphicsCommandList7* cmd, const BufferCreateDesc& createDesc)
 {
-    IE_Assert(createDesc.sizeInBytes > 0);
-
-    const bool hasInitData = (createDesc.initialData != nullptr) && (createDesc.initialDataSize > 0);
-
-    if (hasInitData)
-    {
-        IE_Assert(createDesc.initialDataSize <= createDesc.sizeInBytes);
-    }
-    else
-    {
-        IE_Assert(createDesc.initialData == nullptr || createDesc.initialDataSize == 0);
-    }
-
-    // Views imply you know how the buffer is viewed.
-    if (createDesc.createSRV || createDesc.createUAV)
-    {
-        IE_Assert(createDesc.viewKind != BufferCreateDesc::ViewKind::None);
-    }
-
-    // UAV view only makes sense on DEFAULT heap.
-    if (createDesc.createUAV)
-    {
-        IE_Assert(createDesc.heapType == D3D12_HEAP_TYPE_DEFAULT);
-        IE_Assert((createDesc.resourceFlags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0);
-    }
-
-    // Heap-specific sanity
-    if (createDesc.heapType == D3D12_HEAP_TYPE_UPLOAD)
-    {
-        IE_Assert((createDesc.resourceFlags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0);
-        IE_Assert(!createDesc.createUAV);
-        IE_Assert(createDesc.initialState == D3D12_RESOURCE_STATE_COMMON || createDesc.initialState == D3D12_RESOURCE_STATE_GENERIC_READ);
-        IE_Assert(createDesc.finalState == D3D12_RESOURCE_STATE_COMMON || createDesc.finalState == D3D12_RESOURCE_STATE_GENERIC_READ);
-    }
-    else if (createDesc.heapType == D3D12_HEAP_TYPE_READBACK)
-    {
-        IE_Assert((createDesc.resourceFlags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0);
-        IE_Assert(!createDesc.createUAV);
-        IE_Assert(!hasInitData); // init-from-CPU into a readback resource is almost certainly a bug
-        IE_Assert(createDesc.initialState == D3D12_RESOURCE_STATE_COMMON || createDesc.initialState == D3D12_RESOURCE_STATE_COPY_DEST);
-        IE_Assert(createDesc.finalState == D3D12_RESOURCE_STATE_COMMON || createDesc.finalState == D3D12_RESOURCE_STATE_COPY_DEST);
-    }
-
-    SharedPtr<Buffer> out = IE_MakeSharedPtr<Buffer>();
-
-    D3D12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(createDesc.sizeInBytes, createDesc.resourceFlags);
-
-    D3D12MA::ALLOCATION_DESC allocDesc{};
-    allocDesc.HeapType = createDesc.heapType;
-
-    // Track the *real* state at creation.
-    D3D12_RESOURCE_STATES createState = D3D12_RESOURCE_STATE_COMMON;
-
-    if (createDesc.heapType == D3D12_HEAP_TYPE_UPLOAD)
-    {
-        createState = D3D12_RESOURCE_STATE_GENERIC_READ;
-    }
-    else if (createDesc.heapType == D3D12_HEAP_TYPE_READBACK)
-    {
-        createState = D3D12_RESOURCE_STATE_COPY_DEST;
-    }
-    else if (createDesc.initialState == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)
-    {
-        createState = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
-    }
-
-    IE_Check(m_Allocator->CreateResource(&allocDesc, &resourceDesc, createState, nullptr, out->allocation.ReleaseAndGetAddressOf(), IID_PPV_ARGS(out->buffer.ReleaseAndGetAddressOf())));
-
-    IE_Check(out->buffer->SetName(createDesc.name));
-    out->state = createState;
-
-    // Decide the state the caller wants the returned buffer to be in.
-    // If init data exists and finalState is provided (non-COMMON), use it; otherwise fall back to initialState.
-    D3D12_RESOURCE_STATES desiredState = createDesc.initialState;
-    if (hasInitData && createDesc.finalState != D3D12_RESOURCE_STATE_COMMON)
-    {
-        desiredState = createDesc.finalState;
-    }
-
-    auto TransitionIfNeeded = [&](D3D12_RESOURCE_STATES newState) {
-        if (!cmd || out->state == newState)
-            return;
-
-        const D3D12_RESOURCE_BARRIER b = CD3DX12_RESOURCE_BARRIER::Transition(out->buffer.Get(), out->state, newState);
-        cmd->ResourceBarrier(1, &b);
-        out->state = newState;
-    };
-
-    // Init data
-    if (hasInitData)
-    {
-        if (createDesc.heapType == D3D12_HEAP_TYPE_UPLOAD)
-        {
-            u8* mapped = nullptr;
-
-            const CD3DX12_RANGE readRange(0, 0); // CPU won't read
-            IE_Check(out->buffer->Map(0, &readRange, reinterpret_cast<void**>(&mapped)));
-            std::memcpy(mapped, createDesc.initialData, createDesc.initialDataSize);
-
-            const CD3DX12_RANGE writeRange(0, createDesc.initialDataSize);
-            out->buffer->Unmap(0, &writeRange);
-        }
-        else
-        {
-            IE_Assert(createDesc.heapType == D3D12_HEAP_TYPE_DEFAULT);
-            IE_Assert(cmd != nullptr);
-
-            UploadTemp staging{};
-            const D3D12_RESOURCE_DESC upDesc = CD3DX12_RESOURCE_DESC::Buffer(createDesc.initialDataSize);
-
-            D3D12MA::ALLOCATION_DESC upAlloc{};
-            upAlloc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
-
-            IE_Check(m_Allocator->CreateResource(&upAlloc, &upDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, staging.allocation.ReleaseAndGetAddressOf(),
-                                                 IID_PPV_ARGS(staging.resource.ReleaseAndGetAddressOf())));
-
-            IE_Check(staging.resource->SetName(L"BufferInit/Upload"));
-
-            u8* mapped = nullptr;
-            const CD3DX12_RANGE readRange(0, 0);
-            IE_Check(staging.resource->Map(0, &readRange, reinterpret_cast<void**>(&mapped)));
-            std::memcpy(mapped, createDesc.initialData, createDesc.initialDataSize);
-            const CD3DX12_RANGE writeRange(0, createDesc.initialDataSize);
-            staging.resource->Unmap(0, &writeRange);
-
-            TransitionIfNeeded(D3D12_RESOURCE_STATE_COPY_DEST);
-
-            cmd->CopyBufferRegion(out->buffer.Get(), 0, staging.resource.Get(), 0, createDesc.initialDataSize);
-
-            if (desiredState != D3D12_RESOURCE_STATE_COPY_DEST)
-            {
-                TransitionIfNeeded(desiredState);
-            }
-
-            m_InFlightUploads[m_FrameInFlightIdx].push_back(std::move(staging));
-        }
-    }
-    else
-    {
-        // No init data: if caller wants a non-COMMON state and we have a cmd, transition now.
-        if (cmd && createDesc.heapType == D3D12_HEAP_TYPE_DEFAULT && createDesc.initialState != D3D12_RESOURCE_STATE_COMMON)
-        {
-            TransitionIfNeeded(createDesc.initialState);
-        }
-    }
-
-    // Views
-    out->srvIndex = UINT32_MAX;
-    out->uavIndex = UINT32_MAX;
-    out->numElements = 0;
-
-    if (createDesc.viewKind == BufferCreateDesc::ViewKind::Structured)
-    {
-        IE_Assert(createDesc.strideInBytes > 0);
-        IE_Assert((createDesc.strideInBytes & 3u) == 0);
-        IE_Assert(createDesc.strideInBytes <= 2048u);
-        IE_Assert((createDesc.sizeInBytes % createDesc.strideInBytes) == 0);
-
-        const u64 n64 = createDesc.sizeInBytes / createDesc.strideInBytes;
-        IE_Assert(n64 <= UINT32_MAX);
-        const u32 n = static_cast<u32>(n64);
-
-        out->numElements = n;
-
-        if (createDesc.createSRV)
-        {
-            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srv.Format = DXGI_FORMAT_UNKNOWN;
-            srv.Buffer.FirstElement = 0;
-            srv.Buffer.NumElements = n;
-            srv.Buffer.StructureByteStride = createDesc.strideInBytes;
-            out->srvIndex = m_BindlessHeaps.CreateSRV(out->buffer, srv);
-        }
-
-        if (createDesc.createUAV)
-        {
-            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-            uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            uav.Format = DXGI_FORMAT_UNKNOWN;
-            uav.Buffer.FirstElement = 0;
-            uav.Buffer.NumElements = n;
-            uav.Buffer.StructureByteStride = createDesc.strideInBytes;
-            out->uavIndex = m_BindlessHeaps.CreateUAV(out->buffer, uav);
-        }
-    }
-    else if (createDesc.viewKind == BufferCreateDesc::ViewKind::Raw)
-    {
-        IE_Assert((createDesc.sizeInBytes & 3u) == 0);
-
-        const u64 n64 = createDesc.sizeInBytes / 4u;
-        IE_Assert(n64 <= UINT32_MAX);
-        const u32 n = static_cast<u32>(n64);
-
-        out->numElements = n;
-
-        if (createDesc.createSRV)
-        {
-            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-            srv.Format = DXGI_FORMAT_R32_TYPELESS;
-            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srv.Buffer.FirstElement = 0;
-            srv.Buffer.NumElements = n;
-            srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-            out->srvIndex = m_BindlessHeaps.CreateSRV(out->buffer, srv);
-        }
-
-        if (createDesc.createUAV)
-        {
-            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-            uav.Format = DXGI_FORMAT_R32_TYPELESS;
-            uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            uav.Buffer.FirstElement = 0;
-            uav.Buffer.NumElements = n;
-            uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-            out->uavIndex = m_BindlessHeaps.CreateUAV(out->buffer, uav);
-        }
-    }
-    else
-    {
-        IE_Assert(!createDesc.createSRV);
-        IE_Assert(!createDesc.createUAV);
-    }
-
-    return out;
+    return m_RenderDevice.CreateBuffer(m_BindlessHeaps, cmd, createDesc);
 }
 
 void Renderer::BeginFrame(PerFrameData& frameData, ComPtr<ID3D12GraphicsCommandList7>& cmd, Camera::FrameData& cameraFrameData, f32& jitterNormX, f32& jitterNormY)
 {
-    WaitOnFence(frameData.frameFence, frameData.frameFenceValue);
-
-    m_InFlightUploads[m_FrameInFlightIdx].clear();
+    m_RenderDevice.ClearTrackedUploads(m_FrameInFlightIdx);
 
     if (m_PendingShaderReload)
     {
-        g_ShadersCompilationSuccess = true;
+        g_Stats.shadersCompilationSuccess = true;
         ReloadShaders();
         m_PendingShaderReload = false;
-        IE_Log("{}", g_ShadersCompilationSuccess);
     }
 
-    // Timings
-    GpuTimings_Collect(frameData.gpuTimers, m_GpuTimingState);
-    GpuTimings_UpdateAverages(m_GpuTimingState, Window::GetFrameTimeMs(), g_Timing_AverageWindowMs);
+    Timings_CollectGpu(frameData.gpuTimers, m_GpuTimingState);
+    Timings_UpdateAverages(m_GpuTimingState, m_Window.GetFrameTimeMs(), g_Settings.timingAverageWindowMs);
     frameData.gpuTimers.passCount = 0;
     frameData.gpuTimers.nextIdx = 0;
 
-    // Jitter
-    m_Fsr.jitterIndex = (m_Fsr.jitterIndex + 1) % m_Fsr.jitterPhaseCount;
+    const u32 jitterPhaseCount = GetDLSSJitterPhaseCount(m_DLSSMode);
+    const TemporalJitter::Sample jitter = TemporalJitter::ComputeHaltonJitter(m_FrameIndex, m_Upscale.renderSize.x, m_Upscale.renderSize.y, jitterPhaseCount);
+    const f32 jitterScale = (m_DLSSMode == DLSS::Mode::Disabled) ? 1.0f : g_Settings.dlssJitterScale;
+    jitterNormX = jitter.jitterNormX * jitterScale;
+    jitterNormY = jitter.jitterNormY * jitterScale;
 
-    ffx::QueryDescUpscaleGetJitterOffset jo{};
-    jo.index = m_Fsr.jitterIndex;
-    jo.phaseCount = m_Fsr.jitterPhaseCount;
-    jo.pOutX = &m_Fsr.jitterX;
-    jo.pOutY = &m_Fsr.jitterY;
-    IE_Assert(ffx::Query(m_Fsr.context, jo) == ffx::ReturnCode::Ok);
-
-    jitterNormX = m_Fsr.jitterX * 2.0f / static_cast<f32>(m_Fsr.renderSize.x);
-    jitterNormY = -m_Fsr.jitterY * 2.0f / static_cast<f32>(m_Fsr.renderSize.y);
-
-    // Camera
-    Camera& camera = Camera::GetInstance();
-    camera.ConfigurePerspective(Window::GetInstance().GetAspectRatio(), IE_ToRadians(g_Camera_FOV), IE_ToRadians(g_Camera_FrustumCullingFOV), 0.1f, jitterNormX, jitterNormY);
+    Camera& camera = m_Camera;
+    camera.ConfigurePerspective(m_Window.GetAspectRatio(), IE_ToRadians(g_Settings.cameraFov), IE_ToRadians(g_Settings.cameraFrustumCullingFov), 0.1f, jitterNormX, jitterNormY);
+    camera.BuildFrameData();
 
     Environment& env = m_Environments.GetCurrentEnvironment();
 
-    // Sun
-    float cosE = cosf(g_Sun_Elevation);
-    float sinE = sinf(g_Sun_Elevation);
-    XMVECTOR sun = XMVectorSet(cosE * cosf(g_Sun_Azimuth), sinE, cosE * sinf(g_Sun_Azimuth), 0.0f);
+    const float sinE = IE_Sinf(g_Settings.sunElevation);
+    const float cosE = IE_Cosf(g_Settings.sunElevation);
+    XMVECTOR sun = XMVectorSet(cosE * IE_Cosf(g_Settings.sunAzimuth), sinE, cosE * IE_Sinf(g_Settings.sunAzimuth), 0.0f);
     sun = XMVector3Normalize(sun);
     XMStoreFloat3(&env.sunDir, sun);
 
+    // Sky intensity changes path-traced lighting without regenerating the sky cube,
+    // so invalidate the radiance cache here.
+    if (IE_Fabs(g_Settings.skyIntensity - m_LastSkyIntensityForRadianceCache) > 1e-4f)
+    {
+        m_Raytracing.InvalidatePathTraceRadianceCache();
+        m_LastSkyIntensityForRadianceCache = g_Settings.skyIntensity;
+    }
+
+    // These parameters change cache keys or accumulation limits, so rebuild the
+    // radiance cache instead of reusing incompatible history.
+    constexpr u32 kRadianceCacheMaxSamplesSafeClamp = 262144u;
+    const u32 clampedMaxSamples = (g_Settings.radianceCacheMaxSamples < kRadianceCacheMaxSamplesSafeClamp) ? g_Settings.radianceCacheMaxSamples : kRadianceCacheMaxSamplesSafeClamp;
+    if (m_LastRadianceCacheMaxSamples != clampedMaxSamples || m_LastRadianceCacheNormalBinRes != g_Settings.radianceCacheNormalBinRes ||
+        IE_Fabs(g_Settings.radianceCacheCellSize - m_LastRadianceCacheCellSize) > 1e-6f)
+    {
+        m_Raytracing.InvalidatePathTraceRadianceCache();
+        m_LastRadianceCacheMaxSamples = clampedMaxSamples;
+        m_LastRadianceCacheNormalBinRes = g_Settings.radianceCacheNormalBinRes;
+        m_LastRadianceCacheCellSize = g_Settings.radianceCacheCellSize;
+    }
+
     cameraFrameData = camera.GetFrameData();
 
-    // Constant Buffer
-    VertexConstants constants;
+    VertexConstants constants{};
     constants.cameraPos = cameraFrameData.position;
+    constants.gpuFrustumCullingEnabled = g_Settings.gpuFrustumCulling ? 1u : 0u;
+    constants.gpuBackfaceCullingEnabled = g_Settings.gpuBackfaceCulling ? 1u : 0u;
+    constants.materialTextureMipBias = GetDLSSMaterialTextureMipBias(m_DLSSMode, m_Upscale.renderSize, m_Upscale.presentSize, 1.0f);
     constants.viewProj = cameraFrameData.viewProj;
     constants.view = cameraFrameData.view;
     constants.viewProjNoJ = cameraFrameData.viewProjNoJ;
@@ -413,62 +325,86 @@ void Renderer::BeginFrame(PerFrameData& frameData, ComPtr<ID3D12GraphicsCommandL
 
 void Renderer::Pass_DepthPre(const ComPtr<ID3D12GraphicsCommandList7>& cmd)
 {
-    // Transition
-    Barrier(cmd, m_DepthPre.dsvs[m_FrameInFlightIdx], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    m_DepthPre.dsvs[m_FrameInFlightIdx].Transition(cmd, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 
-    // Clear
-    cmd->OMSetRenderTargets(0, nullptr, false, &m_DepthPre.dsvHandles[m_FrameInFlightIdx]);
-    cmd->ClearDepthStencilView(m_DepthPre.dsvHandles[m_FrameInFlightIdx], D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+    cmd->OMSetRenderTargets(0, nullptr, false, &m_DepthPre.dsvs[m_FrameInFlightIdx].dsv);
+    cmd->ClearDepthStencilView(m_DepthPre.dsvs[m_FrameInFlightIdx].dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
 
     auto drawPrimitives = [&](const Vector<PrimitiveRenderData>& primitivesRenderData) {
+        const Vector<Primitive>& primitives = m_SceneResources.GetPrimitives();
         for (const PrimitiveRenderData& primitiveRenderData : primitivesRenderData)
         {
             cmd->SetGraphicsRoot32BitConstants(0, sizeof(primitiveRenderData.primConstants) / 4, &primitiveRenderData.primConstants, 0);
-            cmd->DispatchMesh(IE_DivRoundUp(m_Primitives[primitiveRenderData.primIndex].meshletCount, 32), 1, 1);
+            cmd->DispatchMesh(IE_DivRoundUp(primitives[primitiveRenderData.primIndex].meshletCount, 32), 1, 1);
         }
     };
 
     PerFrameData& frameData = GetCurrentFrameData();
+    const D3D12_GPU_VIRTUAL_ADDRESS frameCbGpuAddress = m_ConstantsBuffer->GetGPUVirtualAddress() + static_cast<u64>(m_FrameInFlightIdx) * m_ConstantsCbStride;
+    const PrimitiveBuckets& primitiveBuckets = m_Culling.GetPrimitiveBuckets();
+    const Vector<PrimitiveRenderData>& opaqueBack = primitiveBuckets[AlphaMode_Opaque][CullMode_Back];
+    const Vector<PrimitiveRenderData>& opaqueNone = primitiveBuckets[AlphaMode_Opaque][CullMode_None];
+    const Vector<PrimitiveRenderData>& maskedBack = primitiveBuckets[AlphaMode_Mask][CullMode_Back];
+    const Vector<PrimitiveRenderData>& maskedNone = primitiveBuckets[AlphaMode_Mask][CullMode_None];
 
-    GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "Depth Pre-Pass - Opaque");
+    if (!opaqueBack.empty() || !opaqueNone.empty())
     {
-        cmd->SetGraphicsRootSignature(m_DepthPre.opaqueRootSig.Get());
-        cmd->SetGraphicsRootConstantBufferView(1, m_ConstantsBuffer->buffer->GetGPUVirtualAddress() + static_cast<u64>(m_FrameInFlightIdx) * m_ConstantsCbStride);
-        for (CullMode cm : {CullMode_Back, CullMode_None})
+        GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "Depth Prepass - Opaque");
         {
-            cmd->SetPipelineState(m_DepthPre.opaquePSO[cm].Get());
-            drawPrimitives(m_PrimitivesRenderData[AlphaMode_Opaque][cm]);
+            cmd->SetGraphicsRootSignature(m_DepthPre.opaqueRootSig.Get());
+            cmd->SetGraphicsRootConstantBufferView(1, frameCbGpuAddress);
+            if (!opaqueBack.empty())
+            {
+                cmd->SetPipelineState(m_DepthPre.opaquePSO[CullMode_Back].Get());
+                drawPrimitives(opaqueBack);
+            }
+            if (!opaqueNone.empty())
+            {
+                cmd->SetPipelineState(m_DepthPre.opaquePSO[CullMode_None].Get());
+                drawPrimitives(opaqueNone);
+            }
         }
+        GPU_MARKER_END(cmd, frameData.gpuTimers);
     }
-    GPU_MARKER_END(cmd, frameData.gpuTimers);
 
-    GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "Depth Pre-Pass - Alpha-Tested");
+    if (!maskedBack.empty() || !maskedNone.empty())
     {
-        cmd->SetGraphicsRootSignature(m_DepthPre.alphaTestRootSig.Get());
-        cmd->SetGraphicsRootConstantBufferView(1, m_ConstantsBuffer->buffer->GetGPUVirtualAddress() + static_cast<u64>(m_FrameInFlightIdx) * m_ConstantsCbStride);
-        for (CullMode cm : {CullMode_Back, CullMode_None})
+        GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "Depth Prepass - Alpha Tested");
         {
-            cmd->SetPipelineState(m_DepthPre.alphaTestPSO[cm].Get());
-            drawPrimitives(m_PrimitivesRenderData[AlphaMode_Mask][cm]);
+            cmd->SetGraphicsRootSignature(m_DepthPre.alphaTestRootSig.Get());
+            cmd->SetGraphicsRootConstantBufferView(1, frameCbGpuAddress);
+            if (!maskedBack.empty())
+            {
+                cmd->SetPipelineState(m_DepthPre.alphaTestPSO[CullMode_Back].Get());
+                drawPrimitives(maskedBack);
+            }
+            if (!maskedNone.empty())
+            {
+                cmd->SetPipelineState(m_DepthPre.alphaTestPSO[CullMode_None].Get());
+                drawPrimitives(maskedNone);
+            }
         }
+        GPU_MARKER_END(cmd, frameData.gpuTimers);
     }
-    GPU_MARKER_END(cmd, frameData.gpuTimers);
 
-    Barrier(cmd, m_DepthPre.dsvs[m_FrameInFlightIdx], D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
+    m_DepthPre.dsvs[m_FrameInFlightIdx].Transition(cmd, D3D12_RESOURCE_STATE_DEPTH_READ);
 }
 
-void Renderer::Pass_Shadows(const ComPtr<ID3D12GraphicsCommandList7>& cmd) const
+void Renderer::Pass_Shadows(const ComPtr<ID3D12GraphicsCommandList7>& cmd)
 {
-    Raytracing& raytracing = Raytracing::GetInstance();
+    PerFrameData& frameData = GetCurrentFrameData();
+    Raytracing& raytracing = m_Raytracing;
     const Environment& env = m_Environments.GetCurrentEnvironment();
 
-    if (g_RTShadows_Enabled)
+    if (g_Settings.rtShadowsEnabled)
     {
         Raytracing::ShadowPassInput shadowPassInput;
-        shadowPassInput.depthTextureIndex = m_DepthPre.dsvSrvIdx[m_FrameInFlightIdx];
+        shadowPassInput.depthTextureIndex = m_DepthPre.dsvs[m_FrameInFlightIdx].srvIndex;
+        shadowPassInput.normalGeoTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].normalGeo.srvIndex;
+        shadowPassInput.materialsBufferIndex = m_SceneResources.GetMaterialsBuffer()->srvIndex;
         shadowPassInput.sunDir = env.sunDir;
         shadowPassInput.frameIndex = m_FrameIndex;
-        raytracing.ShadowPass(cmd, shadowPassInput);
+        raytracing.ShadowPass(cmd, frameData.gpuTimers, m_Upscale.renderSize, shadowPassInput);
     }
 }
 
@@ -478,107 +414,155 @@ void Renderer::Pass_GBuffer(const ComPtr<ID3D12GraphicsCommandList7>& cmd)
 
     auto& gb = m_GBuf.gbuffers[m_FrameInFlightIdx];
 
-    auto BarrierGBuffer = [&](D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
-        Barrier(cmd, gb.albedo, from, to);
-        Barrier(cmd, gb.normal, from, to);
-        Barrier(cmd, gb.normalGeo, from, to);
-        Barrier(cmd, gb.material, from, to);
-        Barrier(cmd, gb.motionVector, from, to);
-        Barrier(cmd, gb.ao, from, to);
+    auto TransitionGBuffer = [&](D3D12_RESOURCE_STATES to) {
+        gb.albedo.Transition(cmd, to);
+        gb.normal.Transition(cmd, to);
+        gb.normalGeo.Transition(cmd, to);
+        gb.material.Transition(cmd, to);
+        gb.motionVector.Transition(cmd, to);
+        gb.ao.Transition(cmd, to);
+        gb.emissive.Transition(cmd, to);
     };
 
-    BarrierGBuffer(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-
-    f32 clearColor[4] = {0, 0, 0, 0};
-    for (u8 i = 0; i < GBuffer::targetCount; ++i)
-    {
-        cmd->ClearRenderTargetView(m_GBuf.rtvHandles[m_FrameInFlightIdx][i], clearColor, 0, nullptr);
-    }
+    TransitionGBuffer(D3D12_RESOURCE_STATE_RENDER_TARGET);
 
     auto drawPrimitives = [&](const Vector<PrimitiveRenderData>& primitivesRenderData) {
+        const Vector<Primitive>& primitives = m_SceneResources.GetPrimitives();
         for (const PrimitiveRenderData& primitiveRenderData : primitivesRenderData)
         {
             cmd->SetGraphicsRoot32BitConstants(0, sizeof(primitiveRenderData.primConstants) / 4, &primitiveRenderData.primConstants, 0);
-            cmd->DispatchMesh(IE_DivRoundUp(m_Primitives[primitiveRenderData.primIndex].meshletCount, 32), 1, 1);
+            cmd->DispatchMesh(IE_DivRoundUp(primitives[primitiveRenderData.primIndex].meshletCount, 32), 1, 1);
         }
     };
 
+    const Array<ID3D12DescriptorHeap*, 2> descriptorHeaps = m_BindlessHeaps.GetDescriptorHeaps();
+    cmd->SetDescriptorHeaps(descriptorHeaps.size(), descriptorHeaps.data());
+    const D3D12_GPU_VIRTUAL_ADDRESS frameCbGpuAddress = m_ConstantsBuffer->GetGPUVirtualAddress() + static_cast<u64>(m_FrameInFlightIdx) * m_ConstantsCbStride;
+    const PrimitiveBuckets& primitiveBuckets = m_Culling.GetPrimitiveBuckets();
     for (AlphaMode alphaMode : {AlphaMode_Opaque, AlphaMode_Mask})
     {
-        const char* passName = alphaMode == AlphaMode_Opaque ? "GBuffer - Opaque" : "GBuffer - Masked";
+        const Vector<PrimitiveRenderData>& drawBack = primitiveBuckets[alphaMode][CullMode_Back];
+        const Vector<PrimitiveRenderData>& drawNone = primitiveBuckets[alphaMode][CullMode_None];
+        if (drawBack.empty() && drawNone.empty())
+        {
+            continue;
+        }
+
+        const char* passName = alphaMode == AlphaMode_Opaque ? "GBuffer - Opaque" : "GBuffer - Alpha Tested";
         GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, passName);
         {
-            cmd->SetDescriptorHeaps(m_BindlessHeaps.GetDescriptorHeaps().size(), m_BindlessHeaps.GetDescriptorHeaps().data());
             cmd->SetGraphicsRootSignature(m_GBuf.rootSigs[alphaMode].Get());
-            cmd->OMSetRenderTargets(GBuffer::targetCount, m_GBuf.rtvHandles[m_FrameInFlightIdx].data(), false, &m_DepthPre.dsvHandles[m_FrameInFlightIdx]);
-            cmd->SetGraphicsRootConstantBufferView(1, m_ConstantsBuffer->buffer->GetGPUVirtualAddress() + static_cast<u64>(m_FrameInFlightIdx) * m_ConstantsCbStride);
+            Array<D3D12_CPU_DESCRIPTOR_HANDLE, GBuffer::targetCount> rtvs = {gb.albedo.rtv, gb.normal.rtv, gb.normalGeo.rtv, gb.material.rtv, gb.motionVector.rtv, gb.ao.rtv,
+                                                                              gb.emissive.rtv};
+            cmd->OMSetRenderTargets(GBuffer::targetCount, rtvs.data(), false, &m_DepthPre.dsvs[m_FrameInFlightIdx].dsv);
+            cmd->SetGraphicsRootConstantBufferView(1, frameCbGpuAddress);
 
-            cmd->SetPipelineState(m_GBuf.psos[alphaMode][CullMode_Back].Get());
-            drawPrimitives(m_PrimitivesRenderData[alphaMode][CullMode_Back]);
+            if (!drawBack.empty())
+            {
+                cmd->SetPipelineState(m_GBuf.psos[alphaMode][CullMode_Back].Get());
+                drawPrimitives(drawBack);
+            }
 
-            cmd->SetPipelineState(m_GBuf.psos[alphaMode][CullMode_None].Get());
-            drawPrimitives(m_PrimitivesRenderData[alphaMode][CullMode_None]);
+            if (!drawNone.empty())
+            {
+                cmd->SetPipelineState(m_GBuf.psos[alphaMode][CullMode_None].Get());
+                drawPrimitives(drawNone);
+            }
         }
         GPU_MARKER_END(cmd, frameData.gpuTimers);
     }
 
-    BarrierGBuffer(D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    TransitionGBuffer(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
 
-    Barrier(cmd, m_DepthPre.dsvs[m_FrameInFlightIdx], D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_DepthPre.dsvs[m_FrameInFlightIdx].Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
-void Renderer::Pass_PathTrace(const ComPtr<ID3D12GraphicsCommandList7>& cmd) const
+void Renderer::Pass_PathTrace(const ComPtr<ID3D12GraphicsCommandList7>& cmd)
 {
-    Raytracing& raytracing = Raytracing::GetInstance();
+    Raytracing& raytracing = m_Raytracing;
     const Environment& env = m_Environments.GetCurrentEnvironment();
 
     Raytracing::PathTracePassInput pathTracePassInput;
-    pathTracePassInput.depthTextureIndex = m_DepthPre.dsvSrvIdx[m_FrameInFlightIdx];
+    pathTracePassInput.depthTextureIndex = m_DepthPre.dsvs[m_FrameInFlightIdx].srvIndex;
     pathTracePassInput.sunDir = env.sunDir;
+    pathTracePassInput.sunColor = env.sky.sunColor;
     pathTracePassInput.frameIndex = m_FrameIndex;
-    pathTracePassInput.normalGeoTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].normalGeoIndex;
-    pathTracePassInput.albedoTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].albedoIndex;
-    pathTracePassInput.materialsBufferIndex = m_MaterialsBuffer->srvIndex;
-    pathTracePassInput.samplerIndex = m_LinearSamplerIdx;
-    raytracing.PathTracePass(cmd, pathTracePassInput);
+    pathTracePassInput.frameInFlightIdx = m_FrameInFlightIdx;
+    pathTracePassInput.normalGeoTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].normalGeo.srvIndex;
+    pathTracePassInput.materialsBufferIndex = m_SceneResources.GetMaterialsBuffer()->srvIndex;
+    pathTracePassInput.skyCubeIndex = m_Sky.GetSkyCubeSrvIndex();
+    pathTracePassInput.samplerIndex = m_SceneResources.GetLinearSamplerIdx();
+    raytracing.PathTracePass(cmd, GetCurrentFrameData().gpuTimers, m_Upscale.renderSize, pathTracePassInput);
+}
+
+void Renderer::Pass_RTSpecular(const ComPtr<ID3D12GraphicsCommandList7>& cmd)
+{
+    if (!g_Settings.rtSpecularEnabled)
+    {
+        return;
+    }
+
+    Raytracing& raytracing = m_Raytracing;
+    const Environment& env = m_Environments.GetCurrentEnvironment();
+
+    Raytracing::SpecularPassInput specularPassInput;
+    specularPassInput.depthTextureIndex = m_DepthPre.dsvs[m_FrameInFlightIdx].srvIndex;
+    specularPassInput.normalTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].normal.srvIndex;
+    specularPassInput.materialTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].material.srvIndex;
+    specularPassInput.sunDir = env.sunDir;
+    specularPassInput.sunColor = env.sky.sunColor;
+    specularPassInput.frameIndex = m_FrameIndex;
+    specularPassInput.materialsBufferIndex = m_SceneResources.GetMaterialsBuffer()->srvIndex;
+    specularPassInput.skyCubeIndex = m_Sky.GetSkyCubeSrvIndex();
+    specularPassInput.samplerIndex = m_SceneResources.GetLinearSamplerIdx();
+    raytracing.SpecularPass(cmd, GetCurrentFrameData().gpuTimers, m_Upscale.renderSize, specularPassInput);
 }
 
 void Renderer::Pass_Lighting(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const Camera::FrameData& cameraFrameData)
 {
     PerFrameData& frameData = GetCurrentFrameData();
-    const Raytracing::ShadowPassResources& shadowPassResources = Raytracing::GetInstance().GetShadowPassResources();
-    const Raytracing::PathTracePassResources& pathTracePassResources = Raytracing::GetInstance().GetPathTracePassResources();
+    const Raytracing::ShadowPassResources& shadowPassResources = m_Raytracing.GetShadowPassResources();
+    const Raytracing::PathTracePassResources& pathTracePassResources = m_Raytracing.GetPathTracePassResources();
+    const Raytracing::SpecularPassResources& specularPassResources = m_Raytracing.GetSpecularPassResources();
     const Environment& env = m_Environments.GetCurrentEnvironment();
+
+    if (m_Light.hdrRt[m_FrameInFlightIdx].state != D3D12_RESOURCE_STATE_RENDER_TARGET)
+    {
+        m_Light.hdrRt[m_FrameInFlightIdx].Transition(cmd, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
 
     GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "Lighting");
     {
-        LightingPassConstants c;
-        c.albedoTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].albedoIndex;
-        c.normalTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].normalIndex;
-        c.materialTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].materialIndex;
-        c.depthTextureIndex = m_DepthPre.dsvSrvIdx[m_FrameInFlightIdx];
-        c.samplerIndex = m_LinearSamplerIdx;
+        LightingPassConstants c{};
+        c.albedoTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].albedo.srvIndex;
+        c.normalTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].normal.srvIndex;
+        c.materialTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].material.srvIndex;
+        c.depthTextureIndex = m_DepthPre.dsvs[m_FrameInFlightIdx].srvIndex;
+        c.samplerIndex = m_SceneResources.GetLinearSamplerIdx();
         c.cameraPos = cameraFrameData.position;
-        c.view = cameraFrameData.view;
-        c.invView = cameraFrameData.invView;
+        c.rtShadowTextureIndex = shadowPassResources.trace.outputTexture.srvIndex;
         c.invViewProj = cameraFrameData.invViewProj;
         c.sunDir = env.sunDir;
-        c.raytracingOutputIndex = shadowPassResources.trace.outputSrvIndex;
-        c.envMapIndex = env.envSrvIdx;
-        c.diffuseIBLIndex = env.diffuseSrvIdx;
-        c.specularIBLIndex = env.specularSrvIdx;
-        c.brdfLUTIndex = env.brdfSrvIdx;
-        c.sunAzimuth = g_Sun_Azimuth;
-        c.IBLSpecularIntensity = g_IBL_SpecularIntensity;
-        c.RTShadowsEnabled = g_RTShadows_Enabled;
-        c.renderSize = {static_cast<f32>(m_Fsr.renderSize.x), static_cast<f32>(m_Fsr.renderSize.y)};
-        c.sunIntensity = g_Sun_Intensity;
-        c.skyIntensity = g_IBL_SkyIntensity;
-        c.aoTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].aoIndex;
-        c.indirectDiffuseTextureIndex = pathTracePassResources.trace.outputSrvIndex;
+        c.skyCubeIndex = m_Sky.GetSkyCubeSrvIndex();
+        c.rtShadowsEnabled = g_Settings.rtShadowsEnabled;
+        c.rtSpecularTextureIndex = specularPassResources.trace.outputTexture.srvIndex;
+        c.rtSpecularEnabled = g_Settings.rtSpecularEnabled ? 1u : 0u;
+        c.rtSpecularStrength = g_Settings.rtSpecularStrength;
+        c.renderSize = {static_cast<f32>(m_Upscale.renderSize.x), static_cast<f32>(m_Upscale.renderSize.y)};
+        c.sunColor = env.sky.sunColor;
+        c.sunIntensity = g_Settings.sunIntensity;
+        c.skyIntensity = g_Settings.skyIntensity;
+        c.ambientStrength = g_Settings.ambientStrength;
+        c.shadowMinVisibility = g_Settings.shadowMinVisibility;
+        c.rtIndirectDiffuseStrength = g_Settings.rtIndirectDiffuseStrength;
+        c.aoTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].ao.srvIndex;
+        c.indirectDiffuseTextureIndex = pathTracePassResources.trace.indirectDiffuseTexture.srvIndex;
+        c.emissiveTextureIndex = m_GBuf.gbuffers[m_FrameInFlightIdx].emissive.srvIndex;
+        c.debugViewMode = g_Settings.lightingDebugMode;
+        c.debugMeshletColorEnabled = g_Settings.debugMeshletColor ? 1u : 0u;
         std::memcpy(m_Light.cbMapped[m_FrameInFlightIdx], &c, sizeof(c));
 
-        cmd->OMSetRenderTargets(1, &m_Light.rtvHandles[m_FrameInFlightIdx], false, nullptr);
+        cmd->OMSetRenderTargets(1, &m_Light.hdrRt[m_FrameInFlightIdx].rtv, false, nullptr);
         cmd->SetPipelineState(m_Light.pso.Get());
         cmd->SetGraphicsRootSignature(m_Light.rootSig.Get());
         cmd->SetDescriptorHeaps(m_BindlessHeaps.GetDescriptorHeaps().size(), m_BindlessHeaps.GetDescriptorHeaps().data());
@@ -592,141 +576,163 @@ void Renderer::Pass_Lighting(const ComPtr<ID3D12GraphicsCommandList7>& cmd, cons
     cmd->RSSetScissorRects(1, &m_PresentRect);
 }
 
-void Renderer::Pass_FSR(const ComPtr<ID3D12GraphicsCommandList7>& cmd, f32 jitterNormX, f32 jitterNormY, const Camera::FrameData& cameraFrameData)
+void Renderer::Pass_Upscale(const ComPtr<ID3D12GraphicsCommandList7>& cmd, f32 jitterNormX, f32 jitterNormY, const Camera::FrameData& cameraFrameData)
 {
+    if (m_DLSSMode == DLSS::Mode::Disabled)
+    {
+        return;
+    }
+
     PerFrameData& frameData = GetCurrentFrameData();
 
-    auto EnsureFsrState = [&](u32 idx, D3D12_RESOURCE_STATES desired) {
-        if (m_Fsr.outputState[idx] != desired)
+    auto EnsureOutputState = [&](u32 idx, D3D12_RESOURCE_STATES desired) {
+        if (m_Upscale.outputs[idx].state != desired)
         {
-            Barrier(cmd, m_Fsr.outputs[idx], m_Fsr.outputState[idx], desired);
-            m_Fsr.outputState[idx] = desired;
+            m_Upscale.outputs[idx].Transition(cmd, desired);
         }
     };
 
-    EnsureFsrState(m_FrameInFlightIdx, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (m_FrameIndex > 0)
+    EnsureOutputState(m_FrameInFlightIdx, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "DLSS");
     {
-        u32 prevIdx = (m_FrameInFlightIdx + IE_Constants::frameInFlightCount - 1) % IE_Constants::frameInFlightCount;
-        EnsureFsrState(prevIdx, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    }
+        const D3D12_RESOURCE_DESC hdrDesc = m_Light.hdrRt[m_FrameInFlightIdx].GetDesc();
+        const D3D12_RESOURCE_DESC outDesc = m_Upscale.outputs[m_FrameInFlightIdx].GetDesc();
+        const D3D12_RESOURCE_DESC mvDesc = m_GBuf.gbuffers[m_FrameInFlightIdx].motionVector.GetDesc();
 
-    GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "FSR");
-    {
-        ffx::DispatchDescUpscale d{};
+        const f32 jitterPxX = jitterNormX * 0.5f * static_cast<f32>(m_Upscale.renderSize.x);
+        // jitterNormY is stored in D3D NDC-up convention for the projection matrix.
+        // Streamline expects pixel-space jitter in screen-space coordinates.
+        const f32 jitterPxY = -jitterNormY * 0.5f * static_cast<f32>(m_Upscale.renderSize.y);
 
-        FfxApiResource hdr{};
-        hdr.resource = m_Light.hdrRt[m_FrameInFlightIdx].Get();
-        hdr.description = {FFX_API_RESOURCE_TYPE_TEXTURE2D, FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT, m_Fsr.renderSize.x, m_Fsr.renderSize.y, 1, 1, 0, 0};
-        hdr.state = FFX_API_RESOURCE_STATE_RENDER_TARGET;
-        d.color = hdr;
+        DLSS::EvaluateDesc d{};
+        d.cmd = cmd.Get();
+        d.colorIn = m_Light.hdrRt[m_FrameInFlightIdx].Get();
+        d.colorOut = m_Upscale.outputs[m_FrameInFlightIdx].Get();
+        d.depth = m_DepthPre.dsvs[m_FrameInFlightIdx].Get();
+        d.motionVectors = m_GBuf.gbuffers[m_FrameInFlightIdx].motionVector.Get();
+        d.exposure = m_AutoExposure.GetFinalExposureTexture().Get();
 
-        FfxApiResource depth{};
-        depth.resource = m_DepthPre.dsvs[m_FrameInFlightIdx].Get();
-        depth.description = {FFX_API_RESOURCE_TYPE_TEXTURE2D, FFX_API_SURFACE_FORMAT_R32_FLOAT, m_Fsr.renderSize.x, m_Fsr.renderSize.y, 1, 1, 0, 0};
-        depth.state = FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
-        d.depth = depth;
+        d.colorInFormat = hdrDesc.Format;
+        d.colorOutFormat = outDesc.Format;
+        d.depthFormat = m_DepthPre.dsvs[m_FrameInFlightIdx].GetDesc().Format;
+        d.motionVectorsFormat = mvDesc.Format;
+        d.exposureFormat = m_AutoExposure.GetFinalExposureTexture().GetDesc().Format;
 
-        FfxApiResource motion{};
-        motion.resource = m_GBuf.gbuffers[m_FrameInFlightIdx].motionVector.Get();
-        motion.description = {FFX_API_RESOURCE_TYPE_TEXTURE2D, FFX_API_SURFACE_FORMAT_R16G16_FLOAT, m_Fsr.renderSize.x, m_Fsr.renderSize.y, 1, 1, 0, 0};
-        motion.state = FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
-        d.motionVectors = motion;
+        d.colorInState = m_Light.hdrRt[m_FrameInFlightIdx].state;
+        d.colorOutState = m_Upscale.outputs[m_FrameInFlightIdx].state;
+        d.depthState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        d.motionVectorsState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        d.exposureState = m_AutoExposure.GetFinalExposureTexture().state;
 
-        FfxApiResource out{};
-        out.resource = m_Fsr.outputs[m_FrameInFlightIdx].Get();
-        out.description = {FFX_API_RESOURCE_TYPE_TEXTURE2D, FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT, m_Fsr.presentSize.x, m_Fsr.presentSize.y, 1, 1, 0, 0};
-        out.state = FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
-        d.output = out;
+        d.renderWidth = m_Upscale.renderSize.x;
+        d.renderHeight = m_Upscale.renderSize.y;
+        d.outputWidth = m_Upscale.presentSize.x;
+        d.outputHeight = m_Upscale.presentSize.y;
+        d.frameIndex = m_FrameIndex;
+        d.mode = m_DLSSMode;
 
-        d.commandList = cmd.Get();
-        d.jitterOffset.x = jitterNormX;
-        d.jitterOffset.y = jitterNormY;
-        d.cameraFovAngleVertical = IE_ToRadians(g_Camera_FOV);
-        d.cameraNear = cameraFrameData.znearfar.y;
-        d.cameraFar = cameraFrameData.znearfar.x;
-        d.motionVectorScale.x = static_cast<f32>(m_Fsr.renderSize.x);
-        d.motionVectorScale.y = static_cast<f32>(m_Fsr.renderSize.y);
-        d.frameTimeDelta = Window::GetFrameTimeMs();
-        d.renderSize.width = m_Fsr.renderSize.x;
-        d.renderSize.height = m_Fsr.renderSize.y;
-        d.preExposure = 1.0f;
+        d.viewProjNoJ = cameraFrameData.viewProjNoJ;
+        d.prevViewProjNoJ = cameraFrameData.prevViewProjNoJ;
+        d.projectionNoJitter = cameraFrameData.projectionNoJitter;
+        d.prevProjectionNoJitter = cameraFrameData.prevProjectionNoJitter;
+        d.invView = cameraFrameData.invView;
+        d.prevView = cameraFrameData.prevView;
+        d.cameraPos = cameraFrameData.position;
 
-        IE_Assert(ffx::Dispatch(m_Fsr.context, d) == ffx::ReturnCode::Ok);
+        d.cameraFov = IE_ToRadians(g_Settings.cameraFov);
+        d.cameraAspect = m_Window.GetAspectRatio();
+        d.cameraNear = cameraFrameData.znearfar.x;
+        d.cameraFar = cameraFrameData.znearfar.y;
+        d.jitterOffsetX = jitterPxX;
+        d.jitterOffsetY = jitterPxY;
+        d.reset = (m_FrameIndex == 0);
+
+        DLSS::Evaluate(d);
     }
     GPU_MARKER_END(cmd, frameData.gpuTimers);
 
-    UAVBarrier(cmd, m_Fsr.outputs[m_FrameInFlightIdx]);
-    EnsureFsrState(m_FrameInFlightIdx, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_Upscale.outputs[m_FrameInFlightIdx].UavBarrier(cmd);
+    EnsureOutputState(m_FrameInFlightIdx, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
 }
 
-void Renderer::Pass_Histogram(const ComPtr<ID3D12GraphicsCommandList7>& cmd)
+void Renderer::Pass_Bloom(const ComPtr<ID3D12GraphicsCommandList7>& cmd)
 {
-    PerFrameData& frameData = GetCurrentFrameData();
-    Array<ID3D12DescriptorHeap*, 2> descriptorHeaps = m_BindlessHeaps.GetDescriptorHeaps();
-
-    GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "Histogram");
+    if (!g_Settings.bloomEnabled || g_Settings.bloomIntensity <= 0.0f)
     {
-        ClearConstants clr;
-        clr.bufferIndex = m_Histo.histogramBuffer->uavIndex;
-        clr.numElements = m_Histo.histogramBuffer->numElements;
-        cmd->SetPipelineState(m_Histo.clearUintPso.Get());
-        cmd->SetDescriptorHeaps(descriptorHeaps.size(), descriptorHeaps.data());
-        cmd->SetComputeRootSignature(m_Histo.clearUintRootSig.Get());
-        cmd->SetComputeRoot32BitConstants(0, sizeof(clr) / 4, &clr, 0);
-        cmd->Dispatch(IE_DivRoundUp(m_Histo.histogramBuffer->numElements, 64), 1, 1);
+        return;
+    }
 
-        UAVBarrier(cmd, m_Histo.histogramBuffer->buffer);
+    PerFrameData& frameData = GetCurrentFrameData();
+    GpuResource* source = nullptr;
+    u32 sourceSrvIndex = UINT32_MAX;
+    if (m_DLSSMode == DLSS::Mode::Disabled)
+    {
+        source = &m_Light.hdrRt[m_FrameInFlightIdx];
+        sourceSrvIndex = m_Light.hdrRt[m_FrameInFlightIdx].srvIndex;
+    }
+    else
+    {
+        source = &m_Upscale.outputs[m_FrameInFlightIdx];
+        sourceSrvIndex = m_Upscale.outputs[m_FrameInFlightIdx].srvIndex;
+    }
 
-        HistogramConstants hc;
-        hc.hdrTextureIndex = m_Fsr.srvIdx[m_FrameInFlightIdx];
-        hc.minLogLum = g_AutoExposure_MinLogLum;
-        hc.maxLogLum = g_AutoExposure_MaxLogLum;
-        hc.numBuckets = m_Histo.numBuckets;
-        hc.histogramBufferIndex = m_Histo.histogramBuffer->uavIndex;
-        hc.depthTextureIndex = m_DepthPre.dsvSrvIdx[m_FrameInFlightIdx];
-        cmd->SetPipelineState(m_Histo.histogramPso.Get());
-        cmd->SetDescriptorHeaps(descriptorHeaps.size(), descriptorHeaps.data());
-        cmd->SetComputeRootSignature(m_Histo.histogramRootSig.Get());
-        cmd->SetComputeRoot32BitConstants(0, sizeof(hc) / 4, &hc, 0);
-        cmd->Dispatch(IE_DivRoundUp(m_Fsr.renderSize.x, 16), IE_DivRoundUp(m_Fsr.renderSize.y, 16), 1);
+    source->Transition(cmd, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
 
-        UAVBarrier(cmd, m_Histo.histogramBuffer->buffer);
+    const u32 linearSamplerIndex = m_SceneResources.GetLinearSamplerIdx();
+    auto dispatchForMip = [&](u32 mip) {
+        return XMUINT2(IE_DivRoundUp(m_Bloom.mipSizes[mip].x, 8u), IE_DivRoundUp(m_Bloom.mipSizes[mip].y, 8u));
+    };
 
-        ExposureConstants ec;
-        ec.numBuckets = m_Histo.numBuckets;
-        ec.totalPixels = m_Fsr.renderSize.x * m_Fsr.renderSize.y;
-        ec.targetPct = g_AutoExposure_TargetPct;
-        ec.lowReject = g_AutoExposure_LowReject;
-        ec.highReject = g_AutoExposure_HighReject;
-        ec.key = g_AutoExposure_Key;
-        ec.minLogLum = g_AutoExposure_MinLogLum;
-        ec.maxLogLum = g_AutoExposure_MaxLogLum;
-        ec.histogramBufferIndex = m_Histo.histogramBuffer->srvIndex;
-        ec.exposureBufferIndex = m_Histo.exposureBuffer->uavIndex;
-        cmd->SetPipelineState(m_Histo.exposurePso.Get());
-        cmd->SetComputeRootSignature(m_Histo.exposureRootSig.Get());
-        cmd->SetDescriptorHeaps(descriptorHeaps.size(), descriptorHeaps.data());
-        cmd->SetComputeRoot32BitConstants(0, sizeof(ec) / 4, &ec, 0);
-        cmd->Dispatch(1, 1, 1);
+    GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "Bloom");
+    {
+        cmd->SetDescriptorHeaps(m_BindlessHeaps.GetDescriptorHeaps().size(), m_BindlessHeaps.GetDescriptorHeaps().data());
 
-        UAVBarrier(cmd, m_Histo.exposureBuffer->buffer);
+        cmd->SetComputeRootSignature(m_Bloom.downsampleRootSig.Get());
+        cmd->SetPipelineState(m_Bloom.downsamplePso.Get());
+        for (u32 mip = 0; mip < m_Bloom.mipCount; ++mip)
+        {
+            Texture& dst = m_Bloom.downChain[m_FrameInFlightIdx][mip];
 
-        AdaptExposureConstants ac;
-        ac.exposureBufferIndex = m_Histo.exposureBuffer->srvIndex;
-        ac.adaptedExposureBufferIndex = m_Histo.adaptExposureBuffer->uavIndex;
-        ac.dt = Window::GetFrameTimeMs() / 1000.f;
-        ac.tauBright = g_AutoExposure_TauBright;
-        ac.tauDark = g_AutoExposure_TauDark;
-        ac.clampMin = g_AutoExposure_ClampMin;
-        ac.clampMax = g_AutoExposure_ClampMax;
-        cmd->SetPipelineState(m_Histo.adaptExposurePso.Get());
-        cmd->SetComputeRootSignature(m_Histo.adaptExposureRootSig.Get());
-        cmd->SetDescriptorHeaps(descriptorHeaps.size(), descriptorHeaps.data());
-        cmd->SetComputeRoot32BitConstants(0, sizeof(ac) / 4, &ac, 0);
-        cmd->Dispatch(1, 1, 1);
+            BloomDownsampleConstants c{};
+            c.inputTextureIndex = (mip == 0u) ? sourceSrvIndex : m_Bloom.downChain[m_FrameInFlightIdx][mip - 1u].srvIndex;
+            c.outputTextureIndex = dst.uavIndex;
+            c.samplerIndex = linearSamplerIndex;
+            c.applyThreshold = (mip == 0u) ? 1u : 0u;
+            c.threshold = g_Settings.bloomThreshold;
+            c.softKnee = g_Settings.bloomSoftKnee;
 
-        UAVBarrier(cmd, m_Histo.adaptExposureBuffer->buffer);
+            const XMUINT2 dispatch = dispatchForMip(mip);
+            dst.Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            cmd->SetComputeRoot32BitConstants(0, sizeof(c) / sizeof(u32), &c, 0);
+            cmd->Dispatch(dispatch.x, dispatch.y, 1);
+            dst.UavBarrier(cmd);
+            dst.Transition(cmd, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+        }
+
+        if (m_Bloom.mipCount > 1u)
+        {
+            cmd->SetComputeRootSignature(m_Bloom.upsampleRootSig.Get());
+            cmd->SetPipelineState(m_Bloom.upsamplePso.Get());
+            for (i32 mip = static_cast<i32>(m_Bloom.mipCount) - 2; mip >= 0; --mip)
+            {
+                Texture& dst = m_Bloom.upChain[m_FrameInFlightIdx][mip];
+
+                BloomUpsampleConstants c{};
+                c.baseTextureIndex = m_Bloom.downChain[m_FrameInFlightIdx][mip].srvIndex;
+                c.bloomTextureIndex = (mip == static_cast<i32>(m_Bloom.mipCount) - 2) ? m_Bloom.downChain[m_FrameInFlightIdx][mip + 1].srvIndex
+                                                                                      : m_Bloom.upChain[m_FrameInFlightIdx][mip + 1].srvIndex;
+                c.outputTextureIndex = dst.uavIndex;
+                c.samplerIndex = linearSamplerIndex;
+
+                const XMUINT2 dispatch = dispatchForMip(static_cast<u32>(mip));
+                dst.Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                cmd->SetComputeRoot32BitConstants(0, sizeof(c) / sizeof(u32), &c, 0);
+                cmd->Dispatch(dispatch.x, dispatch.y, 1);
+                dst.UavBarrier(cmd);
+                dst.Transition(cmd, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+            }
+        }
     }
     GPU_MARKER_END(cmd, frameData.gpuTimers);
 }
@@ -737,17 +743,20 @@ void Renderer::Pass_Tonemap(const ComPtr<ID3D12GraphicsCommandList7>& cmd)
 
     GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "Tone Mapping");
     {
-        Barrier(cmd, m_Tonemap.sdrRt[m_FrameInFlightIdx], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        m_Tonemap.sdrRt[m_FrameInFlightIdx].Transition(cmd, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-        TonemapConstants t;
-        t.srvIndex = m_Fsr.srvIdx[m_FrameInFlightIdx];
-        t.samplerIndex = m_LinearSamplerIdx;
-        t.whitePoint = g_ToneMapping_WhitePoint;
-        t.contrast = g_ToneMapping_Contrast;
-        t.saturation = g_ToneMapping_Saturation;
-        t.adaptExposureBufferIndex = m_Histo.adaptExposureBuffer->srvIndex;
+        TonemapConstants t{};
+        t.srvIndex = (m_DLSSMode == DLSS::Mode::Disabled) ? m_Light.hdrRt[m_FrameInFlightIdx].srvIndex : m_Upscale.outputs[m_FrameInFlightIdx].srvIndex;
+        t.samplerIndex = m_SceneResources.GetLinearSamplerIdx();
+        t.bloomTextureIndex = (m_Bloom.mipCount > 1u) ? m_Bloom.upChain[m_FrameInFlightIdx][0].srvIndex : m_Bloom.downChain[m_FrameInFlightIdx][0].srvIndex;
+        t.exposureTextureIndex = m_AutoExposure.GetFinalExposureTextureSrvIndex();
+        t.contrast = g_Settings.toneMappingContrast;
+        t.saturation = g_Settings.toneMappingSaturation;
+        t.bloomIntensity = g_Settings.bloomEnabled ? g_Settings.bloomIntensity : 0.0f;
 
-        cmd->OMSetRenderTargets(1, &m_Tonemap.rtvHandles[m_FrameInFlightIdx], false, nullptr);
+        cmd->RSSetViewports(1, &m_PresentViewport);
+        cmd->RSSetScissorRects(1, &m_PresentRect);
+        cmd->OMSetRenderTargets(1, &m_Tonemap.sdrRt[m_FrameInFlightIdx].rtv, false, nullptr);
         cmd->SetPipelineState(m_Tonemap.pso.Get());
         cmd->SetGraphicsRootSignature(m_Tonemap.rootSig.Get());
         cmd->SetDescriptorHeaps(m_BindlessHeaps.GetDescriptorHeaps().size(), m_BindlessHeaps.GetDescriptorHeaps().data());
@@ -762,54 +771,82 @@ void Renderer::Pass_ImGui(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const C
 {
     PerFrameData& frameData = GetCurrentFrameData();
 
-    GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "ImGui");
+    GPU_MARKER_BEGIN(cmd, frameData.gpuTimers, "UI");
     {
-        static ImGui_TimingRaw raw[128];
-        static ImGui_TimingSmooth smt[128];
+        static ImGui_TimingValue gpuTimings[128];
+        static ImGui_TimingValue cpuTimings[128];
 
-        u32 nRaw = m_GpuTimingState.lastCount;
-        for (u32 i = 0; i < nRaw; ++i)
+        const float timingWindowMs = g_Settings.timingAverageWindowMs;
+
+        u32 nGpuTimings = m_GpuTimingState.lastCount;
+        for (u32 i = 0; i < nGpuTimings; ++i)
         {
-            raw[i].name = m_GpuTimingState.last[i].name;
-            raw[i].ms = m_GpuTimingState.last[i].ms;
+            gpuTimings[i].name = m_GpuTimingState.last[i].name;
+            gpuTimings[i].ms = Timings_ComputeAverageWindowMs(m_GpuTimingState, gpuTimings[i].name, timingWindowMs);
         }
 
-        u32 nSmt = m_GpuTimingState.smoothCount;
-        for (u32 i = 0; i < nSmt; ++i)
+        u32 nCpuTimings = m_CpuTimingState.lastCount;
+        for (u32 i = 0; i < nCpuTimings; ++i)
         {
-            smt[i].name = m_GpuTimingState.smooth[i].name;
-            smt[i].value = m_GpuTimingState.smooth[i].value;
+            cpuTimings[i].name = m_CpuTimingState.last[i].name;
+            cpuTimings[i].ms = Timings_ComputeAverageWindowMs(m_CpuTimingState, cpuTimings[i].name, timingWindowMs);
         }
 
         ImGui_FrameStats frameStats;
-        frameStats.fps = static_cast<u32>(Window::GetFPS());
+        frameStats.fps = static_cast<u32>(m_Window.GetFPS());
         frameStats.cameraPos[0] = cameraFrameData.position.x;
         frameStats.cameraPos[1] = cameraFrameData.position.y;
         frameStats.cameraPos[2] = cameraFrameData.position.z;
+        frameStats.cameraYaw = cameraFrameData.yaw;
+        frameStats.cameraPitch = cameraFrameData.pitch;
 
-        const Raytracing::ShadowPassResources& shadowPassResources = Raytracing::GetInstance().GetShadowPassResources();
-        const Raytracing::PathTracePassResources& pathTracePassResources = Raytracing::GetInstance().GetPathTracePassResources();
+        const Raytracing::ShadowPassResources& shadowPassResources = m_Raytracing.GetShadowPassResources();
+        const Raytracing::PathTracePassResources& pathTracePassResources = m_Raytracing.GetPathTracePassResources();
+        const Raytracing::SpecularPassResources& specularPassResources = m_Raytracing.GetSpecularPassResources();
+
+        u32 radianceCacheUsedEntries = 0u;
+        const SharedPtr<Buffer>& cacheUsageReadback = pathTracePassResources.trace.radianceCacheUsageReadback[m_FrameInFlightIdx];
+        if (cacheUsageReadback && cacheUsageReadback->resource)
+        {
+            const D3D12_RANGE readRange(0, sizeof(u32));
+            u32* mapped = nullptr;
+            if (SUCCEEDED(cacheUsageReadback->Map(0, &readRange, reinterpret_cast<void**>(&mapped))) && mapped)
+            {
+                radianceCacheUsedEntries = *mapped;
+                const D3D12_RANGE writeRange(0, 0);
+                cacheUsageReadback->Unmap(0, &writeRange);
+            }
+        }
+
+        const u64 radianceCacheMaxBytes = pathTracePassResources.trace.radianceCache ? static_cast<u64>(pathTracePassResources.trace.radianceCache->numElements) * sizeof(RadianceCacheEntry) : 0ull;
+        const u64 radianceCacheUsedBytesRaw = static_cast<u64>(radianceCacheUsedEntries) * sizeof(RadianceCacheEntry);
+        const u64 radianceCacheUsedBytes = (radianceCacheUsedBytesRaw < radianceCacheMaxBytes) ? radianceCacheUsedBytesRaw : radianceCacheMaxBytes;
+        constexpr f32 kBytesToMB = 1.0f / (1024.0f * 1024.0f);
+        const f32 radianceCacheUsedMB = static_cast<f32>(radianceCacheUsedBytes) * kBytesToMB;
+        const f32 radianceCacheMaxMB = static_cast<f32>(radianceCacheMaxBytes) * kBytesToMB;
 
         ImGui_RenderParams rp;
         rp.cmd = cmd.Get();
-        rp.rtv = m_Tonemap.rtvHandles[m_FrameInFlightIdx];
-        rp.rtvResource = m_Tonemap.sdrRt[m_FrameInFlightIdx].Get();
+        rp.renderer = this;
+        rp.rtv = m_Tonemap.sdrRt[m_FrameInFlightIdx].rtv;
         rp.gbufferAlbedo = m_GBuf.gbuffers[m_FrameInFlightIdx].albedo.Get();
         rp.gbufferNormal = m_GBuf.gbuffers[m_FrameInFlightIdx].normal.Get();
         rp.gbufferNormalGeo = m_GBuf.gbuffers[m_FrameInFlightIdx].normalGeo.Get();
         rp.gbufferMaterial = m_GBuf.gbuffers[m_FrameInFlightIdx].material.Get();
         rp.gbufferMotion = m_GBuf.gbuffers[m_FrameInFlightIdx].motionVector.Get();
         rp.gbufferAO = m_GBuf.gbuffers[m_FrameInFlightIdx].ao.Get();
+        rp.gbufferEmissive = m_GBuf.gbuffers[m_FrameInFlightIdx].emissive.Get();
         rp.depth = m_DepthPre.dsvs[m_FrameInFlightIdx].Get();
         rp.rtShadows = shadowPassResources.trace.outputTexture.Get();
         rp.rtIndirectDiffuse = pathTracePassResources.trace.indirectDiffuseTexture.Get();
-        rp.renderWidth = m_Fsr.renderSize.x;
-        rp.renderHeight = m_Fsr.renderSize.y;
+        rp.rtSpecular = specularPassResources.trace.outputTexture.Get();
+        rp.radianceCacheUsedMB = radianceCacheUsedMB;
+        rp.radianceCacheMaxMB = radianceCacheMaxMB;
         rp.frame = frameStats;
-        rp.timingsRaw = raw;
-        rp.timingsRawCount = nRaw;
-        rp.timingsSmooth = smt;
-        rp.timingsSmoothCount = nSmt;
+        rp.gpuTimings = gpuTimings;
+        rp.gpuTimingsCount = nGpuTimings;
+        rp.cpuTimings = cpuTimings;
+        rp.cpuTimingsCount = nCpuTimings;
         ImGui_Render(rp);
     }
     GPU_MARKER_END(cmd, frameData.gpuTimers);
@@ -822,178 +859,50 @@ void Renderer::EndFrame(const PerFrameData& frameData, const ComPtr<ID3D12Graphi
         cmd->ResolveQueryData(frameData.gpuTimers.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, frameData.gpuTimers.nextIdx, frameData.gpuTimers.readback.Get(), 0);
     }
 
-    Barrier(cmd, m_Tonemap.sdrRt[m_FrameInFlightIdx], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    m_Tonemap.sdrRt[m_FrameInFlightIdx].Transition(cmd, D3D12_RESOURCE_STATE_PRESENT);
 
-    IE_Check(cmd->Close());
-    ID3D12CommandList* pCmdList = cmd.Get();
-    m_CommandQueue->ExecuteCommandLists(1, &pCmdList);
-    IE_Check(m_CommandQueue->Signal(frameData.frameFence.Get(), frameData.frameFenceValue));
-
-    IE_Check(m_Swapchain->Present(0, 0));
+    m_RenderDevice.ExecuteFrame(frameData, cmd);
     m_FrameIndex++;
 }
 
 void Renderer::WaitForGpuIdle()
 {
-    ComPtr<ID3D12Fence> fence;
-    IE_Check(m_Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
-
-    const UINT64 value = 1;
-    IE_Check(m_CommandQueue->Signal(fence.Get(), value));
-
-    HANDLE evt = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    IE_Check(fence->SetEventOnCompletion(value, evt));
-    WaitForSingleObject(evt, INFINITE);
-    CloseHandle(evt);
+    m_RenderDevice.WaitForGpuIdle();
 }
 
 void Renderer::ReloadShaders()
 {
     WaitForGpuIdle();
 
-    IE_Log("Reloading shaders...");
+    IE_LogInfo("Reloading shaders...");
+    Shader::ResetReloadStats();
 
-    Vector<WString> globalDefines;
+    Vector<String> globalDefines;
     CreateDepthPrePassPipelines(globalDefines);
     CreateGBufferPassPipelines(globalDefines);
     CreateLightingPassPipelines(globalDefines);
-    CreateHistogramPassPipelines(globalDefines);
+    m_Sky.CreateProceduralSkyCubePipelines(m_RenderDevice.GetDevice(), globalDefines);
+    m_AutoExposure.CreatePipelines(m_RenderDevice.GetDevice(), globalDefines);
+    m_Sky.CreateSkyMotionPassPipelines(m_RenderDevice.GetDevice(), globalDefines);
+    CreateBloomPassPipelines(globalDefines);
     CreateToneMapPassPipelines(globalDefines);
 
-    Raytracing::GetInstance().ReloadShaders();
+    m_Raytracing.ReloadShaders();
+    m_Sky.MarkProceduralSkyDirty();
 
-    IE_Log("Shader reload done.");
-}
-
-void Renderer::CreateDevice()
-{
-    ComPtr<ID3D12Debug> debug;
-    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
-    {
-        debug->EnableDebugLayer();
-
-        const CommandLineArguments& args = GetCommandLineArguments();
-        if (args.gpuValidation)
-        {
-            ComPtr<ID3D12Debug1> debug1;
-            if (SUCCEEDED(debug.As(&debug1)))
-            {
-                debug1->SetEnableGPUBasedValidation(true);
-            }
-        }
-    }
-    m_Debug = debug;
-
-#ifdef _DEBUG
-    u32 factoryFlags = DXGI_CREATE_FACTORY_DEBUG;
-#else
-    u32 factoryFlags = 0;
-#endif
-    IE_Check(CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(&m_DxgiFactory)));
-
-    ComPtr<IDXGIFactory6> factory6;
-    IE_Check(m_DxgiFactory.As(&factory6));
-
-    D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_12_2;
-
-    for (u32 i = 0;; ++i)
-    {
-        ComPtr<IDXGIAdapter1> adapter;
-        if (factory6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)) == DXGI_ERROR_NOT_FOUND)
-        {
-            break;
-        }
-
-        DXGI_ADAPTER_DESC1 desc;
-        IE_Check(adapter->GetDesc1(&desc));
-        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
-        {
-            continue;
-        }
-
-        if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), featureLevel, __uuidof(ID3D12Device), nullptr)))
-        {
-            m_Adapter = adapter;
-            break;
-        }
-    }
-    IE_Check(D3D12CreateDevice(m_Adapter.Get(), featureLevel, IID_PPV_ARGS(&m_Device)));
-#ifdef _DEBUG
-    ComPtr<ID3D12InfoQueue> infoQueue;
-    if (SUCCEEDED(m_Device.As(&infoQueue)))
-    {
-        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
-        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
-        infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
-    }
-#endif
-}
-
-void Renderer::CreateAllocator()
-{
-    D3D12MA::ALLOCATOR_DESC allocatorDesc{};
-    allocatorDesc.Flags = D3D12MA::ALLOCATOR_FLAG_MSAA_TEXTURES_ALWAYS_COMMITTED | D3D12MA::ALLOCATOR_FLAG_DEFAULT_POOLS_NOT_ZEROED;
-    allocatorDesc.pDevice = m_Device.Get();
-    allocatorDesc.pAdapter = m_Adapter.Get();
-    IE_Check(D3D12MA::CreateAllocator(&allocatorDesc, &m_Allocator));
-}
-
-void Renderer::CreateCommandQueue()
-{
-    D3D12_COMMAND_QUEUE_DESC commandQueueDesc{};
-    commandQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    commandQueueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
-    IE_Check(m_Device->CreateCommandQueue(&commandQueueDesc, IID_PPV_ARGS(&m_CommandQueue)));
-}
-
-void Renderer::CreateSwapchain()
-{
-    const Window& window = Window::GetInstance();
-
-    DXGI_SWAP_CHAIN_DESC1 swapchainDesc{};
-    swapchainDesc.Width = m_Fsr.presentSize.x;
-    swapchainDesc.Height = m_Fsr.presentSize.y;
-    swapchainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    swapchainDesc.SampleDesc.Count = 1;
-    swapchainDesc.SampleDesc.Quality = 0;
-    swapchainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swapchainDesc.BufferCount = IE_Constants::frameInFlightCount;
-    swapchainDesc.Scaling = DXGI_SCALING_NONE;
-    swapchainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    swapchainDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-
-    ComPtr<IDXGISwapChain1> tempSwapchain;
-    IE_Check(m_DxgiFactory->CreateSwapChainForHwnd(m_CommandQueue.Get(), window.GetHwnd(), &swapchainDesc, nullptr, nullptr, tempSwapchain.ReleaseAndGetAddressOf()));
-    IE_Check(m_DxgiFactory->MakeWindowAssociation(window.GetHwnd(), DXGI_MWA_NO_ALT_ENTER));
-    IE_Check(tempSwapchain->QueryInterface(IID_PPV_ARGS(&m_Swapchain)));
-}
-
-void Renderer::CreateFrameSynchronizationFences()
-{
-    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
-    {
-        IE_Check(m_Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_AllFrameData[i].frameFence)));
-    }
-}
-
-void Renderer::CreateCommands()
-{
-    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
-    {
-        IE_Check(m_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_AllFrameData[i].commandAllocator)));
-        IE_Check(m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_AllFrameData[i].commandAllocator.Get(), nullptr, IID_PPV_ARGS(&m_AllFrameData[i].cmd)));
-        IE_Check(m_AllFrameData[i].cmd->SetName(L"Main command list"));
-        m_AllFrameData[i].cmd->Close();
-    }
+    const Shader::ReloadStats reloadStats = Shader::GetReloadStats();
+    IE_LogInfo("Shader reload done. Reloaded {}/{} (skipped {}, failed {}).", reloadStats.reloaded, reloadStats.total, reloadStats.skipped, reloadStats.failed);
 }
 
 void Renderer::CreateRTVs()
 {
-    // SDR
+    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
+    const ComPtr<IDXGISwapChain4>& swapchain = m_RenderDevice.GetSwapchain();
+
     D3D12_DESCRIPTOR_HEAP_DESC sdrRtvHeapDesc{};
     sdrRtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     sdrRtvHeapDesc.NumDescriptors = IE_Constants::frameInFlightCount;
-    IE_Check(m_Device->CreateDescriptorHeap(&sdrRtvHeapDesc, IID_PPV_ARGS(&m_Tonemap.rtvHeap)));
+    IE_Check(device->CreateDescriptorHeap(&sdrRtvHeapDesc, IID_PPV_ARGS(&m_Tonemap.rtvHeap)));
     IE_Check(m_Tonemap.rtvHeap->SetName(L"SDR Color Target : Heap"));
 
     D3D12_RENDER_TARGET_VIEW_DESC sdrRtvDesc{};
@@ -1001,47 +910,52 @@ void Renderer::CreateRTVs()
     sdrRtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
     for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
     {
-        IE_Check(m_Swapchain->GetBuffer(i, IID_PPV_ARGS(&m_Tonemap.sdrRt[i])));
-        IE_Check(m_Tonemap.sdrRt[i]->SetName(L"SDR Color Target"));
+        IE_Check(swapchain->GetBuffer(i, IID_PPV_ARGS(&m_Tonemap.sdrRt[i].resource)));
+        m_Tonemap.sdrRt[i].state = D3D12_RESOURCE_STATE_PRESENT;
+        m_Tonemap.sdrRt[i].SetName(L"SDR Color Target");
 
-        m_Tonemap.rtvHandles[i] = m_Tonemap.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        m_Tonemap.rtvHandles[i].ptr += i * m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        m_Device->CreateRenderTargetView(m_Tonemap.sdrRt[i].Get(), &sdrRtvDesc, m_Tonemap.rtvHandles[i]);
+        m_Tonemap.sdrRt[i].rtv = m_Tonemap.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        m_Tonemap.sdrRt[i].rtv.ptr += i * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        device->CreateRenderTargetView(m_Tonemap.sdrRt[i].Get(), &sdrRtvDesc, m_Tonemap.sdrRt[i].rtv);
     }
 
-    // HDR
     D3D12_DESCRIPTOR_HEAP_DESC hdrRtvHeapDesc{};
     hdrRtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     hdrRtvHeapDesc.NumDescriptors = IE_Constants::frameInFlightCount;
 
-    IE_Check(m_Device->CreateDescriptorHeap(&hdrRtvHeapDesc, IID_PPV_ARGS(&m_Light.rtvHeap)));
+    IE_Check(device->CreateDescriptorHeap(&hdrRtvHeapDesc, IID_PPV_ARGS(&m_Light.rtvHeap)));
     IE_Check(m_Light.rtvHeap->SetName(L"HDR Float Color Target : Heap"));
 
     CD3DX12_HEAP_PROPERTIES hdrHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
     for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
     {
-        CD3DX12_RESOURCE_DESC hdrRtvDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16B16A16_FLOAT, m_Fsr.renderSize.x, m_Fsr.renderSize.y, 1, 0, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        CD3DX12_RESOURCE_DESC hdrRtvDesc =
+            CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R11G11B10_FLOAT, m_Upscale.renderSize.x, m_Upscale.renderSize.y, 1, 0, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
 
         D3D12_CLEAR_VALUE clearValue{};
-        clearValue.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        IE_Check(m_Device->CreateCommittedResource(&hdrHeapProps, D3D12_HEAP_FLAG_NONE, &hdrRtvDesc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clearValue, IID_PPV_ARGS(&m_Light.hdrRt[i])));
-        IE_Check(m_Light.hdrRt[i]->SetName(L"HDR Float Color Target"));
+        clearValue.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+        IE_Check(device->CreateCommittedResource(&hdrHeapProps, D3D12_HEAP_FLAG_NONE, &hdrRtvDesc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clearValue, IID_PPV_ARGS(&m_Light.hdrRt[i].resource)));
+        m_Light.hdrRt[i].state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        m_Light.hdrRt[i].SetName(L"HDR Float Color Target");
 
         D3D12_RENDER_TARGET_VIEW_DESC hdrRtvViewDesc{};
-        hdrRtvViewDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        hdrRtvViewDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
         hdrRtvViewDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        m_Light.rtvHandles[i] = m_Light.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        m_Light.rtvHandles[i].ptr += i * m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        m_Device->CreateRenderTargetView(m_Light.hdrRt[i].Get(), &hdrRtvViewDesc, m_Light.rtvHandles[i]);
+        m_Light.hdrRt[i].rtv = m_Light.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        m_Light.hdrRt[i].rtv.ptr += i * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        device->CreateRenderTargetView(m_Light.hdrRt[i].Get(), &hdrRtvViewDesc, m_Light.hdrRt[i].rtv);
     }
 }
 
 void Renderer::CreateDSV()
 {
+    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
+    const ComPtr<D3D12MA::Allocator>& allocator = m_RenderDevice.GetAllocator();
+
     D3D12_DESCRIPTOR_HEAP_DESC descriptorDsvHeapDesc{};
     descriptorDsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     descriptorDsvHeapDesc.NumDescriptors = IE_Constants::frameInFlightCount;
-    IE_Check(m_Device->CreateDescriptorHeap(&descriptorDsvHeapDesc, IID_PPV_ARGS(&m_DepthPre.dsvHeap)));
+    IE_Check(device->CreateDescriptorHeap(&descriptorDsvHeapDesc, IID_PPV_ARGS(&m_DepthPre.dsvHeap)));
     IE_Check(m_DepthPre.dsvHeap->SetName(L"Depth/Stencil : Heap"));
     for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
     {
@@ -1052,143 +966,143 @@ void Renderer::CreateDSV()
         clearValue.Format = DXGI_FORMAT_D32_FLOAT;
         clearValue.DepthStencil.Depth = 0.0f;
 
-        D3D12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R32_TYPELESS, m_Fsr.renderSize.x, m_Fsr.renderSize.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        D3D12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R32_TYPELESS, m_Upscale.renderSize.x, m_Upscale.renderSize.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         D3D12MA::ALLOCATION_DESC allocDesc{};
         allocDesc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
 
-        IE_Check(m_Allocator->CreateResource(&allocDesc, &resourceDesc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clearValue,
-                                             m_DepthPre.dsvAllocs[i].ReleaseAndGetAddressOf(), IID_PPV_ARGS(&m_DepthPre.dsvs[i])));
-        IE_Check(m_DepthPre.dsvs[i]->SetName(L"Depth/Stencil : DSV"));
+        IE_Check(allocator->CreateResource(&allocDesc, &resourceDesc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clearValue,
+                                           m_DepthPre.dsvs[i].allocation.ReleaseAndGetAddressOf(), IID_PPV_ARGS(&m_DepthPre.dsvs[i].resource)));
+        m_DepthPre.dsvs[i].state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        m_DepthPre.dsvs[i].SetName(L"Depth/Stencil : DSV");
 
-        m_DepthPre.dsvHandles[i] = m_DepthPre.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-        m_DepthPre.dsvHandles[i].ptr += i * m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        m_DepthPre.dsvs[i].dsv = m_DepthPre.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        m_DepthPre.dsvs[i].dsv.ptr += i * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
-        m_Device->CreateDepthStencilView(m_DepthPre.dsvs[i].Get(), &dsvDesc, m_DepthPre.dsvHandles[i]);
+        device->CreateDepthStencilView(m_DepthPre.dsvs[i].Get(), &dsvDesc, m_DepthPre.dsvs[i].dsv);
     }
 }
 
 void Renderer::SetRenderAndPresentSize()
 {
-    m_Fsr.presentSize = Window::GetInstance().GetResolution();
+    m_Upscale.presentSize = m_Window.GetResolution();
 
-    ffx::QueryDescUpscaleGetRenderResolutionFromQualityMode query{};
-    query.displayWidth = m_Fsr.presentSize.x;
-    query.displayHeight = m_Fsr.presentSize.y;
-    query.qualityMode = IE_Constants::upscalingMode;
-    query.pOutRenderWidth = &m_Fsr.renderSize.x;
-    query.pOutRenderHeight = &m_Fsr.renderSize.y;
-    IE_Assert(ffx::Query(query) == ffx::ReturnCode::Ok);
+    DLSS::OptimalSettings dlssSettings{};
+    DLSS::GetOptimalSettings(m_Upscale.presentSize.x, m_Upscale.presentSize.y, m_DLSSMode, dlssSettings);
+    m_Upscale.renderSize.x = dlssSettings.renderWidth;
+    m_Upscale.renderSize.y = dlssSettings.renderHeight;
 
     m_PresentViewport.TopLeftX = 0.f;
     m_PresentViewport.TopLeftY = 0.f;
-    m_PresentViewport.Width = static_cast<f32>(m_Fsr.presentSize.x);
-    m_PresentViewport.Height = static_cast<f32>(m_Fsr.presentSize.y);
+    m_PresentViewport.Width = static_cast<f32>(m_Upscale.presentSize.x);
+    m_PresentViewport.Height = static_cast<f32>(m_Upscale.presentSize.y);
     m_PresentViewport.MinDepth = 0.f;
     m_PresentViewport.MaxDepth = 1.f;
 
     m_PresentRect.left = 0;
     m_PresentRect.top = 0;
-    m_PresentRect.right = static_cast<i32>(m_Fsr.presentSize.x);
-    m_PresentRect.bottom = static_cast<i32>(m_Fsr.presentSize.y);
+    m_PresentRect.right = static_cast<i32>(m_Upscale.presentSize.x);
+    m_PresentRect.bottom = static_cast<i32>(m_Upscale.presentSize.y);
 
     m_RenderViewport.TopLeftX = 0.f;
     m_RenderViewport.TopLeftY = 0.f;
-    m_RenderViewport.Width = static_cast<f32>(m_Fsr.renderSize.x);
-    m_RenderViewport.Height = static_cast<f32>(m_Fsr.renderSize.y);
+    m_RenderViewport.Width = static_cast<f32>(m_Upscale.renderSize.x);
+    m_RenderViewport.Height = static_cast<f32>(m_Upscale.renderSize.y);
     m_RenderViewport.MinDepth = 0.f;
     m_RenderViewport.MaxDepth = 1.f;
 
     m_RenderRect.left = 0;
     m_RenderRect.top = 0;
-    m_RenderRect.right = static_cast<i32>(m_Fsr.renderSize.x);
-    m_RenderRect.bottom = static_cast<i32>(m_Fsr.renderSize.y);
+    m_RenderRect.right = static_cast<i32>(m_Upscale.renderSize.x);
+    m_RenderRect.bottom = static_cast<i32>(m_Upscale.renderSize.y);
 }
 
-void Renderer::CreateGPUTimers()
+void Renderer::CreateUpscaleResources()
 {
-    IE_Check(m_CommandQueue->GetTimestampFrequency(&m_GpuTimingState.timestampFrequency));
-
-    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
-    {
-        constexpr u32 maxTimestamps = 256;
-
-        D3D12_QUERY_HEAP_DESC qh{};
-        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qh.Count = maxTimestamps;
-        IE_Check(m_Device->CreateQueryHeap(&qh, IID_PPV_ARGS(&m_AllFrameData[i].gpuTimers.heap)));
-
-        CD3DX12_RESOURCE_DESC rb = CD3DX12_RESOURCE_DESC::Buffer(maxTimestamps * sizeof(u64));
-        CD3DX12_HEAP_PROPERTIES hp(D3D12_HEAP_TYPE_READBACK);
-        IE_Check(m_Device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_AllFrameData[i].gpuTimers.readback)));
-
-        m_AllFrameData[i].gpuTimers.nextIdx = 0;
-        m_AllFrameData[i].gpuTimers.passCount = 0;
-    }
-}
-
-void Renderer::CreateFSRPassResources()
-{
-    ffx::CreateBackendDX12Desc backendDesc{};
-    backendDesc.device = m_Device.Get();
-
-    ffx::CreateContextDescUpscaleVersion upscalerVersion{};
-    upscalerVersion.version = FFX_UPSCALER_VERSION;
-
-    ffx::CreateContextDescUpscale createUpscaling{};
-    createUpscaling.maxRenderSize = {m_Fsr.renderSize.x, m_Fsr.renderSize.y};
-    createUpscaling.maxUpscaleSize = {m_Fsr.presentSize.x, m_Fsr.presentSize.y};
-    createUpscaling.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INVERTED | FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
-    IE_Assert(ffx::CreateContext(m_Fsr.context, nullptr, createUpscaling, backendDesc, upscalerVersion) == ffx::ReturnCode::Ok);
-
-    ffx::QueryDescUpscaleGetJitterPhaseCount getJitterPhaseDesc{};
-    getJitterPhaseDesc.displayWidth = m_Fsr.presentSize.x;
-    getJitterPhaseDesc.renderWidth = m_Fsr.renderSize.x;
-    getJitterPhaseDesc.pOutPhaseCount = &m_Fsr.jitterPhaseCount;
-    IE_Assert(ffx::Query(m_Fsr.context, getJitterPhaseDesc) == ffx::ReturnCode::Ok);
-
-    ffx::QueryDescUpscaleGetJitterOffset getJitterOffsetDesc{};
-    getJitterOffsetDesc.index = m_Fsr.jitterIndex;
-    getJitterOffsetDesc.phaseCount = m_Fsr.jitterPhaseCount;
-    getJitterOffsetDesc.pOutX = &m_Fsr.jitterX;
-    getJitterOffsetDesc.pOutY = &m_Fsr.jitterY;
-    IE_Assert(ffx::Query(m_Fsr.context, getJitterOffsetDesc) == ffx::ReturnCode::Ok);
-
     CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
     for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
     {
-        CD3DX12_RESOURCE_DESC fsrDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16B16A16_FLOAT, m_Fsr.presentSize.x, m_Fsr.presentSize.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        IE_Check(m_Device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &fsrDesc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_Fsr.outputs[i])));
-        IE_Check(m_Fsr.outputs[i]->SetName(L"FSR Output"));
+        CD3DX12_RESOURCE_DESC desc =
+            CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16B16A16_FLOAT, m_Upscale.presentSize.x, m_Upscale.presentSize.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        IE_Check(
+            m_RenderDevice.GetDevice()->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_Upscale.outputs[i].resource)));
+        m_Upscale.outputs[i].state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        m_Upscale.outputs[i].SetName(L"Upscale Output");
 
-        D3D12_SHADER_RESOURCE_VIEW_DESC fsrSrvDesc{};
-        fsrSrvDesc.Format = fsrDesc.Format;
-        fsrSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        fsrSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        fsrSrvDesc.Texture2D.MipLevels = 1;
-        m_Fsr.srvIdx[i] = m_BindlessHeaps.CreateSRV(m_Fsr.outputs[i].Get(), fsrSrvDesc);
-
-        m_Fsr.outputState[i] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = desc.Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MipLevels = 1;
+        m_Upscale.outputs[i].srvIndex = m_BindlessHeaps.CreateSRV(m_Upscale.outputs[i].Get(), srvDesc);
     }
 }
 
-void Renderer::CreateDepthPrePassPipelines(const Vector<WString>& globalDefines)
+void Renderer::CreateBloomResources()
 {
-    m_GBuf.amplificationShader = IE_LoadShader(IE_SHADER_TYPE_AMPLIFICATION, L"amplification/asBasic.hlsl", {globalDefines}, m_GBuf.amplificationShader);
-    m_GBuf.meshShader = IE_LoadShader(IE_SHADER_TYPE_MESH, L"mesh/msBasic.hlsl", {globalDefines}, m_GBuf.meshShader);
+    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
+    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MipLevels = 1;
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+    uavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+
+    m_Bloom.mipCount = 0;
+    u32 width = (m_Upscale.presentSize.x > 1u) ? (m_Upscale.presentSize.x / 2u) : 1u;
+    u32 height = (m_Upscale.presentSize.y > 1u) ? (m_Upscale.presentSize.y / 2u) : 1u;
+    for (u32 mip = 0; mip < BloomResources::kMaxMipCount; ++mip)
+    {
+        m_Bloom.mipSizes[mip] = XMUINT2(width, height);
+        m_Bloom.mipCount = mip + 1u;
+        if (width == 1u && height == 1u)
+        {
+            break;
+        }
+        width = (width > 1u) ? (width / 2u) : 1u;
+        height = (height > 1u) ? (height / 2u) : 1u;
+    }
+
+    auto createTexture = [&](Texture& texture, const XMUINT2& size, const wchar_t* name) {
+        CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16B16A16_FLOAT, size.x, size.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        IE_Check(device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, nullptr,
+                                                 IID_PPV_ARGS(&texture.resource)));
+        texture.state = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+        texture.SetName(name);
+        texture.srvIndex = m_BindlessHeaps.CreateSRV(texture.Get(), srvDesc);
+        texture.uavIndex = m_BindlessHeaps.CreateUAV(texture.Get(), uavDesc);
+    };
+
+    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
+    {
+        for (u32 mip = 0; mip < m_Bloom.mipCount; ++mip)
+        {
+            createTexture(m_Bloom.downChain[i][mip], m_Bloom.mipSizes[mip], L"Bloom Down");
+            createTexture(m_Bloom.upChain[i][mip], m_Bloom.mipSizes[mip], L"Bloom Up");
+        }
+    }
+}
+
+void Renderer::CreateDepthPrePassPipelines(const Vector<String>& globalDefines)
+{
+    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
+    Shader::ReloadOrCreate(m_GBuf.amplificationShader, IE_SHADER_TYPE_AMPLIFICATION, "systems/gbuffer/gbuffer.as.hlsl", globalDefines);
+    Shader::ReloadOrCreate(m_DepthPre.opaqueMeshShader, IE_SHADER_TYPE_MESH, "systems/depth/depth_pre_opaque.ms.hlsl", globalDefines);
+    Shader::ReloadOrCreate(m_DepthPre.alphaTestMeshShader, IE_SHADER_TYPE_MESH, "systems/depth/depth_pre_alpha_test.ms.hlsl", globalDefines);
 
     CD3DX12_DEPTH_STENCIL_DESC ds(D3D12_DEFAULT);
     ds.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
 
-    // Opaque
     {
-        IE_Check(m_Device->CreateRootSignature(0, m_GBuf.meshShader->blob->GetBufferPointer(), m_GBuf.meshShader->blob->GetBufferSize(), IID_PPV_ARGS(&m_DepthPre.opaqueRootSig)));
+        m_DepthPre.opaqueRootSig = m_DepthPre.opaqueMeshShader->GetOrCreateRootSignature(device);
 
         D3DX12_MESH_SHADER_PIPELINE_STATE_DESC depthDesc{};
         depthDesc.pRootSignature = m_DepthPre.opaqueRootSig.Get();
-        depthDesc.AS = m_GBuf.amplificationShader->blob->GetBufferSize() > 0
-                           ? D3D12_SHADER_BYTECODE(m_GBuf.amplificationShader->blob->GetBufferPointer(), m_GBuf.amplificationShader->blob->GetBufferSize())
-                           : D3D12_SHADER_BYTECODE();
-        depthDesc.MS = D3D12_SHADER_BYTECODE(m_GBuf.meshShader->blob->GetBufferPointer(), m_GBuf.meshShader->blob->GetBufferSize());
+        depthDesc.AS = m_GBuf.amplificationShader->GetBytecode();
+        depthDesc.MS = m_DepthPre.opaqueMeshShader->GetBytecode();
         depthDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
         depthDesc.SampleMask = UINT_MAX;
         depthDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
@@ -1199,7 +1113,7 @@ void Renderer::CreateDepthPrePassPipelines(const Vector<WString>& globalDefines)
 
         CD3DX12_PIPELINE_MESH_STATE_STREAM depthStream(depthDesc);
         D3D12_PIPELINE_STATE_STREAM_DESC depthStreamDesc{sizeof(depthStream), &depthStream};
-        IE_Check(m_Device->CreatePipelineState(&depthStreamDesc, IID_PPV_ARGS(&m_DepthPre.opaquePSO[CullMode_Back])));
+        IE_Check(device->CreatePipelineState(&depthStreamDesc, IID_PPV_ARGS(&m_DepthPre.opaquePSO[CullMode_Back])));
 
         D3DX12_MESH_SHADER_PIPELINE_STATE_DESC depthDescNoCull = depthDesc;
         auto rastNoCull = depthDescNoCull.RasterizerState;
@@ -1208,22 +1122,19 @@ void Renderer::CreateDepthPrePassPipelines(const Vector<WString>& globalDefines)
 
         CD3DX12_PIPELINE_MESH_STATE_STREAM streamNoCull(depthDescNoCull);
         D3D12_PIPELINE_STATE_STREAM_DESC streamDescNoCull{sizeof(streamNoCull), &streamNoCull};
-        IE_Check(m_Device->CreatePipelineState(&streamDescNoCull, IID_PPV_ARGS(&m_DepthPre.opaquePSO[CullMode_None])));
+        IE_Check(device->CreatePipelineState(&streamDescNoCull, IID_PPV_ARGS(&m_DepthPre.opaquePSO[CullMode_None])));
     }
 
-    // Alpha Tested
     {
-        m_DepthPre.alphaTestShader = IE_LoadShader(IE_SHADER_TYPE_PIXEL, L"pixel/psAlphaTest.hlsl", {globalDefines}, m_DepthPre.alphaTestShader);
+        Shader::ReloadOrCreate(m_DepthPre.alphaTestShader, IE_SHADER_TYPE_PIXEL, "systems/gbuffer/gbuffer_alpha_test.ps.hlsl", globalDefines);
 
-        IE_Check(m_Device->CreateRootSignature(0, m_DepthPre.alphaTestShader->blob->GetBufferPointer(), m_DepthPre.alphaTestShader->blob->GetBufferSize(), IID_PPV_ARGS(&m_DepthPre.alphaTestRootSig)));
+        m_DepthPre.alphaTestRootSig = m_DepthPre.alphaTestShader->GetOrCreateRootSignature(device);
 
         D3DX12_MESH_SHADER_PIPELINE_STATE_DESC depthDesc{};
         depthDesc.pRootSignature = m_DepthPre.alphaTestRootSig.Get();
-        depthDesc.AS = m_GBuf.amplificationShader->blob->GetBufferSize() > 0
-                           ? D3D12_SHADER_BYTECODE(m_GBuf.amplificationShader->blob->GetBufferPointer(), m_GBuf.amplificationShader->blob->GetBufferSize())
-                           : D3D12_SHADER_BYTECODE();
-        depthDesc.MS = D3D12_SHADER_BYTECODE(m_GBuf.meshShader->blob->GetBufferPointer(), m_GBuf.meshShader->blob->GetBufferSize());
-        depthDesc.PS = D3D12_SHADER_BYTECODE(m_DepthPre.alphaTestShader->blob->GetBufferPointer(), m_DepthPre.alphaTestShader->blob->GetBufferSize());
+        depthDesc.AS = m_GBuf.amplificationShader->GetBytecode();
+        depthDesc.MS = m_DepthPre.alphaTestMeshShader->GetBytecode();
+        depthDesc.PS = m_DepthPre.alphaTestShader->GetBytecode();
         depthDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
         depthDesc.SampleMask = UINT_MAX;
         depthDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
@@ -1234,7 +1145,7 @@ void Renderer::CreateDepthPrePassPipelines(const Vector<WString>& globalDefines)
 
         CD3DX12_PIPELINE_MESH_STATE_STREAM depthStream(depthDesc);
         D3D12_PIPELINE_STATE_STREAM_DESC depthStreamDesc{sizeof(depthStream), &depthStream};
-        IE_Check(m_Device->CreatePipelineState(&depthStreamDesc, IID_PPV_ARGS(&m_DepthPre.alphaTestPSO[CullMode_Back])));
+        IE_Check(device->CreatePipelineState(&depthStreamDesc, IID_PPV_ARGS(&m_DepthPre.alphaTestPSO[CullMode_Back])));
 
         D3DX12_MESH_SHADER_PIPELINE_STATE_DESC depthDescNoCull = depthDesc;
         auto rastNoCull = depthDescNoCull.RasterizerState;
@@ -1243,35 +1154,40 @@ void Renderer::CreateDepthPrePassPipelines(const Vector<WString>& globalDefines)
 
         CD3DX12_PIPELINE_MESH_STATE_STREAM streamNoCull(depthDescNoCull);
         D3D12_PIPELINE_STATE_STREAM_DESC streamDescNoCull{sizeof(streamNoCull), &streamNoCull};
-        IE_Check(m_Device->CreatePipelineState(&streamDescNoCull, IID_PPV_ARGS(&m_DepthPre.alphaTestPSO[CullMode_None])));
+        IE_Check(device->CreatePipelineState(&streamDescNoCull, IID_PPV_ARGS(&m_DepthPre.alphaTestPSO[CullMode_None])));
     }
 }
 
 constexpr DXGI_FORMAT formats[GBuffer::targetCount] = {
     DXGI_FORMAT_R8G8B8A8_UNORM, // Albedo
-    DXGI_FORMAT_R16G16_FLOAT,   // Normal
-    DXGI_FORMAT_R16G16_FLOAT,   // NormalGeo
+    DXGI_FORMAT_R16G16_SNORM,   // Normal
+    DXGI_FORMAT_R16G16_SNORM,   // NormalGeo
     DXGI_FORMAT_R16G16_UNORM,   // Material
     DXGI_FORMAT_R16G16_FLOAT,   // Motion vector
     DXGI_FORMAT_R8_UNORM,       // AO
+    DXGI_FORMAT_R11G11B10_FLOAT, // Emissive
 };
-constexpr const wchar_t* rtvNames[GBuffer::targetCount] = {L"GBuffer Albedo", L"GBuffer Normal", L"GBuffer Normal Geometry", L"GBuffer Material", L"GBuffer Motion Vector", L"GBuffer AO"};
+constexpr const wchar_t* rtvNames[GBuffer::targetCount] = {L"GBuffer Albedo", L"GBuffer Normal", L"GBuffer Normal Geometry", L"GBuffer Material", L"GBuffer Motion Vector",
+                                                           L"GBuffer AO", L"GBuffer Emissive"};
 
-void Renderer::CreateGBufferPassPipelines(const Vector<WString>& globalDefines)
+void Renderer::CreateGBufferPassPipelines(const Vector<String>& globalDefines)
 {
-    m_GBuf.pixelShaders[AlphaMode_Opaque] = IE_LoadShader(IE_SHADER_TYPE_PIXEL, L"pixel/psGBuffer.hlsl", globalDefines, m_GBuf.pixelShaders[AlphaMode_Opaque]);
+    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
+    Shader::ReloadOrCreate(m_GBuf.amplificationShader, IE_SHADER_TYPE_AMPLIFICATION, "systems/gbuffer/gbuffer.as.hlsl", globalDefines);
+    Shader::ReloadOrCreate(m_GBuf.meshShader, IE_SHADER_TYPE_MESH, "systems/gbuffer/gbuffer.ms.hlsl", globalDefines);
+    Shader::ReloadOrCreate(m_GBuf.pixelShaders[AlphaMode_Opaque], IE_SHADER_TYPE_PIXEL, "systems/gbuffer/gbuffer.ps.hlsl", globalDefines);
 
-    Vector<WString> blendDefines = globalDefines;
-    blendDefines.push_back(L"ENABLE_BLEND");
-    m_GBuf.pixelShaders[AlphaMode_Blend] = IE_LoadShader(IE_SHADER_TYPE_PIXEL, L"pixel/psGBuffer.hlsl", blendDefines, m_GBuf.pixelShaders[AlphaMode_Blend]);
+    Vector<String> blendDefines = globalDefines;
+    blendDefines.push_back("ENABLE_BLEND");
+    Shader::ReloadOrCreate(m_GBuf.pixelShaders[AlphaMode_Blend], IE_SHADER_TYPE_PIXEL, "systems/gbuffer/gbuffer.ps.hlsl", blendDefines);
 
-    Vector<WString> maskDefines = globalDefines;
-    maskDefines.push_back(L"ENABLE_ALPHA_TEST");
-    m_GBuf.pixelShaders[AlphaMode_Mask] = IE_LoadShader(IE_SHADER_TYPE_PIXEL, L"pixel/psGBuffer.hlsl", maskDefines, m_GBuf.pixelShaders[AlphaMode_Mask]);
+    Vector<String> maskDefines = globalDefines;
+    maskDefines.push_back("ENABLE_ALPHA_TEST");
+    Shader::ReloadOrCreate(m_GBuf.pixelShaders[AlphaMode_Mask], IE_SHADER_TYPE_PIXEL, "systems/gbuffer/gbuffer.ps.hlsl", maskDefines);
 
     for (AlphaMode alphaMode = AlphaMode_Opaque; alphaMode < AlphaMode_Count; alphaMode = static_cast<AlphaMode>(alphaMode + 1))
     {
-        IE_Check(m_Device->CreateRootSignature(0, m_GBuf.meshShader->blob->GetBufferPointer(), m_GBuf.meshShader->blob->GetBufferSize(), IID_PPV_ARGS(&m_GBuf.rootSigs[alphaMode])));
+        m_GBuf.rootSigs[alphaMode] = m_GBuf.meshShader->GetOrCreateRootSignature(device);
 
         CD3DX12_DEPTH_STENCIL_DESC ds(D3D12_DEFAULT);
         ds.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
@@ -1279,11 +1195,9 @@ void Renderer::CreateGBufferPassPipelines(const Vector<WString>& globalDefines)
 
         D3DX12_MESH_SHADER_PIPELINE_STATE_DESC msDesc{};
         msDesc.pRootSignature = m_GBuf.rootSigs[alphaMode].Get();
-        msDesc.AS = m_GBuf.amplificationShader->blob->GetBufferSize() > 0
-                        ? D3D12_SHADER_BYTECODE(m_GBuf.amplificationShader->blob->GetBufferPointer(), m_GBuf.amplificationShader->blob->GetBufferSize())
-                        : D3D12_SHADER_BYTECODE();
-        msDesc.MS = D3D12_SHADER_BYTECODE(m_GBuf.meshShader->blob->GetBufferPointer(), m_GBuf.meshShader->blob->GetBufferSize());
-        msDesc.PS = D3D12_SHADER_BYTECODE(m_GBuf.pixelShaders[alphaMode]->blob->GetBufferPointer(), m_GBuf.pixelShaders[alphaMode]->blob->GetBufferSize());
+        msDesc.AS = m_GBuf.amplificationShader->GetBytecode();
+        msDesc.MS = m_GBuf.meshShader->GetBytecode();
+        msDesc.PS = m_GBuf.pixelShaders[alphaMode]->GetBytecode();
         msDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
         msDesc.SampleMask = UINT_MAX;
         msDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
@@ -1297,14 +1211,12 @@ void Renderer::CreateGBufferPassPipelines(const Vector<WString>& globalDefines)
             msDesc.RTVFormats[i] = formats[i];
         }
 
-        // Cull
         {
             CD3DX12_PIPELINE_MESH_STATE_STREAM stream(msDesc);
             D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
-            IE_Check(m_Device->CreatePipelineState(&desc, IID_PPV_ARGS(&m_GBuf.psos[alphaMode][CullMode_Back])));
+            IE_Check(device->CreatePipelineState(&desc, IID_PPV_ARGS(&m_GBuf.psos[alphaMode][CullMode_Back])));
         }
 
-        // No cull
         {
             D3DX12_MESH_SHADER_PIPELINE_STATE_DESC noCull = msDesc;
             D3D12_RASTERIZER_DESC rast = noCull.RasterizerState;
@@ -1313,132 +1225,83 @@ void Renderer::CreateGBufferPassPipelines(const Vector<WString>& globalDefines)
 
             CD3DX12_PIPELINE_MESH_STATE_STREAM stream(noCull);
             D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
-            IE_Check(m_Device->CreatePipelineState(&desc, IID_PPV_ARGS(&m_GBuf.psos[alphaMode][CullMode_None])));
+            IE_Check(device->CreatePipelineState(&desc, IID_PPV_ARGS(&m_GBuf.psos[alphaMode][CullMode_None])));
         }
     }
 }
 
-void Renderer::CreateLightingPassPipelines(const Vector<WString>& globalDefines)
+void Renderer::CreateLightingPassPipelines(const Vector<String>& globalDefines)
 {
-    m_Light.pxShader = IE_LoadShader(IE_SHADER_TYPE_PIXEL, L"pixel/psLighting.hlsl", {globalDefines}, m_Light.pxShader);
-    m_Light.vxShader = IE_LoadShader(IE_SHADER_TYPE_VERTEX, L"vertex/vsFullscreen.hlsl", {globalDefines}, m_Light.vxShader);
-    IE_Check(m_Device->CreateRootSignature(0, m_Light.pxShader->blob->GetBufferPointer(), m_Light.pxShader->blob->GetBufferSize(), IID_PPV_ARGS(&m_Light.rootSig)));
-
-    D3D12_DEPTH_STENCIL_DESC dsDesc{};
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
-    psoDesc.pRootSignature = m_Light.rootSig.Get();
-    psoDesc.VS.pShaderBytecode = m_Light.vxShader->blob->GetBufferPointer();
-    psoDesc.VS.BytecodeLength = m_Light.vxShader->blob->GetBufferSize();
-    psoDesc.PS.pShaderBytecode = m_Light.pxShader->blob->GetBufferPointer();
-    psoDesc.PS.BytecodeLength = m_Light.pxShader->blob->GetBufferSize();
-    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-    psoDesc.SampleMask = UINT_MAX;
-    psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-    psoDesc.DepthStencilState = dsDesc;
-    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = {DXGI_FORMAT_R16G16B16A16_FLOAT};
-    psoDesc.SampleDesc = DefaultSampleDesc();
-    IE_Check(m_Device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_Light.pso)));
+    Shader::ReloadOrCreate(m_Light.pxShader, IE_SHADER_TYPE_PIXEL, "systems/lighting/lighting.ps.hlsl", globalDefines);
+    Shader::ReloadOrCreate(m_Light.vxShader, IE_SHADER_TYPE_VERTEX, "shared/fullscreen.vs.hlsl", globalDefines);
+    PipelineHelpers::CreateFullscreenGraphicsPipeline(m_RenderDevice.GetDevice(), m_Light.vxShader, m_Light.pxShader, DXGI_FORMAT_R11G11B10_FLOAT, m_Light.rootSig, m_Light.pso);
 }
 
-void Renderer::CreateHistogramPassPipelines(const Vector<WString>& globalDefines)
+void Renderer::CreateBloomPassPipelines(const Vector<String>& globalDefines)
 {
-    // Clear pass
-    m_Histo.clearUintShader = IE_LoadShader(IE_SHADER_TYPE_COMPUTE, L"compute/csClearUint.hlsl", {globalDefines}, m_Histo.clearUintShader);
-    IE_Check(m_Device->CreateRootSignature(0, m_Histo.clearUintShader->blob->GetBufferPointer(), m_Histo.clearUintShader->blob->GetBufferSize(), IID_PPV_ARGS(&m_Histo.clearUintRootSig)));
-    D3D12_COMPUTE_PIPELINE_STATE_DESC clearUintPsoDesc{};
-    clearUintPsoDesc.pRootSignature = m_Histo.clearUintRootSig.Get();
-    clearUintPsoDesc.CS.pShaderBytecode = m_Histo.clearUintShader->blob->GetBufferPointer();
-    clearUintPsoDesc.CS.BytecodeLength = m_Histo.clearUintShader->blob->GetBufferSize();
-    IE_Check(m_Device->CreateComputePipelineState(&clearUintPsoDesc, IID_PPV_ARGS(&m_Histo.clearUintPso)));
+    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
 
-    // Histogram pass
-    m_Histo.histogramShader = IE_LoadShader(IE_SHADER_TYPE_COMPUTE, L"compute/csHistogram.hlsl", {globalDefines}, m_Histo.histogramShader);
-    IE_Check(m_Device->CreateRootSignature(0, m_Histo.histogramShader->blob->GetBufferPointer(), m_Histo.histogramShader->blob->GetBufferSize(), IID_PPV_ARGS(&m_Histo.histogramRootSig)));
-    D3D12_COMPUTE_PIPELINE_STATE_DESC histogramPsoDesc{};
-    histogramPsoDesc.pRootSignature = m_Histo.histogramRootSig.Get();
-    histogramPsoDesc.CS.pShaderBytecode = m_Histo.histogramShader->blob->GetBufferPointer();
-    histogramPsoDesc.CS.BytecodeLength = m_Histo.histogramShader->blob->GetBufferSize();
-    IE_Check(m_Device->CreateComputePipelineState(&histogramPsoDesc, IID_PPV_ARGS(&m_Histo.histogramPso)));
+    auto CreateComputePipeline = [&](const SharedPtr<Shader>& shader, ComPtr<ID3D12RootSignature>& outRootSig, ComPtr<ID3D12PipelineState>& outPso) {
+        IE_Assert(shader && shader->IsValid());
+        outRootSig = shader->GetOrCreateRootSignature(device);
 
-    // Exposure pass
-    m_Histo.exposureShader = IE_LoadShader(IE_SHADER_TYPE_COMPUTE, L"compute/csExposure.hlsl", {globalDefines}, m_Histo.exposureShader);
-    IE_Check(m_Device->CreateRootSignature(0, m_Histo.exposureShader->blob->GetBufferPointer(), m_Histo.exposureShader->blob->GetBufferSize(), IID_PPV_ARGS(&m_Histo.exposureRootSig)));
-    D3D12_COMPUTE_PIPELINE_STATE_DESC exposurePsoDesc{};
-    exposurePsoDesc.pRootSignature = m_Histo.exposureRootSig.Get();
-    exposurePsoDesc.CS.pShaderBytecode = m_Histo.exposureShader->blob->GetBufferPointer();
-    exposurePsoDesc.CS.BytecodeLength = m_Histo.exposureShader->blob->GetBufferSize();
-    IE_Check(m_Device->CreateComputePipelineState(&exposurePsoDesc, IID_PPV_ARGS(&m_Histo.exposurePso)));
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+        psoDesc.pRootSignature = outRootSig.Get();
+        psoDesc.CS = shader->GetBytecode();
+        IE_Check(device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&outPso)));
+    };
 
-    // Adapt exposure pass
-    m_Histo.adaptExposureShader = IE_LoadShader(IE_SHADER_TYPE_COMPUTE, L"compute/csAdaptExposure.hlsl", {globalDefines}, m_Histo.adaptExposureShader);
-    IE_Check(m_Device->CreateRootSignature(0, m_Histo.adaptExposureShader->blob->GetBufferPointer(), m_Histo.adaptExposureShader->blob->GetBufferSize(), IID_PPV_ARGS(&m_Histo.adaptExposureRootSig)));
-    D3D12_COMPUTE_PIPELINE_STATE_DESC adaptExposurePsoDesc{};
-    adaptExposurePsoDesc.pRootSignature = m_Histo.adaptExposureRootSig.Get();
-    adaptExposurePsoDesc.CS.pShaderBytecode = m_Histo.adaptExposureShader->blob->GetBufferPointer();
-    adaptExposurePsoDesc.CS.BytecodeLength = m_Histo.adaptExposureShader->blob->GetBufferSize();
-    IE_Check(m_Device->CreateComputePipelineState(&adaptExposurePsoDesc, IID_PPV_ARGS(&m_Histo.adaptExposurePso)));
+    Shader::ReloadOrCreate(m_Bloom.downsampleCs, IE_SHADER_TYPE_COMPUTE, "systems/post/bloom_extract.cs.hlsl", globalDefines);
+    CreateComputePipeline(m_Bloom.downsampleCs, m_Bloom.downsampleRootSig, m_Bloom.downsamplePso);
+
+    Shader::ReloadOrCreate(m_Bloom.upsampleCs, IE_SHADER_TYPE_COMPUTE, "systems/post/bloom_blur.cs.hlsl", globalDefines);
+    CreateComputePipeline(m_Bloom.upsampleCs, m_Bloom.upsampleRootSig, m_Bloom.upsamplePso);
 }
 
-void Renderer::CreateToneMapPassPipelines(const Vector<WString>& globalDefines)
+void Renderer::CreateToneMapPassPipelines(const Vector<String>& globalDefines)
 {
-    m_Tonemap.vxShader = IE_LoadShader(IE_SHADER_TYPE_VERTEX, L"vertex/vsFullscreen.hlsl", {globalDefines}, m_Tonemap.vxShader);
-    m_Tonemap.pxShader = IE_LoadShader(IE_SHADER_TYPE_PIXEL, L"pixel/psTonemap.hlsl", {globalDefines}, m_Tonemap.pxShader);
-    IE_Check(m_Device->CreateRootSignature(0, m_Tonemap.pxShader->blob->GetBufferPointer(), m_Tonemap.pxShader->blob->GetBufferSize(), IID_PPV_ARGS(&m_Tonemap.rootSig)));
-
-    D3D12_DEPTH_STENCIL_DESC dsDesc{};
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
-    psoDesc.pRootSignature = m_Tonemap.rootSig.Get();
-    psoDesc.VS.pShaderBytecode = m_Tonemap.vxShader->blob->GetBufferPointer();
-    psoDesc.VS.BytecodeLength = m_Tonemap.vxShader->blob->GetBufferSize();
-    psoDesc.PS.pShaderBytecode = m_Tonemap.pxShader->blob->GetBufferPointer();
-    psoDesc.PS.BytecodeLength = m_Tonemap.pxShader->blob->GetBufferSize();
-    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-    psoDesc.SampleMask = UINT_MAX;
-    psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-    psoDesc.DepthStencilState = dsDesc;
-    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    psoDesc.SampleDesc = DefaultSampleDesc();
-    IE_Check(m_Device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_Tonemap.pso)));
+    Shader::ReloadOrCreate(m_Tonemap.vxShader, IE_SHADER_TYPE_VERTEX, "shared/fullscreen.vs.hlsl", globalDefines);
+    Shader::ReloadOrCreate(m_Tonemap.pxShader, IE_SHADER_TYPE_PIXEL, "systems/post/tonemap.ps.hlsl", globalDefines);
+    PipelineHelpers::CreateFullscreenGraphicsPipeline(m_RenderDevice.GetDevice(), m_Tonemap.vxShader, m_Tonemap.pxShader, DXGI_FORMAT_R8G8B8A8_UNORM, m_Tonemap.rootSig, m_Tonemap.pso);
 }
 
 void Renderer::CreateGBufferPassResources()
 {
+    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
     for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
     {
         GBuffer& gbuff = m_GBuf.gbuffers[i];
-        ComPtr<ID3D12Resource>* targets[GBuffer::targetCount] = {&gbuff.albedo, &gbuff.normal, &gbuff.normalGeo, &gbuff.material, &gbuff.motionVector, &gbuff.ao};
+        RenderTarget* targets[GBuffer::targetCount] = {&gbuff.albedo, &gbuff.normal, &gbuff.normalGeo, &gbuff.material, &gbuff.motionVector, &gbuff.ao, &gbuff.emissive};
 
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         heapDesc.NumDescriptors = GBuffer::targetCount;
-        IE_Check(m_Device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&gbuff.rtvHeap)));
+        IE_Check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&gbuff.rtvHeap)));
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = gbuff.rtvHeap->GetCPUDescriptorHandleForHeapStart();
 
         for (u32 t = 0; t < GBuffer::targetCount; ++t)
         {
-            CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Tex2D(formats[t], m_Fsr.renderSize.x, m_Fsr.renderSize.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Tex2D(formats[t], m_Upscale.renderSize.x, m_Upscale.renderSize.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
 
             D3D12_CLEAR_VALUE clearValue = {formats[t], {0.f, 0.f, 0.f, 0.f}};
             CD3DX12_HEAP_PROPERTIES heap(D3D12_HEAP_TYPE_DEFAULT);
 
-            IE_Check(m_Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, &clearValue, IID_PPV_ARGS(targets[t]->GetAddressOf())));
-            IE_Check(targets[t]->Get()->SetName(rtvNames[t]));
+            IE_Check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, &clearValue, IID_PPV_ARGS(&targets[t]->resource)));
+            targets[t]->state = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+            targets[t]->SetName(rtvNames[t]);
 
-            m_Device->CreateRenderTargetView(targets[t]->Get(), nullptr, rtvHandle);
-            m_GBuf.rtvHandles[i][t] = rtvHandle;
+            targets[t]->rtv = rtvHandle;
+            device->CreateRenderTargetView(targets[t]->Get(), nullptr, targets[t]->rtv);
 
-            rtvHandle.ptr += m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            rtvHandle.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         }
     }
 }
 
 void Renderer::CreateLightingPassResources()
 {
+    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv2D{};
     srv2D.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv2D.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1448,85 +1311,272 @@ void Renderer::CreateLightingPassResources()
     CD3DX12_RESOURCE_DESC cbDesc = CD3DX12_RESOURCE_DESC::Buffer(IE_AlignUp(sizeof(LightingPassConstants), 256));
     for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
     {
-        srv2D.Format = m_GBuf.gbuffers[i].albedo->GetDesc().Format;
-        m_GBuf.gbuffers[i].albedoIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].albedo, srv2D);
+        srv2D.Format = m_GBuf.gbuffers[i].albedo.GetDesc().Format;
+        m_GBuf.gbuffers[i].albedo.srvIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].albedo.resource, srv2D);
 
-        srv2D.Format = m_GBuf.gbuffers[i].normal->GetDesc().Format;
-        m_GBuf.gbuffers[i].normalIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].normal, srv2D);
+        srv2D.Format = m_GBuf.gbuffers[i].normal.GetDesc().Format;
+        m_GBuf.gbuffers[i].normal.srvIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].normal.resource, srv2D);
 
-        srv2D.Format = m_GBuf.gbuffers[i].normalGeo->GetDesc().Format;
-        m_GBuf.gbuffers[i].normalGeoIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].normalGeo, srv2D);
+        srv2D.Format = m_GBuf.gbuffers[i].normalGeo.GetDesc().Format;
+        m_GBuf.gbuffers[i].normalGeo.srvIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].normalGeo.resource, srv2D);
 
-        srv2D.Format = m_GBuf.gbuffers[i].material->GetDesc().Format;
-        m_GBuf.gbuffers[i].materialIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].material, srv2D);
+        srv2D.Format = m_GBuf.gbuffers[i].material.GetDesc().Format;
+        m_GBuf.gbuffers[i].material.srvIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].material.resource, srv2D);
 
-        srv2D.Format = m_GBuf.gbuffers[i].motionVector->GetDesc().Format;
-        m_GBuf.gbuffers[i].motionVectorIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].motionVector, srv2D);
+        srv2D.Format = m_GBuf.gbuffers[i].motionVector.GetDesc().Format;
+        m_GBuf.gbuffers[i].motionVector.srvIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].motionVector.resource, srv2D);
 
-        srv2D.Format = m_GBuf.gbuffers[i].ao->GetDesc().Format;
-        m_GBuf.gbuffers[i].aoIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].ao, srv2D);
+        srv2D.Format = m_GBuf.gbuffers[i].ao.GetDesc().Format;
+        m_GBuf.gbuffers[i].ao.srvIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].ao.resource, srv2D);
 
-        IE_Check(m_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &cbDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_Light.cb[i])));
+        srv2D.Format = m_GBuf.gbuffers[i].emissive.GetDesc().Format;
+        m_GBuf.gbuffers[i].emissive.srvIndex = m_BindlessHeaps.CreateSRV(m_GBuf.gbuffers[i].emissive.resource, srv2D);
+
+        srv2D.Format = m_Light.hdrRt[i].GetDesc().Format;
+        m_Light.hdrRt[i].srvIndex = m_BindlessHeaps.CreateSRV(m_Light.hdrRt[i].resource, srv2D);
+        IE_Check(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &cbDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_Light.cb[i])));
         IE_Check(m_Light.cb[i]->SetName(L"LightingPassConstants"));
         m_Light.cb[i]->Map(0, nullptr, reinterpret_cast<void**>(&m_Light.cbMapped[i]));
     }
 }
 
-void Renderer::CreateHistogramPassResources()
+void Renderer::ReloadRuntimeAndScene(const String& sceneFile)
 {
-    BufferCreateDesc bufferDesc{};
-    bufferDesc.heapType = D3D12_HEAP_TYPE_DEFAULT;
-    bufferDesc.viewKind = BufferCreateDesc::ViewKind::Structured;
-    bufferDesc.createSRV = true;
-    bufferDesc.createUAV = true;
-    bufferDesc.resourceFlags = D3D12_RESOURCE_FLAG_NONE | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    bufferDesc.initialState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    bufferDesc.finalState = bufferDesc.initialState;
+    WaitForGpuIdle();
+    ImGui_ResetDebugTextureCache();
 
-    bufferDesc.sizeInBytes = m_Histo.numBuckets * sizeof(u32);
-    bufferDesc.strideInBytes = sizeof(u32);
-    bufferDesc.name = L"Histogram";
-    m_Histo.histogramBuffer = CreateBuffer(nullptr, bufferDesc);
-
-    bufferDesc.sizeInBytes = 1 * sizeof(f32);
-    bufferDesc.strideInBytes = sizeof(f32);
-    bufferDesc.name = L"Exposure";
-    m_Histo.exposureBuffer = CreateBuffer(nullptr, bufferDesc);
-
-    bufferDesc.sizeInBytes = 1 * sizeof(f32);
-    bufferDesc.strideInBytes = sizeof(f32);
-    bufferDesc.name = L"Adapt Exposure";
-    m_Histo.adaptExposureBuffer = CreateBuffer(nullptr, bufferDesc);
-}
-
-void Renderer::LoadScene()
-{
-    const CommandLineArguments& args = GetCommandLineArguments();
-    String sceneFile = args.sceneFile.empty() ? "Bistro" : args.sceneFile;
-
-    // Camera config stays in renderer
-    Camera& camera = Camera::GetInstance();
-    camera.LoadSceneConfig(sceneFile);
-
-    // GPU-side scene construction handled by SceneLoader
-    SceneLoader::Load(*this, sceneFile);
-}
-
-void Renderer::WaitOnFence(const ComPtr<ID3D12Fence>& fence, u64& fenceValue)
-{
-    if (fence->GetCompletedValue() < fenceValue)
+    Timings_ResetAverages(m_GpuTimingState);
+    Timings_ResetAverages(m_CpuTimingState);
+    for (PerFrameData& frameData : m_RenderDevice.GetAllFrameData())
     {
-        HANDLE event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-        IE_Check(fence->SetEventOnCompletion(fenceValue, event));
-        WaitForSingleObject(event, INFINITE);
-        CloseHandle(event);
+        frameData.gpuTimers.passCount = 0;
+        frameData.gpuTimers.nextIdx = 0;
     }
-    fenceValue++;
+
+    m_BindlessHeaps.ResetAll();
+
+    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
+    {
+        if (m_Light.cb[i] && m_Light.cbMapped[i])
+        {
+            m_Light.cb[i]->Unmap(0, nullptr);
+        }
+        m_Light.cbMapped[i] = nullptr;
+        m_Light.cb[i].Reset();
+    }
+
+    m_RenderDevice.ClearAllTrackedUploads();
+
+    m_SceneResources.Reset();
+    m_Culling.Reset();
+    m_TestMovePrev = false;
+    m_TestBaseWorlds.clear();
+
+    SetRenderAndPresentSize();
+    CreateRTVs();
+    CreateDSV();
+    CreateUpscaleResources();
+    CreateBloomResources();
+    CreateGBufferPassResources();
+    CreateLightingPassResources();
+    m_Sky.CreateProceduralSkyCubeResources(m_RenderDevice.GetDevice(), m_BindlessHeaps);
+    m_AutoExposure.CreateResources(m_RenderDevice, m_BindlessHeaps);
+    m_Sky.CreateSkyMotionPassResources(m_RenderDevice.GetDevice());
+
+    LoadScene(sceneFile);
+}
+
+void Renderer::CreateSceneDepthSRVs()
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC depthSrvDesc{};
+    depthSrvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    depthSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depthSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depthSrvDesc.Texture2D.MipLevels = 1;
+    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
+    {
+        m_DepthPre.dsvs[i].srvIndex = m_BindlessHeaps.CreateSRV(m_DepthPre.dsvs[i].resource, depthSrvDesc);
+    }
+}
+
+void Renderer::PresentLoadingFrame()
+{
+    m_FrameInFlightIdx = m_RenderDevice.GetCurrentBackBufferIndex();
+
+    PerFrameData& frameData = GetCurrentFrameData();
+    m_RenderDevice.WaitForFrame(frameData);
+
+    IE_Check(frameData.commandAllocator->Reset());
+    IE_Check(frameData.cmd->Reset(frameData.commandAllocator.Get(), nullptr));
+
+    ComPtr<ID3D12GraphicsCommandList7> cmd = frameData.cmd;
+    cmd->RSSetViewports(1, &m_PresentViewport);
+    cmd->RSSetScissorRects(1, &m_PresentRect);
+
+    RenderTarget& backBuffer = m_Tonemap.sdrRt[m_FrameInFlightIdx];
+    backBuffer.Transition(cmd, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cmd->OMSetRenderTargets(1, &backBuffer.rtv, false, nullptr);
+
+    constexpr FLOAT clearColor[4] = {0.06f, 0.07f, 0.08f, 1.0f};
+    cmd->ClearRenderTargetView(backBuffer.rtv, clearColor, 0, nullptr);
+
+    ImGui_FrameStats frameStats{};
+    const Camera::FrameData cameraFrameData = m_Camera.GetFrameData();
+    frameStats.fps = static_cast<u32>(m_Window.GetFPS());
+    frameStats.cameraPos[0] = cameraFrameData.position.x;
+    frameStats.cameraPos[1] = cameraFrameData.position.y;
+    frameStats.cameraPos[2] = cameraFrameData.position.z;
+    frameStats.cameraYaw = cameraFrameData.yaw;
+    frameStats.cameraPitch = cameraFrameData.pitch;
+
+    ImGui_RenderParams rp;
+    rp.cmd = cmd.Get();
+    rp.renderer = this;
+    rp.rtv = backBuffer.rtv;
+    rp.loadingLabel = m_SceneResources.GetPendingSceneFile().c_str();
+    rp.frame = frameStats;
+    ImGui_Render(rp);
+
+    backBuffer.Transition(cmd, D3D12_RESOURCE_STATE_PRESENT);
+    m_RenderDevice.ExecuteFrame(frameData, cmd);
+}
+
+void Renderer::SubmitSceneUploadAndSync(PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd)
+{
+    m_RenderDevice.ExecuteAndWait(frameData, cmd);
+}
+
+void Renderer::ReloadRuntimeForDLSSModeChange()
+{
+    WaitForGpuIdle();
+    ImGui_ResetDebugTextureCache();
+
+    Timings_ResetAverages(m_GpuTimingState);
+    Timings_ResetAverages(m_CpuTimingState);
+    for (PerFrameData& frameData : m_RenderDevice.GetAllFrameData())
+    {
+        frameData.gpuTimers.passCount = 0;
+        frameData.gpuTimers.nextIdx = 0;
+    }
+
+    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
+    {
+        if (m_Light.cb[i] && m_Light.cbMapped[i])
+        {
+            m_Light.cb[i]->Unmap(0, nullptr);
+        }
+        m_Light.cbMapped[i] = nullptr;
+        m_Light.cb[i].Reset();
+    }
+
+    SetRenderAndPresentSize();
+    CreateRTVs();
+    CreateDSV();
+    CreateSceneDepthSRVs();
+
+    CreateUpscaleResources();
+    CreateBloomResources();
+    CreateGBufferPassResources();
+    CreateLightingPassResources();
+    m_AutoExposure.CreateResources(m_RenderDevice, m_BindlessHeaps);
+    m_Sky.CreateSkyMotionPassResources(m_RenderDevice.GetDevice());
+
+    Raytracing& raytracing = m_Raytracing;
+    raytracing.CreateShadowPassResources(m_Upscale.renderSize);
+    raytracing.CreatePathTracePassResources(m_Upscale.renderSize);
+    raytracing.CreateSpecularPassResources(m_Upscale.renderSize);
+    raytracing.InvalidatePathTraceRadianceCache();
+
+    m_Camera.ResetHistory();
+    m_FrameIndex = 0;
+}
+
+void Renderer::LoadScene(const String& sceneFile)
+{
+    const String resolvedScene = m_SceneResources.ResolveSceneName(sceneFile);
+    if (!m_Environments.SetCurrentEnvironmentByName(resolvedScene))
+    {
+        m_Environments.SetCurrentEnvironmentByName("Afternoon");
+    }
+
+    Camera& camera = m_Camera;
+    camera.LoadSceneConfig(resolvedScene);
+    camera.ResetHistory();
+
+    m_FrameInFlightIdx = m_RenderDevice.GetCurrentBackBufferIndex();
+    PerFrameData& frameData = GetCurrentFrameData();
+    IE_Check(frameData.commandAllocator->Reset());
+    IE_Check(frameData.cmd->Reset(frameData.commandAllocator.Get(), nullptr));
+
+    ComPtr<ID3D12GraphicsCommandList7> cmd = frameData.cmd;
+    const auto descriptorHeaps = m_BindlessHeaps.GetDescriptorHeaps();
+    cmd->SetDescriptorHeaps(static_cast<UINT>(descriptorHeaps.size()), descriptorHeaps.data());
+
+    const LoadedScene scene = SceneLoader::Load(resolvedScene);
+    CreateSceneDepthSRVs();
+    m_SceneResources.ImportScene(scene, cmd);
+    const Vector<Raytracing::RTInstance> rtInstances = m_SceneResources.BuildRTInstances();
+
+    m_Raytracing.Init(cmd, m_Upscale.renderSize, m_SceneResources.GetPrimitives(), scene.primitives, rtInstances);
+    SubmitSceneUploadAndSync(frameData, cmd);
+
+    m_SceneResources.SetCurrentSceneFile(resolvedScene);
+    m_TestMovePrev = false;
+    m_TestBaseWorlds.clear();
+    m_FrameIndex = 0;
+}
+
+void Renderer::ProcessPendingSceneSwitch()
+{
+    const bool hasSceneSwitch = m_SceneResources.HasPendingSceneSwitch();
+    const bool hasDLSSModeChange = m_HasPendingDLSSModeChange;
+    if (!hasSceneSwitch && !hasDLSSModeChange)
+        return;
+
+    if (!hasSceneSwitch)
+    {
+        m_DLSSMode = m_PendingDLSSMode;
+        m_HasPendingDLSSModeChange = false;
+
+        if (m_SceneResources.GetCurrentSceneFile().empty())
+        {
+            return;
+        }
+
+        IE_LogInfo("Reloading runtime resources after DLSS mode change.");
+        ReloadRuntimeForDLSSModeChange();
+        return;
+    }
+
+    const String targetScene = m_SceneResources.GetPendingSceneFile();
+    if (targetScene.empty())
+        return;
+
+    if (m_PendingSceneSwitchDelayFrames > 0)
+    {
+        --m_PendingSceneSwitchDelayFrames;
+        return;
+    }
+
+    if (hasDLSSModeChange)
+    {
+        m_DLSSMode = m_PendingDLSSMode;
+        m_HasPendingDLSSModeChange = false;
+    }
+    m_SceneResources.ClearPendingSceneSwitch();
+    IE_LogInfo("Switching scene to '{}'", targetScene);
+    ReloadRuntimeAndScene(targetScene);
+    IE_LogInfo("Scene loaded: '{}'", m_SceneResources.GetCurrentSceneFile());
 }
 
 Renderer::PerFrameData& Renderer::GetCurrentFrameData()
 {
-    return m_AllFrameData[m_Swapchain->GetCurrentBackBufferIndex()];
+    return m_RenderDevice.GetCurrentFrameData();
+}
+
+Environment& Renderer::GetCurrentEnvironment()
+{
+    return m_Environments.GetCurrentEnvironment();
 }
 
 const Environment& Renderer::GetCurrentEnvironment() const
@@ -1534,45 +1584,85 @@ const Environment& Renderer::GetCurrentEnvironment() const
     return m_Environments.GetCurrentEnvironment();
 }
 
+const Vector<String>& Renderer::GetEnvironmentNames() const
+{
+    return m_Environments.GetEnvironmentNames();
+}
+
+const String& Renderer::GetCurrentEnvironmentName() const
+{
+    return m_Environments.GetCurrentEnvironmentName();
+}
+
+i32 Renderer::GetCurrentEnvironmentIndex() const
+{
+    return m_Environments.GetCurrentEnvironmentIndex();
+}
+
+void Renderer::SetCurrentEnvironmentIndex(const i32 index)
+{
+    m_Environments.SetCurrentEnvironmentIndex(index);
+}
+
 void Renderer::RequestShaderReload()
 {
     m_PendingShaderReload = true;
 }
 
+void Renderer::RequestSceneSwitch(const String& sceneFile)
+{
+    const bool hadPendingSceneSwitch = m_SceneResources.HasPendingSceneSwitch();
+    m_SceneResources.RequestSceneSwitch(sceneFile);
+    if (!hadPendingSceneSwitch && m_SceneResources.HasPendingSceneSwitch())
+    {
+        m_PendingSceneSwitchDelayFrames = 1;
+    }
+}
+
+void Renderer::RequestDLSSMode(DLSS::Mode mode)
+{
+    if (!m_HasPendingDLSSModeChange && mode == m_DLSSMode)
+    {
+        return;
+    }
+    if (m_HasPendingDLSSModeChange && mode == m_PendingDLSSMode)
+    {
+        return;
+    }
+
+    m_PendingDLSSMode = mode;
+    m_HasPendingDLSSModeChange = true;
+    IE_LogInfo("Queued DLSS mode change.");
+}
+
+DLSS::Mode Renderer::GetDLSSMode() const
+{
+    return m_HasPendingDLSSModeChange ? m_PendingDLSSMode : m_DLSSMode;
+}
+
+bool Renderer::HasPendingSceneSwitch() const
+{
+    return m_SceneResources.HasPendingSceneSwitch();
+}
+
+const String& Renderer::GetPendingSceneFile() const
+{
+    return m_SceneResources.GetPendingSceneFile();
+}
+
+const String& Renderer::GetCurrentSceneFile() const
+{
+    return m_SceneResources.GetCurrentSceneFile();
+}
+
+const Vector<String>& Renderer::GetAvailableScenes() const
+{
+    return m_SceneResources.GetAvailableScenes();
+}
+
 void Renderer::SetBufferData(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const SharedPtr<Buffer>& dst, const void* data, u32 sizeInBytes, u32 offsetInBytes)
 {
-    UploadTemp staging{};
-
-    D3D12_RESOURCE_DESC upDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeInBytes);
-    D3D12MA::ALLOCATION_DESC upAlloc{};
-    upAlloc.HeapType = D3D12_HEAP_TYPE_UPLOAD;
-    IE_Check(m_Allocator->CreateResource(&upAlloc, &upDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, staging.allocation.ReleaseAndGetAddressOf(),
-                                         IID_PPV_ARGS(staging.resource.ReleaseAndGetAddressOf())));
-    IE_Check(staging.resource->SetName(L"SetBufferData/Upload"));
-
-    u8* mapped = nullptr;
-    IE_Check(staging.resource->Map(0, nullptr, reinterpret_cast<void**>(&mapped)));
-    std::memcpy(mapped, data, sizeInBytes);
-    staging.resource->Unmap(0, nullptr);
-
-    const D3D12_RESOURCE_STATES before = dst->state;
-    Barrier(cmd, dst->buffer, before, D3D12_RESOURCE_STATE_COPY_DEST);
-    cmd->CopyBufferRegion(dst->buffer.Get(), offsetInBytes, staging.resource.Get(), 0, sizeInBytes);
-    Barrier(cmd, dst->buffer, D3D12_RESOURCE_STATE_COPY_DEST, before);
-
-    m_InFlightUploads[m_FrameInFlightIdx].push_back(staging);
-}
-
-void Renderer::Barrier(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const ComPtr<ID3D12Resource>& resource, D3D12_RESOURCE_STATES stateBefore, D3D12_RESOURCE_STATES stateAfter)
-{
-    D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(resource.Get(), stateBefore, stateAfter);
-    cmd->ResourceBarrier(1, &barrier);
-}
-
-void Renderer::UAVBarrier(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const ComPtr<ID3D12Resource>& resource)
-{
-    D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::UAV(resource.Get());
-    cmd->ResourceBarrier(1, &barrier);
+    m_RenderDevice.SetBufferData(cmd, dst, data, sizeInBytes, offsetInBytes);
 }
 
 BindlessHeaps& Renderer::GetBindlessHeaps()
@@ -1582,10 +1672,105 @@ BindlessHeaps& Renderer::GetBindlessHeaps()
 
 const ComPtr<ID3D12Device14>& Renderer::GetDevice() const
 {
-    return m_Device;
+    return m_RenderDevice.GetDevice();
+}
+
+Window& Renderer::GetWindow()
+{
+    return m_Window;
+}
+
+const Window& Renderer::GetWindow() const
+{
+    return m_Window;
 }
 
 XMUINT2 Renderer::GetRenderSize() const
 {
-    return m_Fsr.renderSize;
+    return m_Upscale.renderSize;
+}
+
+Camera& Renderer::GetCamera()
+{
+    return m_Camera;
+}
+
+const Camera& Renderer::GetCamera() const
+{
+    return m_Camera;
+}
+
+void Renderer::ApplyTestInstanceMotion()
+{
+    auto hash32 = [](u32 x) {
+        x ^= x >> 16;
+        x *= 0x7feb352d;
+        x ^= x >> 15;
+        x *= 0x846ca68b;
+        x ^= x >> 16;
+        return x;
+    };
+
+    auto hash01 = [](u32 x) { return static_cast<f32>((x >> 8) & 0x00FFFFFF) / static_cast<f32>(0x01000000); };
+
+    if (g_Settings.testMoveInstances)
+    {
+        Vector<InstanceData>& instances = m_SceneResources.GetInstances();
+
+        if (!m_TestMovePrev || m_TestBaseWorlds.size() != instances.size())
+        {
+            m_TestBaseWorlds.clear();
+            m_TestBaseWorlds.reserve(instances.size());
+            for (const InstanceData& inst : instances)
+            {
+                m_TestBaseWorlds.push_back(inst.world);
+            }
+        }
+
+        const u32 total = static_cast<u32>(instances.size());
+        const u32 want = (g_Settings.testMoveInstancesCount == 0 || g_Settings.testMoveInstancesCount > total) ? total : g_Settings.testMoveInstancesCount;
+        const f32 ratio = (total > 0) ? static_cast<f32>(want) / static_cast<f32>(total) : 0.0f;
+        const f32 t = static_cast<f32>(m_FrameIndex) * g_Settings.testMoveInstancesSpeed * 0.016f * XM_2PI;
+        const f32 amp = g_Settings.testMoveInstancesAmplitude;
+
+        for (u32 i = 0; i < total; ++i)
+        {
+            const u32 h = hash32(i);
+            if (hash01(h) > ratio)
+            {
+                continue;
+            }
+
+            const f32 phase0 = hash01(h ^ 0x9e3779b9u) * XM_2PI;
+            const f32 phase1 = hash01(h ^ 0x7f4a7c15u) * XM_2PI;
+
+            const f32 ox = amp * IE_Sinf(t + phase0);
+            const f32 oz = amp * IE_Cosf(t + phase1);
+            const f32 oy = amp * 0.2f * IE_Sinf(t + phase1);
+
+            XMFLOAT4X4 w = m_TestBaseWorlds[i];
+            w._41 += ox;
+            w._42 += oy;
+            w._43 += oz;
+            instances[i].world = w;
+        }
+
+        m_SceneResources.MarkInstancesDirty();
+        m_TestMovePrev = true;
+    }
+    else if (m_TestMovePrev)
+    {
+        Vector<InstanceData>& instances = m_SceneResources.GetInstances();
+
+        if (m_TestBaseWorlds.size() == instances.size())
+        {
+            for (u32 i = 0; i < instances.size(); ++i)
+            {
+                instances[i].world = m_TestBaseWorlds[i];
+            }
+            m_SceneResources.MarkInstancesDirty();
+        }
+        m_TestBaseWorlds.clear();
+        m_TestMovePrev = false;
+    }
 }

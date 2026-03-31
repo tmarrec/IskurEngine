@@ -1,31 +1,77 @@
-﻿// Iškur Engine - Scene Packer
+// Iskur Engine - Scene Packer
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
 
 #include "common/IskurPackFormat.h"
+#include "common/Asserts.h"
+#include "common/StringUtils.h"
 #include "shaders/CPUGPU.h"
 #include <DirectXMath.h>
+#include <DirectXPackedVector.h>
 #include <DirectXTex.h>
 #include <Objbase.h>
-#include <algorithm>
-#include <cassert>
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <d3d12.h>
+#include <fastgltf/base64.hpp>
+#include <fastgltf/core.hpp>
+#include <fastgltf/tools.hpp>
+#include <fastgltf/types.hpp>
 #include <filesystem>
 #include <fstream>
 #include <meshoptimizer.h>
 #include <mikktspace.h>
 #include <print>
 #include <string>
-#include <tiny_gltf.h>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 using namespace DirectX;
 namespace fs = std::filesystem;
+
+[[noreturn]] static void Fatal(const char* msg)
+{
+    std::println("Error: {}", msg);
+    std::exit(EXIT_FAILURE);
+}
+
+static void Require(bool cond, const char* msg)
+{
+    if (!cond)
+        Fatal(msg);
+}
+
+static bool IsFiniteF32(float v)
+{
+    return std::isfinite(v);
+}
+
+static bool IsFiniteFloat2(const XMFLOAT2& v)
+{
+    return IsFiniteF32(v.x) && IsFiniteF32(v.y);
+}
+
+static bool IsFiniteFloat3(const XMFLOAT3& v)
+{
+    return IsFiniteF32(v.x) && IsFiniteF32(v.y) && IsFiniteF32(v.z);
+}
+
+static bool IsFiniteFloat4(const XMFLOAT4& v)
+{
+    return IsFiniteF32(v.x) && IsFiniteF32(v.y) && IsFiniteF32(v.z) && IsFiniteF32(v.w);
+}
+
+static bool IsFiniteFloat4x4(const XMFLOAT4X4& m)
+{
+    return IsFiniteF32(m._11) && IsFiniteF32(m._12) && IsFiniteF32(m._13) && IsFiniteF32(m._14) && IsFiniteF32(m._21) && IsFiniteF32(m._22) && IsFiniteF32(m._23) &&
+           IsFiniteF32(m._24) && IsFiniteF32(m._31) && IsFiniteF32(m._32) && IsFiniteF32(m._33) && IsFiniteF32(m._34) && IsFiniteF32(m._41) && IsFiniteF32(m._42) &&
+           IsFiniteF32(m._43) && IsFiniteF32(m._44);
+}
 
 struct IskurMeshlet
 {
@@ -35,75 +81,146 @@ struct IskurMeshlet
 
 using namespace IEPack;
 
-static void TRS_ToColArray(const float T[3], const float Qraw[4], const float S[3], float M[16])
-{
-    float x = Qraw[0], y = Qraw[1], z = Qraw[2], w = Qraw[3];
-    float n = std::sqrt(x * x + y * y + z * z + w * w);
-    if (n > 0)
-    {
-        x /= n;
-        y /= n;
-        z /= n;
-        w /= n;
-    }
-    float xx = x * x, yy = y * y, zz = z * z, xy = x * y, xz = x * z, yz = y * z, wx = w * x, wy = w * y, wz = w * z;
-    M[0] = (1.f - 2.f * (yy + zz)) * S[0];
-    M[1] = (2.f * (xy + wz)) * S[0];
-    M[2] = (2.f * (xz - wy)) * S[0];
-    M[3] = 0;
-    M[4] = (2.f * (xy - wz)) * S[1];
-    M[5] = (1.f - 2.f * (xx + zz)) * S[1];
-    M[6] = (2.f * (yz + wx)) * S[1];
-    M[7] = 0;
-    M[8] = (2.f * (xz + wy)) * S[2];
-    M[9] = (2.f * (yz - wx)) * S[2];
-    M[10] = (1.f - 2.f * (xx + yy)) * S[2];
-    M[11] = 0;
-    M[12] = T[0];
-    M[13] = T[1];
-    M[14] = T[2];
-    M[15] = 1;
-}
-
 static XMMATRIX RowMatFromColArray(const float Mc[16])
 {
     return XMMatrixSet(Mc[0], Mc[1], Mc[2], Mc[3], Mc[4], Mc[5], Mc[6], Mc[7], Mc[8], Mc[9], Mc[10], Mc[11], Mc[12], Mc[13], Mc[14], Mc[15]);
 }
 
-static XMMATRIX NodeLocalMatrix_Row(const tinygltf::Node& n)
+static XMMATRIX NodeLocalMatrix_Row(const fastgltf::Node& n)
 {
-    if (n.matrix.size() == 16)
-    {
-        float Mc[16];
-        for (int i = 0; i < 16; ++i)
-            Mc[i] = static_cast<float>(n.matrix[i]);
-        return RowMatFromColArray(Mc);
-    }
-
-    float T[3]{0, 0, 0}, S[3]{1, 1, 1}, Q[4]{0, 0, 0, 1};
-    if (n.translation.size() == 3)
-    {
-        T[0] = static_cast<float>(n.translation[0]);
-        T[1] = static_cast<float>(n.translation[1]);
-        T[2] = static_cast<float>(n.translation[2]);
-    }
-    if (n.scale.size() == 3)
-    {
-        S[0] = static_cast<float>(n.scale[0]);
-        S[1] = static_cast<float>(n.scale[1]);
-        S[2] = static_cast<float>(n.scale[2]);
-    }
-    if (n.rotation.size() == 4)
-    {
-        Q[0] = static_cast<float>(n.rotation[0]);
-        Q[1] = static_cast<float>(n.rotation[1]);
-        Q[2] = static_cast<float>(n.rotation[2]);
-        Q[3] = static_cast<float>(n.rotation[3]);
-    }
-
-    float Mc[16];
-    TRS_ToColArray(T, Q, S, Mc);
+    const fastgltf::math::fmat4x4 m = fastgltf::getTransformMatrix(n, fastgltf::math::fmat4x4(1.0f));
+    float Mc[16] = {
+        m.col(0).x(), m.col(0).y(), m.col(0).z(), m.col(0).w(), m.col(1).x(), m.col(1).y(), m.col(1).z(), m.col(1).w(),
+        m.col(2).x(), m.col(2).y(), m.col(2).z(), m.col(2).w(), m.col(3).x(), m.col(3).y(), m.col(3).z(), m.col(3).w(),
+    };
     return RowMatFromColArray(Mc);
+}
+
+static float SignNotZeroF(float v)
+{
+    return (v >= 0.0f) ? 1.0f : -1.0f;
+}
+
+static XMFLOAT3 NormalizeSafe(const XMFLOAT3& n)
+{
+    const float len2 = n.x * n.x + n.y * n.y + n.z * n.z;
+    if (len2 <= 1e-20f)
+        return XMFLOAT3(0.0f, 0.0f, 1.0f);
+    const float invLen = 1.0f / std::sqrt(len2);
+    return XMFLOAT3(n.x * invLen, n.y * invLen, n.z * invLen);
+}
+
+static uint32_t PackNormalOctSnorm16(const XMFLOAT3& inNormal)
+{
+    XMFLOAT3 n = NormalizeSafe(inNormal);
+    const float invL1 = 1.0f / (std::abs(n.x) + std::abs(n.y) + std::abs(n.z));
+    float ex = n.x * invL1;
+    float ey = n.y * invL1;
+    if (n.z < 0.0f)
+    {
+        const float ox = (1.0f - std::abs(ey)) * SignNotZeroF(ex);
+        const float oy = (1.0f - std::abs(ex)) * SignNotZeroF(ey);
+        ex = ox;
+        ey = oy;
+    }
+
+    const auto toSnorm16 = [](float v) -> int16_t {
+        v = std::clamp(v, -1.0f, 1.0f);
+        int q = static_cast<int>(std::lround(v * 32767.0f));
+        q = std::clamp(q, -32767, 32767);
+        return static_cast<int16_t>(q);
+    };
+
+    const uint16_t qx = static_cast<uint16_t>(toSnorm16(ex));
+    const uint16_t qy = static_cast<uint16_t>(toSnorm16(ey));
+    return static_cast<uint32_t>(qx) | (static_cast<uint32_t>(qy) << 16);
+}
+
+static XMFLOAT3 UnpackNormalOctSnorm16(uint32_t packed)
+{
+    const int16_t qx = static_cast<int16_t>(packed & 0xFFFFu);
+    const int16_t qy = static_cast<int16_t>((packed >> 16) & 0xFFFFu);
+
+    float ex = static_cast<float>(qx) / 32767.0f;
+    float ey = static_cast<float>(qy) / 32767.0f;
+    ex = std::max(-1.0f, ex);
+    ey = std::max(-1.0f, ey);
+
+    float x = ex;
+    float y = ey;
+    float z = 1.0f - std::abs(x) - std::abs(y);
+    if (z < 0.0f)
+    {
+        const float ox = (1.0f - std::abs(y)) * SignNotZeroF(x);
+        const float oy = (1.0f - std::abs(x)) * SignNotZeroF(y);
+        x = ox;
+        y = oy;
+    }
+    return NormalizeSafe(XMFLOAT3(x, y, z));
+}
+
+static uint32_t PackTexCoordHalf2(const XMFLOAT2& uv)
+{
+    const uint16_t ux = DirectX::PackedVector::XMConvertFloatToHalf(uv.x);
+    const uint16_t uy = DirectX::PackedVector::XMConvertFloatToHalf(uv.y);
+    return static_cast<uint32_t>(ux) | (static_cast<uint32_t>(uy) << 16);
+}
+
+static XMFLOAT2 UnpackTexCoordHalf2(uint32_t packed)
+{
+    const uint16_t ux = static_cast<uint16_t>(packed & 0xFFFFu);
+    const uint16_t uy = static_cast<uint16_t>((packed >> 16) & 0xFFFFu);
+    return XMFLOAT2(DirectX::PackedVector::XMConvertHalfToFloat(ux), DirectX::PackedVector::XMConvertHalfToFloat(uy));
+}
+
+struct PackedColorRGBA16Unorm
+{
+    uint32_t lo;
+    uint32_t hi;
+};
+
+static PackedColorRGBA16Unorm PackColorRGBA16Unorm(const XMFLOAT4& color)
+{
+    const auto toUnorm16 = [](float v) -> uint32_t {
+        const float c = std::clamp(v, 0.0f, 1.0f);
+        const int q = static_cast<int>(std::lround(c * 65535.0f));
+        return static_cast<uint32_t>(std::clamp(q, 0, 65535));
+    };
+
+    const uint32_t r = toUnorm16(color.x);
+    const uint32_t g = toUnorm16(color.y);
+    const uint32_t b = toUnorm16(color.z);
+    const uint32_t a = toUnorm16(color.w);
+    return PackedColorRGBA16Unorm{r | (g << 16), b | (a << 16)};
+}
+
+static uint32_t PackTangentR10G10B10A2(const XMFLOAT3& inTangent, float handedness)
+{
+    XMFLOAT3 t = inTangent;
+    const float len2 = t.x * t.x + t.y * t.y + t.z * t.z;
+    if (len2 <= 1e-20f)
+    {
+        t = XMFLOAT3(1.0f, 0.0f, 0.0f);
+    }
+    else
+    {
+        const float invLen = 1.0f / std::sqrt(len2);
+        t.x *= invLen;
+        t.y *= invLen;
+        t.z *= invLen;
+    }
+
+    const auto toUnorm10 = [](float v) -> uint32_t {
+        const float u = std::clamp(v * 0.5f + 0.5f, 0.0f, 1.0f);
+        const int q = static_cast<int>(std::lround(u * 1023.0f));
+        return static_cast<uint32_t>(std::clamp(q, 0, 1023));
+    };
+
+    const uint32_t x = toUnorm10(t.x);
+    const uint32_t y = toUnorm10(t.y);
+    const uint32_t z = toUnorm10(t.z);
+    const uint32_t a2 = (handedness < 0.0f) ? 0u : 3u;
+    return x | (y << 10) | (z << 20) | (a2 << 30);
 }
 
 static bool IsGlbFile(const fs::path& p)
@@ -116,13 +233,90 @@ static bool IsGlbFile(const fs::path& p)
     return f && m[0] == 'g' && m[1] == 'l' && m[2] == 'T' && m[3] == 'F';
 }
 
-static HRESULT LoadAnyImageMemory(const uint8_t* bytes, size_t size, ScratchImage& out)
+static std::string SceneStemFromArg(const std::string& sceneArg)
+{
+    const std::string lower = ToLowerAscii(sceneArg);
+
+    if (sceneArg.size() >= 4)
+    {
+        if (lower.ends_with(".glb"))
+            return sceneArg.substr(0, sceneArg.size() - 4);
+    }
+    constexpr size_t packExtLen = sizeof(PACK_FILE_EXTENSION) - 1;
+    if (sceneArg.size() >= packExtLen && lower.ends_with(PACK_FILE_EXTENSION))
+        return sceneArg.substr(0, sceneArg.size() - packExtLen);
+    return sceneArg;
+}
+
+static bool ResolveSceneSourcePath(const fs::path& srcRoot, const std::string& sceneArg, fs::path& outGlbPath)
+{
+    const std::string stem = SceneStemFromArg(sceneArg);
+    const fs::path direct = srcRoot / (stem + ".glb");
+    if (fs::exists(direct) && fs::is_regular_file(direct) && IsGlbFile(direct))
+    {
+        outGlbPath = direct;
+        return true;
+    }
+
+    if (!fs::exists(srcRoot) || !fs::is_directory(srcRoot))
+        return false;
+
+    const std::string stemLower = ToLowerAscii(stem);
+    for (const auto& de : fs::directory_iterator(srcRoot))
+    {
+        if (!de.is_regular_file())
+            continue;
+
+        const fs::path p = de.path();
+        if (!EqualsIgnoreCaseAscii(p.extension().string(), ".glb"))
+            continue;
+
+        if (!EqualsIgnoreCaseAscii(p.stem().string(), stemLower))
+            continue;
+
+        if (!IsGlbFile(p))
+            continue;
+
+        outGlbPath = p;
+        return true;
+    }
+
+    return false;
+}
+
+static fs::path FindRepoRoot(const fs::path& exePath)
+{
+#ifdef ISKUR_ROOT
+    fs::path root = fs::path(ISKUR_ROOT);
+    if (!root.empty() && fs::exists(root / "data"))
+        return root;
+#endif
+
+    fs::path cwd = fs::current_path();
+    if (fs::exists(cwd / "data"))
+        return cwd;
+
+    fs::path cur = exePath;
+    if (cur.has_filename())
+        cur = cur.parent_path();
+
+    for (int i = 0; i < 5 && !cur.empty(); ++i)
+    {
+        if (fs::exists(cur / "data"))
+            return cur;
+        cur = cur.parent_path();
+    }
+
+    return cwd;
+}
+
+static HRESULT LoadAnyImageMemory(const uint8_t* bytes, size_t size, ScratchImage& out, WIC_FLAGS wicFlags)
 {
     if (size >= 4 && bytes[0] == 'D' && bytes[1] == 'D' && bytes[2] == 'S' && bytes[3] == ' ')
         return LoadFromDDSMemory(bytes, size, DDS_FLAGS_NONE, nullptr, out);
     if (size >= 10 && std::memcmp(bytes, "#?RADIANCE", 10) == 0)
         return LoadFromHDRMemory(bytes, size, nullptr, out);
-    return LoadFromWICMemory(bytes, size, WIC_FLAGS_NONE, nullptr, out);
+    return LoadFromWICMemory(bytes, size, wicFlags, nullptr, out);
 }
 
 enum : uint32_t
@@ -134,34 +328,32 @@ enum : uint32_t
     IMG_EMISSIVE = 1u << 4
 };
 
-static std::vector<uint32_t> BuildImageUsageFlags(const tinygltf::Model& model)
+static std::vector<uint32_t> BuildImageUsageFlags(const fastgltf::Asset& asset)
 {
-    std::vector<uint32_t> flags(model.images.size(), 0);
-    auto mark = [&](int ti, uint32_t f) {
-        if (ti < 0 || ti >= static_cast<int>(model.textures.size()))
+    std::vector<uint32_t> flags(asset.images.size(), 0);
+    auto mark = [&](const auto& opt, uint32_t f) {
+        if (!opt)
             return;
-        int img = model.textures[static_cast<size_t>(ti)].source;
-        if (img < 0 || img >= static_cast<int>(flags.size()))
+        const size_t ti = opt->textureIndex;
+        if (ti >= asset.textures.size())
             return;
-        flags[static_cast<size_t>(img)] |= f;
+        const auto& tex = asset.textures[ti];
+        if (!tex.imageIndex)
+            return;
+        const size_t img = *tex.imageIndex;
+        if (img >= flags.size())
+            return;
+        flags[img] |= f;
     };
-    for (const auto& m : model.materials)
+    for (const auto& m : asset.materials)
     {
-        mark(m.pbrMetallicRoughness.baseColorTexture.index, IMG_BASECOLOR);
-        mark(m.normalTexture.index, IMG_NORMAL);
-        mark(m.pbrMetallicRoughness.metallicRoughnessTexture.index, IMG_METALROUGH);
-        mark(m.occlusionTexture.index, IMG_OCCLUSION);
-        mark(m.emissiveTexture.index, IMG_EMISSIVE);
+        mark(m.pbrData.baseColorTexture, IMG_BASECOLOR);
+        mark(m.normalTexture, IMG_NORMAL);
+        mark(m.pbrData.metallicRoughnessTexture, IMG_METALROUGH);
+        mark(m.occlusionTexture, IMG_OCCLUSION);
+        mark(m.emissiveTexture, IMG_EMISSIVE);
     }
     return flags;
-}
-
-static uint32_t AccessorStrideBytes(const tinygltf::Accessor& a, const tinygltf::BufferView& v)
-{
-    uint32_t s = a.ByteStride(v);
-    if (s)
-        return s;
-    return static_cast<uint32_t>(tinygltf::GetNumComponentsInType(a.type) * tinygltf::GetComponentSizeInBytes(a.componentType));
 }
 
 // ---- MikkTSpace ----
@@ -218,7 +410,7 @@ static void mk_getNormal(const SMikkTSpaceContext* ctx, float out[3], const int 
 {
     auto* ud = static_cast<const MikkUserData*>(ctx->m_pUserData);
     uint32_t i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
-    auto& N = (*ud->verts)[i].normal;
+    XMFLOAT3 N = UnpackNormalOctSnorm16((*ud->verts)[i].normalPacked);
     out[0] = N.x;
     out[1] = N.y;
     out[2] = N.z;
@@ -228,7 +420,7 @@ static void mk_getTexCoord(const SMikkTSpaceContext* ctx, float out[2], const in
 {
     auto* ud = static_cast<const MikkUserData*>(ctx->m_pUserData);
     uint32_t i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
-    auto& uv = (*ud->verts)[i].texCoord;
+    XMFLOAT2 uv = UnpackTexCoordHalf2((*ud->verts)[i].texCoordPacked);
     out[0] = uv.x;
     out[1] = uv.y;
 }
@@ -237,99 +429,170 @@ static void mk_setTSpaceBasic(const SMikkTSpaceContext* ctx, const float t[3], c
 {
     auto* ud = static_cast<MikkUserData*>(ctx->m_pUserData);
     uint32_t i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
-    auto& d = (*ud->verts)[i].tangent;
-    d.x = t[0];
-    d.y = t[1];
-    d.z = t[2];
-    d.w = -s;
+    const float handedness = -s;
+    (*ud->verts)[i].tangentPacked = PackTangentR10G10B10A2(XMFLOAT3(t[0], t[1], t[2]), handedness);
 }
 
-static void BuildTexturesToMemory(const fs::path& glbPath, const tinygltf::Model& model, const std::vector<uint32_t>& imgUsage, bool fastCompress, std::vector<TextureRecord>& outTable,
-                                  std::vector<uint8_t>& outBlob)
+static bool DecodeDataUri(const fastgltf::URIView& uri, std::vector<uint8_t>& out)
 {
-    std::vector<uint8_t> done(model.images.size(), 0);
-    const fs::path baseDir = glbPath.parent_path();
-
-    auto loadImageBytes = [&](size_t imgIndex, const uint8_t*& bytes, size_t& size, std::vector<uint8_t>& owned) -> bool {
-        const auto& img = model.images[imgIndex];
-        if (img.bufferView >= 0)
-        {
-            const auto& bv = model.bufferViews[static_cast<size_t>(img.bufferView)];
-            const auto& buf = model.buffers[static_cast<size_t>(bv.buffer)];
-            if (static_cast<size_t>(bv.byteOffset) + static_cast<size_t>(bv.byteLength) > buf.data.size())
-                return false;
-            bytes = buf.data.data() + static_cast<size_t>(bv.byteOffset);
-            size = static_cast<size_t>(bv.byteLength);
-            return true;
-        }
-        if (!img.image.empty())
-        {
-            bytes = img.image.data();
-            size = img.image.size();
-            return true;
-        }
-        if (!img.uri.empty())
-        {
-            fs::path p = baseDir / fs::u8path(img.uri);
-            std::ifstream f(p, std::ios::binary);
-            if (!f.good())
-                return false;
-            f.seekg(0, std::ios::end);
-            size_t sz = static_cast<size_t>(f.tellg());
-            f.seekg(0, std::ios::beg);
-            owned.resize(sz);
-            f.read(reinterpret_cast<char*>(owned.data()), static_cast<std::streamsize>(sz));
-            if (!f.good())
-                return false;
-            bytes = owned.data();
-            size = sz;
-            return true;
-        }
+    if (!uri.isDataUri())
         return false;
+    const std::string_view raw = uri.string();
+    const auto comma = raw.find(',');
+    if (comma == std::string_view::npos)
+        return false;
+    const std::string_view meta = raw.substr(5, comma - 5);
+    const std::string_view data = raw.substr(comma + 1);
+    if (meta.find(";base64") != std::string_view::npos)
+    {
+        auto decoded = fastgltf::base64::decode(data);
+        out.assign(decoded.begin(), decoded.end());
+        return true;
+    }
+    std::string decoded(data);
+    fastgltf::URI::decodePercents(decoded);
+    out.assign(decoded.begin(), decoded.end());
+    return true;
+}
+
+static bool LoadUriBytes(const fastgltf::URIView& uri, const fs::path& baseDir, std::vector<uint8_t>& owned)
+{
+    if (uri.isDataUri())
+        return DecodeDataUri(uri, owned);
+    std::string path = std::string(uri.string());
+    fastgltf::URI::decodePercents(path);
+    fs::path p = baseDir / fs::u8path(path);
+    std::ifstream f(p, std::ios::binary);
+    if (!f.good())
+        return false;
+    f.seekg(0, std::ios::end);
+    const size_t sz = static_cast<size_t>(f.tellg());
+    f.seekg(0, std::ios::beg);
+    owned.resize(sz);
+    f.read(reinterpret_cast<char*>(owned.data()), static_cast<std::streamsize>(sz));
+    return f.good();
+}
+
+static bool LoadBufferViewBytes(const fastgltf::Asset& asset, const fastgltf::BufferView& view, const fs::path& baseDir, const uint8_t*& bytes, size_t& size, std::vector<uint8_t>& owned)
+{
+    if (view.bufferIndex >= asset.buffers.size())
+        return false;
+
+    const auto& buf = asset.buffers[view.bufferIndex];
+    const size_t offset = view.byteOffset;
+    const size_t length = view.byteLength;
+
+    auto setView = [&](const uint8_t* data, size_t dataSize) -> bool {
+        if (offset + length > dataSize)
+            return false;
+        bytes = data + offset;
+        size = length;
+        return true;
     };
 
-    for (size_t t = 0; t < model.textures.size(); ++t)
+    return std::visit(fastgltf::visitor{
+                          [&](const fastgltf::sources::Array& arr) -> bool { return setView(reinterpret_cast<const uint8_t*>(arr.bytes.data()), arr.bytes.size_bytes()); },
+                          [&](const fastgltf::sources::Vector& vec) -> bool { return setView(reinterpret_cast<const uint8_t*>(vec.bytes.data()), vec.bytes.size()); },
+                          [&](const fastgltf::sources::ByteView& bv) -> bool { return setView(reinterpret_cast<const uint8_t*>(bv.bytes.data()), bv.bytes.size()); },
+                          [&](const fastgltf::sources::URI& uri) -> bool {
+                              fastgltf::URIView view = uri.uri;
+                              if (!LoadUriBytes(view, baseDir, owned))
+                                  return false;
+                              return setView(owned.data(), owned.size());
+                          },
+                          [&](auto&) -> bool { return false; },
+                      },
+                      buf.data);
+}
+
+static void BuildTexturesToMemory(const fs::path& glbPath, const fastgltf::Asset& asset, const std::vector<uint32_t>& imgUsage, bool fastCompress, std::vector<TextureRecord>& outTable,
+                                  std::vector<TextureSubresourceRecord>& outSubresources, std::vector<uint8_t>& outBlob)
+{
+    const fs::path baseDir = glbPath.parent_path();
+    std::vector<uint8_t> done(asset.images.size(), 0);
+
+    auto loadImageBytes = [&](size_t imgIndex, const uint8_t*& bytes, size_t& size, std::vector<uint8_t>& owned) -> bool {
+        const auto& img = asset.images[imgIndex];
+        return std::visit(fastgltf::visitor{
+                              [&](const fastgltf::sources::URI& filePath) -> bool {
+                                  fastgltf::URIView view = filePath.uri;
+                                  if (!LoadUriBytes(view, baseDir, owned))
+                                      return false;
+                                  bytes = owned.data();
+                                  size = owned.size();
+                                  return true;
+                              },
+                              [&](const fastgltf::sources::Array& arr) -> bool {
+                                  bytes = reinterpret_cast<const uint8_t*>(arr.bytes.data());
+                                  size = arr.bytes.size_bytes();
+                                  return true;
+                              },
+                              [&](const fastgltf::sources::Vector& vec) -> bool {
+                                  bytes = reinterpret_cast<const uint8_t*>(vec.bytes.data());
+                                  size = vec.bytes.size();
+                                  return true;
+                              },
+                              [&](const fastgltf::sources::ByteView& bv) -> bool {
+                                  bytes = reinterpret_cast<const uint8_t*>(bv.bytes.data());
+                                  size = bv.bytes.size();
+                                  return true;
+                              },
+                              [&](const fastgltf::sources::BufferView& view) -> bool {
+                                  if (view.bufferViewIndex >= asset.bufferViews.size())
+                                      return false;
+                                  return LoadBufferViewBytes(asset, asset.bufferViews[view.bufferViewIndex], baseDir, bytes, size, owned);
+                              },
+                              [&](auto&) -> bool { return false; },
+                          },
+                          img.data);
+    };
+
+    for (size_t t = 0; t < asset.textures.size(); ++t)
     {
-        int imgIdx = model.textures[t].source;
-        if (imgIdx < 0 || imgIdx >= static_cast<int>(model.images.size()))
+        const auto& tex = asset.textures[t];
+        if (!tex.imageIndex)
             continue;
 
-        size_t i = static_cast<size_t>(imgIdx);
-        if (done[i])
+        const size_t imgIndex = *tex.imageIndex;
+        if (imgIndex >= asset.images.size())
             continue;
-
-        const auto& img = model.images[i];
+        if (done[imgIndex])
+            continue;
+        const auto& img = asset.images[imgIndex];
         std::string srcDesc;
-        if (!img.uri.empty())
-            srcDesc = img.uri;
-        else if (img.bufferView >= 0)
-            srcDesc = std::string("bufferView#") + std::to_string(img.bufferView);
-        else if (!img.image.empty())
-            srcDesc = "embedded";
-        else
-            srcDesc = "unknown";
-
-        size_t refCount = 0;
-        for (size_t ti = 0; ti < model.textures.size(); ++ti)
-            if (model.textures[ti].source == static_cast<int>(i))
-                ++refCount;
+        std::visit(fastgltf::visitor{
+                       [&](const fastgltf::sources::URI& uri) { srcDesc = std::string(uri.uri.string()); },
+                       [&](const fastgltf::sources::BufferView& view) { srcDesc = std::string("bufferView#") + std::to_string(view.bufferViewIndex); },
+                       [&](const fastgltf::sources::Array&) { srcDesc = "embedded"; },
+                       [&](const fastgltf::sources::Vector&) { srcDesc = "embedded"; },
+                       [&](const fastgltf::sources::ByteView&) { srcDesc = "embedded"; },
+                       [&](auto&) { srcDesc = "unknown"; },
+                   },
+                   img.data);
 
         const uint8_t* raw = nullptr;
         size_t rawSize = 0;
         std::vector<uint8_t> owned;
 
-        bool okLoad = loadImageBytes(i, raw, rawSize, owned);
-        assert(okLoad && "Failed to load image bytes from glTF");
+        bool okLoad = loadImageBytes(imgIndex, raw, rawSize, owned);
+        if (!okLoad)
+            Fatal("Failed to load image bytes from glTF");
 
-        std::println("[tex {}][img {}] refs={} src=\"{}\"", t, i, refCount, srcDesc);
+        std::println("[tex {}][img {}] src=\"{}\"", t, imgIndex, srcDesc);
+
+        const uint32_t usage = (imgIndex < imgUsage.size()) ? imgUsage[imgIndex] : 0u;
+        const bool isNormal = (usage & IMG_NORMAL) != 0;
+        const bool isNonColor = isNormal || ((usage & (IMG_METALROUGH | IMG_OCCLUSION)) != 0);
+        const bool isSRGB = !isNonColor && ((usage & (IMG_BASECOLOR | IMG_EMISSIVE)) != 0);
+        if ((usage & (IMG_BASECOLOR | IMG_EMISSIVE)) && (usage & (IMG_NORMAL | IMG_METALROUGH | IMG_OCCLUSION)))
+            std::println("Warning: image {} used as both color and non-color; treating as non-color", imgIndex);
+        DXGI_FORMAT wantBase = isSRGB ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
 
         ScratchImage loaded;
-        HRESULT hrDec = LoadAnyImageMemory(raw, rawSize, loaded);
-        assert(SUCCEEDED(hrDec) && "Image decode failed");
-
-        bool isNormal = (i < imgUsage.size()) && (imgUsage[i] & IMG_NORMAL);
-        bool isSRGB = !isNormal && ((i < imgUsage.size()) && ((imgUsage[i] & (IMG_BASECOLOR | IMG_EMISSIVE)) && !(imgUsage[i] & (IMG_METALROUGH | IMG_OCCLUSION))));
-        DXGI_FORMAT wantBase = isSRGB ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        const WIC_FLAGS wicFlags = isNonColor ? WIC_FLAGS_IGNORE_SRGB : WIC_FLAGS_NONE;
+        HRESULT hrDec = LoadAnyImageMemory(raw, rawSize, loaded, wicFlags);
+        if (!IE_Try(hrDec))
+            Fatal("Image decode failed");
 
         const Image* srcImages = nullptr;
         size_t srcCount = 0;
@@ -340,7 +603,8 @@ static void BuildTexturesToMemory(const fs::path& glbPath, const tinygltf::Model
         if (didConvert)
         {
             HRESULT hrC = Convert(loaded.GetImages(), loaded.GetImageCount(), loaded.GetMetadata(), wantBase, TEX_FILTER_DEFAULT, 0.0f, converted);
-            assert(SUCCEEDED(hrC) && "Image format conversion failed");
+            if (!IE_Try(hrC))
+                Fatal("Image format conversion failed");
             srcImages = converted.GetImages();
             srcCount = converted.GetImageCount();
             meta = converted.GetMetadata();
@@ -353,7 +617,13 @@ static void BuildTexturesToMemory(const fs::path& glbPath, const tinygltf::Model
         }
 
         ScratchImage mip;
-        if (SUCCEEDED(GenerateMipMaps(srcImages, srcCount, meta, TEX_FILTER_DEFAULT, 0, mip)))
+        TEX_FILTER_FLAGS mipFilter = TEX_FILTER_LINEAR;
+        if (isSRGB)
+            mipFilter = static_cast<TEX_FILTER_FLAGS>(mipFilter | TEX_FILTER_SRGB);
+        if (isNonColor)
+            mipFilter = static_cast<TEX_FILTER_FLAGS>(mipFilter | TEX_FILTER_FORCE_NON_WIC);
+
+        if (SUCCEEDED(GenerateMipMaps(srcImages, srcCount, meta, mipFilter, 0, mip)))
         {
             srcImages = mip.GetImages();
             srcCount = mip.GetImageCount();
@@ -367,68 +637,132 @@ static void BuildTexturesToMemory(const fs::path& glbPath, const tinygltf::Model
 
         ScratchImage bc;
         HRESULT hrComp = Compress(srcImages, srcCount, meta, compFmt, comp, 0.5f, bc);
-        assert(SUCCEEDED(hrComp) && "BC compression failed");
+        if (!IE_Try(hrComp) && (comp & TEX_COMPRESS_BC7_QUICK))
+        {
+            TEX_COMPRESS_FLAGS retryComp = static_cast<TEX_COMPRESS_FLAGS>(comp & ~TEX_COMPRESS_BC7_QUICK);
+            hrComp = Compress(srcImages, srcCount, meta, compFmt, retryComp, 0.5f, bc);
+        }
 
-        Blob blob;
-        HRESULT hrSave = SaveToDDSMemory(bc.GetImages(), bc.GetImageCount(), bc.GetMetadata(), DDS_FLAGS_FORCE_DX10_EXT, blob);
-        assert(SUCCEEDED(hrSave) && "Saving DDS to memory failed");
+        if (!IE_Try(hrComp))
+            Fatal("BC compression failed");
 
-        uint64_t off = outBlob.size();
-        uint64_t sz = blob.GetBufferSize();
-        outBlob.insert(outBlob.end(), reinterpret_cast<const uint8_t*>(blob.GetBufferPointer()), reinterpret_cast<const uint8_t*>(blob.GetBufferPointer()) + sz);
+        const TexMetadata& bcMeta = bc.GetMetadata();
+        const Image* bcImages = bc.GetImages();
+        const size_t bcImageCount = bc.GetImageCount();
+        Require(bcImages != nullptr && bcImageCount > 0, "Compressed texture has no subresources");
+        Require(bcImageCount <= UINT32_MAX, "Texture subresource count exceeds pack format limits");
+        Require(outSubresources.size() <= UINT32_MAX, "Texture subresource table exceeds pack format limits");
 
-        TextureRecord tr;
-        tr.imageIndex = static_cast<uint32_t>(i);
-        tr.flags = (isSRGB ? TEXFLAG_SRGB : 0) | (isNormal ? TEXFLAG_NORMAL : 0);
-        tr.byteOffset = off;
-        tr.byteSize = sz;
+        TextureRecord tr{};
+        tr.imageIndex = static_cast<uint32_t>(imgIndex);
+        tr.format = static_cast<uint32_t>(bcMeta.format);
+        tr.dimension = static_cast<uint32_t>(bcMeta.dimension);
+        tr.miscFlags = static_cast<uint32_t>(bcMeta.miscFlags);
+        tr.miscFlags2 = static_cast<uint32_t>(bcMeta.miscFlags2);
+        tr.width = static_cast<uint32_t>(bcMeta.width);
+        tr.height = static_cast<uint32_t>(bcMeta.height);
+        tr.depth = static_cast<uint32_t>(bcMeta.depth);
+        tr.arraySize = static_cast<uint32_t>(bcMeta.arraySize);
+        tr.mipLevels = static_cast<uint32_t>(bcMeta.mipLevels);
+        tr.subresourceOffset = static_cast<uint32_t>(outSubresources.size());
+        tr.subresourceCount = static_cast<uint32_t>(bcImageCount);
+        tr.byteOffset = static_cast<uint64_t>(outBlob.size());
+
+        for (size_t i = 0; i < bcImageCount; ++i)
+        {
+            const Image& image = bcImages[i];
+            Require(image.rowPitch <= UINT32_MAX, "Texture row pitch exceeds pack format limits");
+            Require(image.slicePitch <= UINT32_MAX, "Texture slice pitch exceeds pack format limits");
+            TextureSubresourceRecord subresource{};
+            subresource.byteOffset = static_cast<uint64_t>(outBlob.size()) - tr.byteOffset;
+            subresource.byteSize = static_cast<uint64_t>(image.slicePitch);
+            subresource.rowPitch = static_cast<uint32_t>(image.rowPitch);
+            subresource.slicePitch = static_cast<uint32_t>(image.slicePitch);
+            outSubresources.push_back(subresource);
+            outBlob.insert(outBlob.end(), image.pixels, image.pixels + image.slicePitch);
+        }
+
+        tr.byteSize = static_cast<uint64_t>(outBlob.size()) - tr.byteOffset;
         outTable.push_back(tr);
-        done[i] = 1;
+        done[imgIndex] = 1;
     }
 }
 
-static D3D12_TEXTURE_ADDRESS_MODE MapWrapModeGLTFToD3D12Addr(int wrap)
+static D3D12_TEXTURE_ADDRESS_MODE MapWrapModeGLTFToD3D12Addr(fastgltf::Wrap wrap)
 {
     switch (wrap)
     {
-    case TINYGLTF_TEXTURE_WRAP_MIRRORED_REPEAT:
+    case fastgltf::Wrap::MirroredRepeat:
         return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
-    case TINYGLTF_TEXTURE_WRAP_CLAMP_TO_EDGE:
+    case fastgltf::Wrap::ClampToEdge:
         return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     default:
         return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     }
 }
 
-static D3D12_FILTER BakeD3D12Filter(int minFilter, int magFilter)
+struct FilterInfo
 {
-    if (minFilter <= 0)
-        minFilter = TINYGLTF_TEXTURE_FILTER_LINEAR_MIPMAP_LINEAR;
-    if (magFilter <= 0)
-        magFilter = TINYGLTF_TEXTURE_FILTER_LINEAR;
+    D3D12_FILTER filter;
+    UINT maxAnisotropy;
+};
 
-    if (minFilter == TINYGLTF_TEXTURE_FILTER_LINEAR_MIPMAP_LINEAR)
-        return D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+static FilterInfo BakeD3D12Filter(fastgltf::Optional<fastgltf::Filter> minFilter, fastgltf::Optional<fastgltf::Filter> magFilter)
+{
+    constexpr UINT kMaterialMaxAnisotropy = 16;
+    const fastgltf::Filter minF = minFilter ? *minFilter : fastgltf::Filter::LinearMipMapLinear;
+    const fastgltf::Filter magF = magFilter ? *magFilter : fastgltf::Filter::Linear;
 
-    if (minFilter == TINYGLTF_TEXTURE_FILTER_LINEAR_MIPMAP_NEAREST || minFilter == TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_LINEAR || magFilter == TINYGLTF_TEXTURE_FILTER_LINEAR)
-        return D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    if (minF == fastgltf::Filter::NearestMipMapNearest && magF == fastgltf::Filter::Nearest)
+        return {D3D12_FILTER_MIN_MAG_MIP_POINT, 1};
 
-    return D3D12_FILTER_MIN_MAG_MIP_POINT;
+    return {D3D12_FILTER_ANISOTROPIC, kMaterialMaxAnisotropy};
 }
 
-static void BuildSamplerTable(const tinygltf::Model& model, std::vector<D3D12_SAMPLER_DESC>& outSamp)
+static D3D12_SAMPLER_DESC MakeDefaultSamplerDesc()
 {
-    for (const tinygltf::Sampler& s : model.samplers)
+    D3D12_SAMPLER_DESC samplerDesc{};
+    FilterInfo fi = BakeD3D12Filter(fastgltf::Filter::LinearMipMapLinear, fastgltf::Filter::Linear);
+    samplerDesc.Filter = fi.filter;
+    samplerDesc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    samplerDesc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    samplerDesc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    samplerDesc.MipLODBias = 0.0f;
+    samplerDesc.MinLOD = 0.0f;
+    samplerDesc.MaxLOD = D3D12_FLOAT32_MAX;
+    samplerDesc.MaxAnisotropy = fi.maxAnisotropy;
+    samplerDesc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    samplerDesc.BorderColor[0] = 0.0f;
+    samplerDesc.BorderColor[1] = 0.0f;
+    samplerDesc.BorderColor[2] = 0.0f;
+    samplerDesc.BorderColor[3] = 0.0f;
+    return samplerDesc;
+}
+
+static bool HasMissingSampler(const fastgltf::Asset& asset)
+{
+    for (const auto& t : asset.textures)
+    {
+        if (!t.samplerIndex || *t.samplerIndex >= asset.samplers.size())
+            return true;
+    }
+    return false;
+}
+
+static uint32_t BuildSamplerTable(const fastgltf::Asset& asset, std::vector<D3D12_SAMPLER_DESC>& outSamp)
+{
+    for (const fastgltf::Sampler& s : asset.samplers)
     {
         D3D12_SAMPLER_DESC samplerDesc;
-        samplerDesc.Filter = BakeD3D12Filter(s.minFilter, s.magFilter);
+        FilterInfo fi = BakeD3D12Filter(s.minFilter, s.magFilter);
+        samplerDesc.Filter = fi.filter;
         samplerDesc.AddressU = MapWrapModeGLTFToD3D12Addr(s.wrapS);
         samplerDesc.AddressV = MapWrapModeGLTFToD3D12Addr(s.wrapT);
         samplerDesc.AddressW = samplerDesc.AddressV;
         samplerDesc.MipLODBias = 0.0f;
         samplerDesc.MinLOD = 0.0f;
         samplerDesc.MaxLOD = D3D12_FLOAT32_MAX;
-        samplerDesc.MaxAnisotropy = 1;
+        samplerDesc.MaxAnisotropy = fi.maxAnisotropy;
         samplerDesc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
         samplerDesc.BorderColor[0] = 0.0f;
         samplerDesc.BorderColor[1] = 0.0f;
@@ -436,32 +770,43 @@ static void BuildSamplerTable(const tinygltf::Model& model, std::vector<D3D12_SA
         samplerDesc.BorderColor[3] = 0.0f;
         outSamp.push_back(samplerDesc);
     }
+
+    uint32_t defaultSamplerIndex = UINT32_MAX;
+    if (outSamp.empty() || HasMissingSampler(asset))
+    {
+        defaultSamplerIndex = static_cast<uint32_t>(outSamp.size());
+        outSamp.push_back(MakeDefaultSamplerDesc());
+    }
+    return defaultSamplerIndex;
 }
 
-static void BuildMaterialTable(const tinygltf::Model& model, const std::vector<TextureRecord>& texTable, std::vector<MaterialRecord>& outMatl)
+static void BuildMaterialTable(const fastgltf::Asset& asset, const std::vector<TextureRecord>& texTable, std::vector<MaterialRecord>& outMatl, uint32_t defaultSamplerIndex)
 {
-    std::unordered_map<int, int> imageToTxhd;
-    imageToTxhd.reserve(texTable.size());
+    std::unordered_map<int, int> texToTxhd;
+    texToTxhd.reserve(texTable.size());
     for (size_t i = 0; i < texTable.size(); ++i)
-        imageToTxhd[static_cast<int>(texTable[i].imageIndex)] = static_cast<int>(i);
+        texToTxhd[static_cast<int>(texTable[i].imageIndex)] = static_cast<int>(i);
 
-    auto texIndexToTxhd = [&](int texIndex) -> int {
-        if (texIndex < 0 || texIndex >= static_cast<int>(model.textures.size()))
+    auto texIndexToTxhd = [&](size_t texIndex) -> int {
+        if (texIndex >= asset.textures.size())
             return -1;
-        int img = model.textures[static_cast<size_t>(texIndex)].source;
-        auto it = imageToTxhd.find(img);
-        return (img < 0 || it == imageToTxhd.end()) ? -1 : it->second;
+        const auto& tex = asset.textures[texIndex];
+        if (!tex.imageIndex)
+            return -1;
+        int img = static_cast<int>(*tex.imageIndex);
+        auto it = texToTxhd.find(img);
+        return (it == texToTxhd.end()) ? -1 : it->second;
     };
 
-    auto parseAlphaMode = [](const tinygltf::Material& m) -> uint32_t {
-        if (m.alphaMode == "MASK")
+    auto parseAlphaMode = [](const fastgltf::Material& m) -> uint32_t {
+        if (m.alphaMode == fastgltf::AlphaMode::Mask)
             return MATF_ALPHA_MASK;
-        if (m.alphaMode == "BLEND")
+        if (m.alphaMode == fastgltf::AlphaMode::Blend)
             return MATF_ALPHA_BLEND;
         return 0;
     };
 
-    const size_t matCount = std::max<size_t>(1, model.materials.size());
+    const size_t matCount = std::max<size_t>(1, asset.materials.size());
     outMatl.assign(matCount, MaterialRecord{});
 
     for (size_t i = 0; i < matCount; ++i)
@@ -476,99 +821,89 @@ static void BuildMaterialTable(const tinygltf::Model& model, const std::vector<T
         mr.normalScale = 1.0f;
         mr.occlusionStrength = 1.0f;
         mr.alphaCutoff = 0.5f;
-        mr.uvScale[0] = mr.uvScale[1] = 1.0f;
-        mr.uvOffset[0] = mr.uvOffset[1] = 0.0f;
-        mr.uvRotation = 0.0f;
         mr.flags = 0;
-        mr._pad1 = 0;
 
-        if (!model.materials.empty())
+        if (!asset.materials.empty())
         {
-            const tinygltf::Material& m = model.materials[i];
+            const fastgltf::Material& m = asset.materials[i];
 
-            if (m.pbrMetallicRoughness.baseColorFactor.size() == 4)
-                for (int k = 0; k < 4; ++k)
-                    mr.baseColorFactor[k] = static_cast<float>(m.pbrMetallicRoughness.baseColorFactor[k]);
+            mr.baseColorFactor[0] = static_cast<float>(m.pbrData.baseColorFactor.x());
+            mr.baseColorFactor[1] = static_cast<float>(m.pbrData.baseColorFactor.y());
+            mr.baseColorFactor[2] = static_cast<float>(m.pbrData.baseColorFactor.z());
+            mr.baseColorFactor[3] = static_cast<float>(m.pbrData.baseColorFactor.w());
 
-            mr.metallicFactor = static_cast<float>(m.pbrMetallicRoughness.metallicFactor);
-            mr.roughnessFactor = static_cast<float>(m.pbrMetallicRoughness.roughnessFactor);
+            mr.metallicFactor = static_cast<float>(m.pbrData.metallicFactor);
+            mr.roughnessFactor = static_cast<float>(m.pbrData.roughnessFactor);
 
-            if (m.emissiveFactor.size() == 3)
-            {
-                mr.emissiveFactor[0] = static_cast<float>(m.emissiveFactor[0]);
-                mr.emissiveFactor[1] = static_cast<float>(m.emissiveFactor[1]);
-                mr.emissiveFactor[2] = static_cast<float>(m.emissiveFactor[2]);
-            }
+            mr.emissiveFactor[0] = static_cast<float>(m.emissiveFactor.x());
+            mr.emissiveFactor[1] = static_cast<float>(m.emissiveFactor.y());
+            mr.emissiveFactor[2] = static_cast<float>(m.emissiveFactor.z());
 
-            if (m.alphaMode == "MASK")
+            if (m.alphaMode == fastgltf::AlphaMode::Mask)
                 mr.alphaCutoff = static_cast<float>(m.alphaCutoff);
 
             mr.flags |= parseAlphaMode(m);
             if (m.doubleSided)
                 mr.flags |= MATF_DOUBLE_SIDED;
 
-            auto chooseSampler = [&](int texIndex) -> uint32_t {
-                if (texIndex < 0 || texIndex >= static_cast<int>(model.textures.size()))
-                    return 0u;
-                int s = model.textures[static_cast<size_t>(texIndex)].sampler;
-                return (s < 0) ? 0u : static_cast<uint32_t>(s);
+            Require(IsFiniteF32(mr.baseColorFactor[0]) && IsFiniteF32(mr.baseColorFactor[1]) && IsFiniteF32(mr.baseColorFactor[2]) && IsFiniteF32(mr.baseColorFactor[3]),
+                    "Material baseColorFactor contains NaN/Inf");
+            Require(IsFiniteF32(mr.metallicFactor) && IsFiniteF32(mr.roughnessFactor) && IsFiniteF32(mr.normalScale) && IsFiniteF32(mr.occlusionStrength) &&
+                        IsFiniteF32(mr.alphaCutoff),
+                    "Material scalar parameter contains NaN/Inf");
+            Require(IsFiniteF32(mr.emissiveFactor[0]) && IsFiniteF32(mr.emissiveFactor[1]) && IsFiniteF32(mr.emissiveFactor[2]), "Material emissiveFactor contains NaN/Inf");
+
+            auto chooseSampler = [&](size_t texIndex) -> uint32_t {
+                if (texIndex >= asset.textures.size())
+                    return UINT32_MAX;
+                const auto& tex = asset.textures[texIndex];
+                if (!tex.samplerIndex)
+                    return defaultSamplerIndex;
+                if (*tex.samplerIndex >= asset.samplers.size())
+                    return defaultSamplerIndex;
+                return static_cast<uint32_t>(*tex.samplerIndex);
             };
 
-            if (m.pbrMetallicRoughness.baseColorTexture.index >= 0)
+            if (m.pbrData.baseColorTexture)
             {
-                const int ti = m.pbrMetallicRoughness.baseColorTexture.index;
+                const size_t ti = m.pbrData.baseColorTexture->textureIndex;
                 mr.baseColorTx = texIndexToTxhd(ti);
                 if (mr.baseColorTx >= 0)
-                {
-                    mr.flags |= MATF_HAS_BC;
                     mr.baseColorSampler = chooseSampler(ti);
-                }
             }
 
-            if (m.normalTexture.index >= 0)
+            if (m.normalTexture)
             {
-                const int ti = m.normalTexture.index;
+                const size_t ti = m.normalTexture->textureIndex;
                 mr.normalTx = texIndexToTxhd(ti);
-                mr.normalScale = static_cast<float>(m.normalTexture.scale);
+                mr.normalScale = static_cast<float>(m.normalTexture->scale);
                 if (mr.normalTx >= 0)
-                {
-                    mr.flags |= MATF_HAS_NORM;
                     mr.normalSampler = chooseSampler(ti);
-                }
             }
 
-            if (m.pbrMetallicRoughness.metallicRoughnessTexture.index >= 0)
+            if (m.pbrData.metallicRoughnessTexture)
             {
-                const int ti = m.pbrMetallicRoughness.metallicRoughnessTexture.index;
+                const size_t ti = m.pbrData.metallicRoughnessTexture->textureIndex;
                 mr.metallicRoughTx = texIndexToTxhd(ti);
                 if (mr.metallicRoughTx >= 0)
-                {
-                    mr.flags |= MATF_HAS_MR;
                     mr.metallicRoughSampler = chooseSampler(ti);
-                }
             }
 
-            if (m.occlusionTexture.index >= 0)
+            if (m.occlusionTexture)
             {
-                const int ti = m.occlusionTexture.index;
+                const size_t ti = m.occlusionTexture->textureIndex;
                 mr.occlusionTx = texIndexToTxhd(ti);
-                mr.occlusionStrength = static_cast<float>(m.occlusionTexture.strength);
+                mr.occlusionStrength = static_cast<float>(m.occlusionTexture->strength);
                 if (mr.occlusionTx >= 0)
-                {
-                    mr.flags |= MATF_HAS_OCC;
                     mr.occlusionSampler = chooseSampler(ti);
-                }
             }
 
-            if (m.emissiveTexture.index >= 0)
+            if (m.emissiveTexture)
             {
-                const int ti = m.emissiveTexture.index;
+                const size_t ti = m.emissiveTexture->textureIndex;
                 mr.emissiveTx = texIndexToTxhd(ti);
                 if (mr.emissiveTx >= 0)
-                {
-                    mr.flags |= MATF_HAS_EMISSIVE;
                     mr.emissiveSampler = chooseSampler(ti);
-                }
             }
         }
 
@@ -576,97 +911,127 @@ static void BuildMaterialTable(const tinygltf::Model& model, const std::vector<T
     }
 }
 
-static PrimRecord BuildOnePrimitive(const tinygltf::Model& model, int meshIdx, int primIdx, std::vector<Vertex>& blobVertices, std::vector<uint32_t>& blobIndices,
+static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx, size_t primIdx, std::vector<Vertex>& blobVertices, std::vector<uint32_t>& blobIndices,
                                     std::vector<IskurMeshlet>& blobMeshlets, std::vector<uint32_t>& blobMLVerts, std::vector<uint8_t>& blobMLTris, std::vector<MeshletBounds>& blobMLBounds)
 {
-    const auto& gltfPrim = model.meshes[static_cast<size_t>(meshIdx)].primitives[static_cast<size_t>(primIdx)];
-    assert(gltfPrim.mode == TINYGLTF_MODE_TRIANGLES && "Only triangle primitives are supported");
+    const auto& gltfPrim = asset.meshes[meshIdx].primitives[primIdx];
+    if (gltfPrim.type != fastgltf::PrimitiveType::Triangles)
+        Fatal("Only triangle primitives are supported");
 
-    const uint32_t materialIndex = (gltfPrim.material >= 0) ? static_cast<uint32_t>(gltfPrim.material) : 0u;
+    const uint32_t materialIndex = gltfPrim.materialIndex ? static_cast<uint32_t>(*gltfPrim.materialIndex) : 0u;
+
+    auto posAttr = gltfPrim.findAttribute("POSITION");
+    Require(posAttr != gltfPrim.attributes.end(), "Primitive missing POSITION attribute");
+    const auto& posAcc = asset.accessors[posAttr->accessorIndex];
+    const size_t positionCount = static_cast<size_t>(posAcc.count);
+    Require(positionCount > 0, "Primitive has zero POSITION vertices");
 
     std::vector<XMFLOAT3> normals;
     std::vector<XMFLOAT2> texcoords;
+    std::vector<XMFLOAT4> colors;
 
-    if (gltfPrim.attributes.contains("NORMAL"))
+    if (auto it = gltfPrim.findAttribute("NORMAL"); it != gltfPrim.attributes.end())
     {
-        const auto& acc = model.accessors.at(gltfPrim.attributes.at("NORMAL"));
-        const auto& view = model.bufferViews[acc.bufferView];
-        const auto& buf = model.buffers[view.buffer];
-        const uint8_t* data = buf.data.data() + view.byteOffset + acc.byteOffset;
-        uint32_t count = acc.count, stride = AccessorStrideBytes(acc, view);
-        normals.resize(count);
-        for (uint32_t i = 0; i < count; ++i)
-            std::memcpy(&normals[i], data + i * stride, sizeof(XMFLOAT3));
+        const auto& acc = asset.accessors[it->accessorIndex];
+        Require(static_cast<size_t>(acc.count) == positionCount, "NORMAL count must match POSITION count");
+        normals.resize(positionCount);
+        fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, acc, [&](fastgltf::math::fvec3 n, std::size_t i) { normals[i] = XMFLOAT3(n.x(), n.y(), n.z()); });
+        for (const XMFLOAT3& n : normals)
+        {
+            Require(IsFiniteFloat3(n), "NORMAL contains NaN/Inf");
+        }
     }
-    if (gltfPrim.attributes.contains("TEXCOORD_0"))
+    if (auto it = gltfPrim.findAttribute("TEXCOORD_0"); it != gltfPrim.attributes.end())
     {
-        const auto& acc = model.accessors.at(gltfPrim.attributes.at("TEXCOORD_0"));
-        const auto& view = model.bufferViews[acc.bufferView];
-        const auto& buf = model.buffers[view.buffer];
-        const uint8_t* data = buf.data.data() + view.byteOffset + acc.byteOffset;
-        uint32_t count = acc.count, stride = AccessorStrideBytes(acc, view);
-        texcoords.resize(count);
-        for (uint32_t i = 0; i < count; ++i)
-            std::memcpy(&texcoords[i], data + i * stride, sizeof(XMFLOAT2));
+        const auto& acc = asset.accessors[it->accessorIndex];
+        Require(static_cast<size_t>(acc.count) == positionCount, "TEXCOORD_0 count must match POSITION count");
+        texcoords.resize(positionCount);
+        fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec2>(asset, acc, [&](fastgltf::math::fvec2 uv, std::size_t i) { texcoords[i] = XMFLOAT2(uv.x(), uv.y()); });
+        for (const XMFLOAT2& uv : texcoords)
+        {
+            Require(IsFiniteFloat2(uv), "TEXCOORD_0 contains NaN/Inf");
+        }
+    }
+    if (auto it = gltfPrim.findAttribute("COLOR_0"); it != gltfPrim.attributes.end())
+    {
+        const auto& acc = asset.accessors[it->accessorIndex];
+        Require(static_cast<size_t>(acc.count) == positionCount, "COLOR_0 count must match POSITION count");
+        colors.assign(positionCount, XMFLOAT4(1, 1, 1, 1));
+        if (acc.type == fastgltf::AccessorType::Vec3)
+        {
+            fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, acc, [&](fastgltf::math::fvec3 c, std::size_t i) { colors[i] = XMFLOAT4(c.x(), c.y(), c.z(), 1.0f); });
+        }
+        else if (acc.type == fastgltf::AccessorType::Vec4)
+        {
+            fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec4>(asset, acc, [&](fastgltf::math::fvec4 c, std::size_t i) { colors[i] = XMFLOAT4(c.x(), c.y(), c.z(), c.w()); });
+        }
+        else
+        {
+            Fatal("COLOR_0 must be vec3 or vec4");
+        }
+        for (const XMFLOAT4& color : colors)
+        {
+            Require(IsFiniteFloat4(color), "COLOR_0 contains NaN/Inf");
+        }
     }
 
     std::vector<Vertex> initialVertices;
     {
-        const auto& acc = model.accessors.at(gltfPrim.attributes.at("POSITION"));
-        const auto& view = model.bufferViews[acc.bufferView];
-        const auto& buf = model.buffers[view.buffer];
-        const uint8_t* data = buf.data.data() + view.byteOffset + acc.byteOffset;
-        uint32_t count = acc.count, stride = AccessorStrideBytes(acc, view);
-        initialVertices.resize(count);
-        for (uint32_t i = 0; i < count; ++i)
-        {
+        initialVertices.resize(positionCount);
+        fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, posAcc, [&](fastgltf::math::fvec3 pos, std::size_t i) {
             Vertex v{};
-            std::memcpy(&v.position, data + i * stride, sizeof(XMFLOAT3));
+            v.position = XMFLOAT3(pos.x(), pos.y(), pos.z());
+            Require(IsFiniteFloat3(v.position), "POSITION contains NaN/Inf");
             if (!normals.empty())
             {
                 const XMFLOAT3 n = normals[i];
                 float len = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
-                v.normal = (len > 0) ? XMFLOAT3(n.x / len, n.y / len, n.z / len) : XMFLOAT3(0, 0, 1);
+                const XMFLOAT3 nNorm = (len > 0) ? XMFLOAT3(n.x / len, n.y / len, n.z / len) : XMFLOAT3(0, 0, 1);
+                v.normalPacked = PackNormalOctSnorm16(nNorm);
             }
             else
             {
-                v.normal = XMFLOAT3(0, 0, 0);
+                v.normalPacked = PackNormalOctSnorm16(XMFLOAT3(0, 0, 1));
             }
-            v.texCoord = (!texcoords.empty()) ? texcoords[i] : XMFLOAT2(0, 0);
-            v.tangent = XMFLOAT4(0, 0, 0, 0);
+            const XMFLOAT2 uv = (!texcoords.empty()) ? texcoords[i] : XMFLOAT2(0, 0);
+            Require(IsFiniteFloat2(uv), "TEXCOORD_0 contains NaN/Inf");
+            v.texCoordPacked = PackTexCoordHalf2(uv);
+            const XMFLOAT4 color = (!colors.empty()) ? colors[i] : XMFLOAT4(1, 1, 1, 1);
+            Require(IsFiniteFloat4(color), "COLOR_0 contains NaN/Inf");
+            const PackedColorRGBA16Unorm packedColor = PackColorRGBA16Unorm(color);
+            v.colorPackedLo = packedColor.lo;
+            v.colorPackedHi = packedColor.hi;
+            v.tangentPacked = PackTangentR10G10B10A2(XMFLOAT3(1, 0, 0), 1.0f);
             initialVertices[i] = v;
-        }
+        });
     }
 
     std::vector<uint32_t> initialIndices;
-    if (gltfPrim.indices >= 0)
+    if (gltfPrim.indicesAccessor)
     {
-        const auto& acc = model.accessors[gltfPrim.indices];
-        const auto& view = model.bufferViews[acc.bufferView];
-        const auto& buf = model.buffers[view.buffer];
-        const uint8_t* data = buf.data.data() + view.byteOffset + acc.byteOffset;
-        uint32_t count = acc.count;
-        initialIndices.resize(count);
-        if (acc.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE)
+        const auto& acc = asset.accessors[*gltfPrim.indicesAccessor];
+        initialIndices.resize(acc.count);
+        if (acc.componentType == fastgltf::ComponentType::UnsignedByte)
         {
-            for (uint32_t i = 0; i < count; ++i)
-                initialIndices[i] = data[i];
+            std::vector<uint8_t> tmp(acc.count);
+            fastgltf::copyFromAccessor<uint8_t>(asset, acc, tmp.data());
+            for (size_t i = 0; i < tmp.size(); ++i)
+                initialIndices[i] = tmp[i];
         }
-        else if (acc.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
+        else if (acc.componentType == fastgltf::ComponentType::UnsignedShort)
         {
-            const auto* p = reinterpret_cast<const uint16_t*>(data);
-            for (uint32_t i = 0; i < count; ++i)
-                initialIndices[i] = p[i];
+            std::vector<uint16_t> tmp(acc.count);
+            fastgltf::copyFromAccessor<uint16_t>(asset, acc, tmp.data());
+            for (size_t i = 0; i < tmp.size(); ++i)
+                initialIndices[i] = tmp[i];
         }
-        else if (acc.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT)
+        else if (acc.componentType == fastgltf::ComponentType::UnsignedInt)
         {
-            const auto* p = reinterpret_cast<const uint32_t*>(data);
-            for (uint32_t i = 0; i < count; ++i)
-                initialIndices[i] = p[i];
+            fastgltf::copyFromAccessor<uint32_t>(asset, acc, initialIndices.data());
         }
         else
         {
-            assert(false && "Unsupported index component type");
+            Fatal("Unsupported index component type");
         }
     }
     else
@@ -675,6 +1040,11 @@ static PrimRecord BuildOnePrimitive(const tinygltf::Model& model, int meshIdx, i
         for (uint32_t i = 0; i < static_cast<uint32_t>(initialVertices.size()); ++i)
             initialIndices[i] = i;
     }
+
+    Require((initialIndices.size() % 3) == 0, "Primitive index count must be divisible by 3");
+    const size_t vertexCount = initialVertices.size();
+    for (uint32_t idx : initialIndices)
+        Require(static_cast<size_t>(idx) < vertexCount, "Primitive index out of range for POSITION accessor");
 
     if (normals.empty())
     {
@@ -695,16 +1065,17 @@ static PrimRecord BuildOnePrimitive(const tinygltf::Model& model, int meshIdx, i
                 nz /= len;
             }
             XMFLOAT3 n(nx, ny, nz);
-            initialVertices[i0].normal = n;
-            initialVertices[i1].normal = n;
-            initialVertices[i2].normal = n;
+            const uint32_t packedN = PackNormalOctSnorm16(n);
+            initialVertices[i0].normalPacked = packedN;
+            initialVertices[i1].normalPacked = packedN;
+            initialVertices[i2].normalPacked = packedN;
         }
     }
     if (!texcoords.empty())
         ComputeTangentsMikk(initialIndices, initialVertices);
 
     std::vector<uint32_t> remap(initialIndices.size());
-    uint32_t totalVertices = meshopt_generateVertexRemap(remap.data(), initialIndices.data(), initialIndices.size(), initialVertices.data(), initialVertices.size(), sizeof(Vertex));
+    const size_t totalVertices = meshopt_generateVertexRemap(remap.data(), initialIndices.data(), initialIndices.size(), initialVertices.data(), initialVertices.size(), sizeof(Vertex));
     std::vector<uint32_t> outIndices(initialIndices.size());
     meshopt_remapIndexBuffer(outIndices.data(), initialIndices.data(), initialIndices.size(), remap.data());
     std::vector<Vertex> outVertices(totalVertices);
@@ -713,15 +1084,16 @@ static PrimRecord BuildOnePrimitive(const tinygltf::Model& model, int meshIdx, i
     meshopt_optimizeOverdraw(outIndices.data(), outIndices.data(), outIndices.size(), &outVertices[0].position.x, outVertices.size(), sizeof(Vertex), 1.05f);
     meshopt_optimizeVertexFetch(outVertices.data(), outIndices.data(), outIndices.size(), outVertices.data(), outVertices.size(), sizeof(Vertex));
 
-    constexpr uint64_t maxVertices = 64, maxTriangles = 124;
-    constexpr float coneWeight = 0.f;
-    const uint32_t maxMeshlets = meshopt_buildMeshletsBound(outIndices.size(), maxVertices, maxTriangles);
+    constexpr size_t maxVertices = 64, maxTriangles = 126;
+    constexpr float coneWeight = 0.25f;
+    const size_t maxMeshlets = meshopt_buildMeshletsBound(outIndices.size(), maxVertices, maxTriangles);
     std::vector<meshopt_Meshlet> temp(maxMeshlets);
     std::vector<uint32_t> mlVerts(maxMeshlets * maxVertices);
     std::vector<uint8_t> mlTris(maxMeshlets * maxTriangles * 3);
-    uint32_t mc = meshopt_buildMeshlets(temp.data(), mlVerts.data(), mlTris.data(), outIndices.data(), outIndices.size(), &outVertices[0].position.x, outVertices.size(), sizeof(Vertex), maxVertices,
-                                        maxTriangles, coneWeight);
-    temp.resize(mc);
+    const size_t meshletCount =
+        meshopt_buildMeshlets(temp.data(), mlVerts.data(), mlTris.data(), outIndices.data(), outIndices.size(), &outVertices[0].position.x, outVertices.size(), sizeof(Vertex), maxVertices,
+                              maxTriangles, coneWeight);
+    temp.resize(meshletCount);
     if (!temp.empty())
     {
         const auto& last = temp.back();
@@ -741,6 +1113,9 @@ static PrimRecord BuildOnePrimitive(const tinygltf::Model& model, int meshIdx, i
         mb.cone_apex = XMFLOAT3(b.cone_apex[0], b.cone_apex[1], b.cone_apex[2]);
         mb.cone_axis = XMFLOAT3(b.cone_axis[0], b.cone_axis[1], b.cone_axis[2]);
         mb.cone_cutoff = b.cone_cutoff;
+        Require(IsFiniteFloat3(mb.center), "Meshlet bounds center contains NaN/Inf");
+        Require(IsFiniteF32(mb.radius) && mb.radius >= 0.0f, "Meshlet bounds radius is invalid");
+        Require(IsFiniteFloat3(mb.cone_apex) && IsFiniteFloat3(mb.cone_axis) && IsFiniteF32(mb.cone_cutoff), "Meshlet cone data contains NaN/Inf");
         mb.coneAxisAndCutoff = (static_cast<uint32_t>(static_cast<uint8_t>(b.cone_axis_s8[0]))) | (static_cast<uint32_t>(static_cast<uint8_t>(b.cone_axis_s8[1])) << 8) |
                                (static_cast<uint32_t>(static_cast<uint8_t>(b.cone_axis_s8[2])) << 16) | (static_cast<uint32_t>(static_cast<uint8_t>(b.cone_cutoff_s8)) << 24);
         mlBounds.push_back(mb);
@@ -755,13 +1130,52 @@ static PrimRecord BuildOnePrimitive(const tinygltf::Model& model, int meshIdx, i
         meshlets[i].triangleCount = temp[i].triangle_count;
     }
 
-    PrimRecord r;
+    XMFLOAT3 localBoundsCenter = XMFLOAT3(0.0f, 0.0f, 0.0f);
+    float localBoundsRadius = 0.0f;
+    if (!outVertices.empty())
+    {
+        XMFLOAT3 minPos = outVertices[0].position;
+        XMFLOAT3 maxPos = outVertices[0].position;
+        for (const Vertex& v : outVertices)
+        {
+            minPos.x = std::min(minPos.x, v.position.x);
+            minPos.y = std::min(minPos.y, v.position.y);
+            minPos.z = std::min(minPos.z, v.position.z);
+            maxPos.x = std::max(maxPos.x, v.position.x);
+            maxPos.y = std::max(maxPos.y, v.position.y);
+            maxPos.z = std::max(maxPos.z, v.position.z);
+        }
+
+        localBoundsCenter.x = 0.5f * (minPos.x + maxPos.x);
+        localBoundsCenter.y = 0.5f * (minPos.y + maxPos.y);
+        localBoundsCenter.z = 0.5f * (minPos.z + maxPos.z);
+
+        float maxDistSq = 0.0f;
+        for (const Vertex& v : outVertices)
+        {
+            const float dx = v.position.x - localBoundsCenter.x;
+            const float dy = v.position.y - localBoundsCenter.y;
+            const float dz = v.position.z - localBoundsCenter.z;
+            const float distSq = dx * dx + dy * dy + dz * dz;
+            maxDistSq = std::max(maxDistSq, distSq);
+        }
+        localBoundsRadius = std::sqrt(maxDistSq);
+    }
+    Require(IsFiniteFloat3(localBoundsCenter), "Primitive local bounds center contains NaN/Inf");
+    Require(IsFiniteF32(localBoundsRadius) && localBoundsRadius >= 0.0f, "Primitive local bounds radius is invalid");
+
+    PrimRecord r{};
     r.meshIndex = static_cast<uint32_t>(meshIdx);
     r.primIndex = static_cast<uint32_t>(primIdx);
     r.materialIndex = materialIndex;
+    Require(outVertices.size() <= UINT32_MAX, "Primitive vertex count exceeds pack format limits");
+    Require(outIndices.size() <= UINT32_MAX, "Primitive index count exceeds pack format limits");
+    Require(meshlets.size() <= UINT32_MAX, "Primitive meshlet count exceeds pack format limits");
     r.vertexCount = static_cast<uint32_t>(outVertices.size());
     r.indexCount = static_cast<uint32_t>(outIndices.size());
     r.meshletCount = static_cast<uint32_t>(meshlets.size());
+    Require(mlVerts.size() <= UINT32_MAX, "Primitive meshlet vertex data exceeds pack format limits");
+    Require(mlTris.size() <= UINT32_MAX, "Primitive meshlet triangle data exceeds pack format limits");
     r.mlVertsCount = static_cast<uint32_t>(mlVerts.size());
     r.mlTrisByteCount = static_cast<uint32_t>(mlTris.size());
     r.vertexByteOffset = blobVertices.size() * sizeof(Vertex);
@@ -770,6 +1184,8 @@ static PrimRecord BuildOnePrimitive(const tinygltf::Model& model, int meshIdx, i
     r.mlVertsByteOffset = blobMLVerts.size() * sizeof(uint32_t);
     r.mlTrisByteOffset = blobMLTris.size();
     r.mlBoundsByteOffset = blobMLBounds.size() * sizeof(MeshletBounds);
+    r.localBoundsCenter = localBoundsCenter;
+    r.localBoundsRadius = localBoundsRadius;
 
     blobVertices.insert(blobVertices.end(), outVertices.begin(), outVertices.end());
     blobIndices.insert(blobIndices.end(), outIndices.begin(), outIndices.end());
@@ -796,20 +1212,20 @@ static void BuildMeshPrimToPrimIndex(const std::vector<PrimRecord>& prims, std::
     }
 }
 
-static void GatherInstances_Recursive(const tinygltf::Model& model, int nodeIndex, const std::vector<std::vector<uint32_t>>& meshPrimToPrimIndex, const XMMATRIX& parentWorld,
+static void GatherInstances_Recursive(const fastgltf::Asset& asset, size_t nodeIndex, const std::vector<std::vector<uint32_t>>& meshPrimToPrimIndex, const XMMATRIX& parentWorld,
                                       std::vector<InstanceRecord>& out)
 {
-    const tinygltf::Node& n = model.nodes[nodeIndex];
+    const fastgltf::Node& n = asset.nodes[nodeIndex];
     XMMATRIX world = XMMatrixMultiply(NodeLocalMatrix_Row(n), parentWorld);
-    if (n.mesh >= 0 && n.mesh < static_cast<int>(model.meshes.size()))
+    if (n.meshIndex && *n.meshIndex < asset.meshes.size())
     {
-        const auto& m = model.meshes[n.mesh];
+        const auto& m = asset.meshes[*n.meshIndex];
         for (size_t p = 0; p < m.primitives.size(); ++p)
         {
             uint32_t primIndex = UINT32_MAX;
-            if (n.mesh < static_cast<int>(meshPrimToPrimIndex.size()))
+            if (*n.meshIndex < meshPrimToPrimIndex.size())
             {
-                const auto& vec = meshPrimToPrimIndex[n.mesh];
+                const auto& vec = meshPrimToPrimIndex[*n.meshIndex];
                 if (p < vec.size())
                     primIndex = vec[p];
             }
@@ -818,29 +1234,35 @@ static void GatherInstances_Recursive(const tinygltf::Model& model, int nodeInde
             InstanceRecord inst{};
             inst.primIndex = primIndex;
             XMStoreFloat4x4(&inst.world, world);
+            Require(IsFiniteFloat4x4(inst.world), "Instance world matrix contains NaN/Inf");
+            XMVECTOR det{};
+            const XMMATRIX worldInv = XMMatrixInverse(&det, world);
+            XMFLOAT4X4 worldInv4x4{};
+            XMStoreFloat4x4(&worldInv4x4, worldInv);
+            Require(IsFiniteF32(XMVectorGetX(det)) && IsFiniteFloat4x4(worldInv4x4), "Instance world matrix is non-invertible");
             out.push_back(inst);
         }
     }
-    for (int child : n.children)
-        if (child >= 0 && child < static_cast<int>(model.nodes.size()))
-            GatherInstances_Recursive(model, child, meshPrimToPrimIndex, world, out);
+    for (size_t child : n.children)
+        if (child < asset.nodes.size())
+            GatherInstances_Recursive(asset, child, meshPrimToPrimIndex, world, out);
 }
 
-static void BuildInstanceTable(const tinygltf::Model& model, const std::vector<PrimRecord>& prims, std::vector<InstanceRecord>& out)
+static void BuildInstanceTable(const fastgltf::Asset& asset, const std::vector<PrimRecord>& prims, std::vector<InstanceRecord>& out)
 {
-    assert(!model.scenes.empty() && "glTF must contain at least one scene");
+    Require(!asset.scenes.empty(), "glTF must contain at least one scene");
     std::vector<std::vector<uint32_t>> map;
-    BuildMeshPrimToPrimIndex(prims, map, model.meshes.size());
-    int sceneIndex = (model.defaultScene >= 0) ? model.defaultScene : 0;
-    if (sceneIndex < 0 || sceneIndex >= static_cast<int>(model.scenes.size()))
+    BuildMeshPrimToPrimIndex(prims, map, asset.meshes.size());
+    size_t sceneIndex = asset.defaultScene.value_or(0);
+    if (sceneIndex >= asset.scenes.size())
         sceneIndex = 0;
     const XMMATRIX I = XMMatrixIdentity();
-    for (int nodeIdx : model.scenes[sceneIndex].nodes)
-        if (nodeIdx >= 0 && nodeIdx < static_cast<int>(model.nodes.size()))
-            GatherInstances_Recursive(model, nodeIdx, map, I, out);
+    for (size_t nodeIdx : asset.scenes[sceneIndex].nodeIndices)
+        if (nodeIdx < asset.nodes.size())
+            GatherInstances_Recursive(asset, nodeIdx, map, I, out);
 }
 
-static void ResolveInstanceMaterialsAndSort(const std::vector<PrimRecord>& prims, const std::vector<MaterialRecord>& mats, std::vector<InstanceRecord>& inst)
+static void ResolveInstanceMaterials(const std::vector<PrimRecord>& prims, const std::vector<MaterialRecord>& mats, std::vector<InstanceRecord>& inst)
 {
     const uint32_t matCount = static_cast<uint32_t>(mats.empty() ? 1 : mats.size());
 
@@ -851,15 +1273,9 @@ static void ResolveInstanceMaterialsAndSort(const std::vector<PrimRecord>& prims
             mat = 0u;
         I.materialIndex = mat;
     }
-
-    std::stable_sort(inst.begin(), inst.end(), [](const InstanceRecord& a, const InstanceRecord& b) {
-        if (a.materialIndex != b.materialIndex)
-            return a.materialIndex < b.materialIndex;
-        return a.primIndex < b.primIndex;
-    });
 }
 
-static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::path& glbPath, const tinygltf::Model& model, bool fastCompress)
+static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::path& glbPath, const fastgltf::Asset& asset, bool fastCompress)
 {
     std::vector<PrimRecord> prims;
     std::vector<Vertex> blobVertices;
@@ -869,38 +1285,39 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
     std::vector<uint8_t> blobMLTris;
     std::vector<MeshletBounds> blobMLBounds;
 
-    for (int mi = 0; mi < static_cast<int>(model.meshes.size()); ++mi)
+    for (size_t mi = 0; mi < asset.meshes.size(); ++mi)
     {
-        const auto& mesh = model.meshes[mi];
-        for (int pi = 0; pi < static_cast<int>(mesh.primitives.size()); ++pi)
+        const auto& mesh = asset.meshes[mi];
+        for (size_t pi = 0; pi < mesh.primitives.size(); ++pi)
         {
-            PrimRecord r = BuildOnePrimitive(model, mi, pi, blobVertices, blobIndices, blobMeshlets, blobMLVerts, blobMLTris, blobMLBounds);
+            PrimRecord r = BuildOnePrimitive(asset, mi, pi, blobVertices, blobIndices, blobMeshlets, blobMLVerts, blobMLTris, blobMLBounds);
             prims.push_back(r);
         }
     }
 
     std::vector<InstanceRecord> instTable;
-    BuildInstanceTable(model, prims, instTable);
+    BuildInstanceTable(asset, prims, instTable);
 
     std::vector<TextureRecord> texTable;
+    std::vector<TextureSubresourceRecord> texSubresources;
     std::vector<uint8_t> texBlob;
     {
-        auto imgUsage = BuildImageUsageFlags(model);
-        BuildTexturesToMemory(glbPath, model, imgUsage, fastCompress, texTable, texBlob);
-        if (!model.textures.empty())
-            assert(!texTable.empty() && "Texture table is empty despite glTF having textures");
+        auto imgUsage = BuildImageUsageFlags(asset);
+        BuildTexturesToMemory(glbPath, asset, imgUsage, fastCompress, texTable, texSubresources, texBlob);
+        if (!asset.textures.empty() && texTable.empty())
+            Fatal("Texture table is empty despite glTF having textures");
     }
 
     std::vector<D3D12_SAMPLER_DESC> sampTable;
     std::vector<MaterialRecord> matTable;
-    BuildSamplerTable(model, sampTable);
-    BuildMaterialTable(model, texTable, matTable);
+    const uint32_t defaultSamplerIndex = BuildSamplerTable(asset, sampTable);
+    BuildMaterialTable(asset, texTable, matTable, defaultSamplerIndex);
 
     if (!instTable.empty())
-        ResolveInstanceMaterialsAndSort(prims, matTable, instTable);
+        ResolveInstanceMaterials(prims, matTable, instTable);
 
     std::vector<ChunkRecord> chunks;
-    uint32_t chunkCount = 7u + (texTable.empty() ? 0u : 2u) + (sampTable.empty() ? 0u : 1u) + (matTable.empty() ? 0u : 1u) + (instTable.empty() ? 0u : 1u);
+    uint32_t chunkCount = 7u + (texTable.empty() ? 0u : 3u) + (sampTable.empty() ? 0u : 1u) + (matTable.empty() ? 0u : 1u) + (instTable.empty() ? 0u : 1u);
 
     const uint64_t ofsHeader = 0;
     const uint64_t ofsChunkTbl = ofsHeader + sizeof(PackHeader);
@@ -916,6 +1333,9 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
     const uint64_t ofsTxHd = texTable.empty() ? 0 : cur;
     if (!texTable.empty())
         cur += texTable.size() * sizeof(TextureRecord);
+    const uint64_t ofsTxSr = texTable.empty() ? 0 : cur;
+    if (!texTable.empty())
+        cur += texSubresources.size() * sizeof(TextureSubresourceRecord);
     const uint64_t ofsTxTb = texTable.empty() ? 0 : cur;
     if (!texTable.empty())
         cur += texBlob.size();
@@ -948,6 +1368,7 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
     if (!texTable.empty())
     {
         addChunk(CH_TXHD, ofsTxHd, texTable.size() * sizeof(TextureRecord));
+        addChunk(CH_TXSR, ofsTxSr, texSubresources.size() * sizeof(TextureSubresourceRecord));
         addChunk(CH_TXTB, ofsTxTb, texBlob.size());
     }
     if (!sampTable.empty())
@@ -963,11 +1384,12 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
         addChunk(CH_INST, ofsInst, instTable.size() * sizeof(InstanceRecord));
     }
 
-    PackHeader hdr;
+    PackHeader hdr{};
     std::memcpy(hdr.magic, "ISKURPACK", 9);
-    hdr.version = 9;
+    hdr.version = PACK_VERSION_LATEST;
     hdr.primCount = static_cast<uint32_t>(prims.size());
     hdr.chunkCount = static_cast<uint32_t>(chunks.size());
+    hdr.reserved0 = 0;
     hdr.chunkTableOffset = ofsChunkTbl;
     hdr.primTableOffset = ofsPrimTbl;
     hdr.verticesOffset = ofsVertices;
@@ -978,7 +1400,8 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
     hdr.mlBoundsOffset = ofsMLBounds;
 
     std::ofstream out(outPackPath, std::ios::binary | std::ios::trunc);
-    assert(out && "Failed to open output pack file");
+    if (!out)
+        Fatal("Failed to open output pack file");
 
     out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
     out.write(reinterpret_cast<const char*>(chunks.data()), static_cast<std::streamsize>(chunks.size() * sizeof(ChunkRecord)));
@@ -992,6 +1415,7 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
     if (!texTable.empty())
     {
         out.write(reinterpret_cast<const char*>(texTable.data()), static_cast<std::streamsize>(texTable.size() * sizeof(TextureRecord)));
+        out.write(reinterpret_cast<const char*>(texSubresources.data()), static_cast<std::streamsize>(texSubresources.size() * sizeof(TextureSubresourceRecord)));
         out.write(reinterpret_cast<const char*>(texBlob.data()), static_cast<std::streamsize>(texBlob.size()));
     }
     if (!sampTable.empty())
@@ -1001,7 +1425,8 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
     if (!instTable.empty())
         out.write(reinterpret_cast<const char*>(instTable.data()), static_cast<std::streamsize>(instTable.size() * sizeof(InstanceRecord)));
 
-    assert(out.good() && "Error writing pack file");
+    if (!out.good())
+        Fatal("Error writing pack file");
 
     std::println("Meshes pack written: {}", outPackPath.string());
     std::println("  prims={}, verts={}, inds={}, meshlets={}, mlVerts={}, mlTris={} bytes, mlBounds={}", static_cast<size_t>(hdr.primCount), blobVertices.size(), blobIndices.size(),
@@ -1013,7 +1438,7 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
     if (!matTable.empty())
         std::println("  materials: {}", matTable.size());
     if (!instTable.empty())
-        std::println("  instances: {} (sorted by material, then prim)", instTable.size());
+        std::println("  instances: {}", instTable.size());
 }
 
 static void PrintUsage()
@@ -1023,11 +1448,36 @@ static void PrintUsage()
 
 static void WriteIskurScene(const fs::path& inGlb, const fs::path& outPack, bool fastCompress)
 {
-    tinygltf::Model model;
-    tinygltf::TinyGLTF loader;
-    std::string warn, err;
-    bool ok = loader.LoadBinaryFromFile(&model, &warn, &err, inGlb.string());
-    assert(ok && "Failed to load GLB with tinygltf");
+    constexpr auto supportedExtensions = fastgltf::Extensions::None;
+    constexpr auto gltfOptions = fastgltf::Options::DontRequireValidAssetMember | fastgltf::Options::AllowDouble | fastgltf::Options::LoadExternalBuffers | fastgltf::Options::LoadExternalImages;
+
+    fastgltf::Parser parser(supportedExtensions);
+    fastgltf::Asset model{};
+
+    auto loadAsset = [&](fastgltf::GltfDataGetter& input) {
+        auto asset = parser.loadGltf(input, inGlb.parent_path(), gltfOptions);
+        if (asset.error() != fastgltf::Error::None)
+        {
+            std::println("fastgltf load error for '{}': {} ({})", inGlb.string(), fastgltf::getErrorName(asset.error()), fastgltf::getErrorMessage(asset.error()));
+            Fatal("Failed to load GLB with fastgltf");
+        }
+        model = std::move(asset.get());
+    };
+
+    auto gltfFile = fastgltf::MappedGltfFile::FromPath(inGlb);
+    if (gltfFile)
+    {
+        loadAsset(gltfFile.get());
+    }
+    else
+    {
+        std::println("fastgltf mapped file open failed for '{}': {} ({})", inGlb.string(), fastgltf::getErrorName(gltfFile.error()),
+                     fastgltf::getErrorMessage(gltfFile.error()));
+        fastgltf::GltfFileStream gltfStream(inGlb);
+        if (!gltfStream.isOpen())
+            Fatal("Failed to open GLB file");
+        loadAsset(gltfStream);
+    }
 
     std::println("Loaded GLB: {}", inGlb.string());
     ProcessAllMeshesAndWritePack(outPack, inGlb, model, fastCompress);
@@ -1045,7 +1495,7 @@ int main(int argc, char** argv)
 
     for (int i = 1; i < argc; ++i)
     {
-        std::string a = argv[i];
+        std::string a = ToLowerAscii(argv[i]);
         if ((a == "-i" || a == "--scene") && i + 1 < argc)
             inSceneName = argv[++i];
         else if (a == "--fast")
@@ -1054,29 +1504,32 @@ int main(int argc, char** argv)
             processAll = true;
         else
         {
-            assert(false && "Unknown command-line argument");
+            std::println("Error: Unknown command-line argument '{}'", a);
+            std::exit(EXIT_FAILURE);
         }
     }
 
     if (processAll)
     {
-        const fs::path srcRoot = fs::path("data") / "scenes_sources";
-        const fs::path outRoot = fs::path("data") / "scenes";
-        assert(fs::exists(srcRoot) && fs::is_directory(srcRoot) && "Sources directory must exist");
+        const fs::path repoRoot = FindRepoRoot(fs::path(argv[0]));
+        const fs::path srcRoot = repoRoot / "data" / "scenes" / "sources";
+        const fs::path outRoot = repoRoot / "data" / "scenes";
+        Require(fs::exists(srcRoot) && fs::is_directory(srcRoot), "Sources directory must exist");
         if (!fs::exists(outRoot))
         {
             std::error_code ec;
             fs::create_directories(outRoot, ec);
-            assert(!ec && "Failed to create output directory");
+            if (ec)
+                Fatal("Failed to create output directory");
         }
         int total = 0, okc = 0, skipped = 0;
         for (const auto& de : fs::directory_iterator(srcRoot))
         {
-            if (!de.is_regular_file() || de.path().extension() != ".glb")
+            if (!de.is_regular_file() || !EqualsIgnoreCaseAscii(de.path().extension().string(), ".glb"))
                 continue;
             std::string stem = de.path().stem().string();
             fs::path glb = de.path();
-            fs::path pack = outRoot / (stem + ".iskurpack");
+            fs::path pack = outRoot / (stem + PACK_FILE_EXTENSION);
             if (!IsGlbFile(glb))
             {
                 std::println("[skip] {} (not GLB)", stem);
@@ -1100,15 +1553,18 @@ int main(int argc, char** argv)
     if (inSceneName.empty())
     {
         PrintUsage();
-        assert(false && "No scene specified; use --scene <name> or --all");
+        Fatal("No scene specified; use --scene <name> or --all");
     }
 
-    const std::string name = inSceneName.string();
-    const fs::path glbPath = fs::path("data") / "scenes_sources" / (name + ".glb");
-    const fs::path outPath = fs::path("data") / "scenes" / (name + ".iskurpack");
+    const fs::path repoRoot = FindRepoRoot(fs::path(argv[0]));
+    const fs::path srcRoot = repoRoot / "data" / "scenes" / "sources";
+    const fs::path outRoot = repoRoot / "data" / "scenes";
 
-    assert(fs::exists(glbPath) && fs::is_regular_file(glbPath) && "GLB path does not exist or is not a file");
-    assert(IsGlbFile(glbPath) && "Input file must be a GLB");
+    fs::path glbPath;
+    if (!ResolveSceneSourcePath(srcRoot, inSceneName.string(), glbPath))
+        Fatal("Scene source GLB not found (case-insensitive) in data/scenes/sources");
+    const std::string sceneStem = glbPath.stem().string();
+    const fs::path outPath = outRoot / (sceneStem + PACK_FILE_EXTENSION);
 
     {
         const auto outDir = outPath.parent_path();
@@ -1116,7 +1572,8 @@ int main(int argc, char** argv)
         {
             std::error_code ec;
             fs::create_directories(outDir, ec);
-            assert(!ec && "Failed to create output directory");
+            if (ec)
+                Fatal("Failed to create output directory");
         }
     }
 
@@ -1130,3 +1587,4 @@ int main(int argc, char** argv)
 
     return 0;
 }
+

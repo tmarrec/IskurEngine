@@ -1,6 +1,6 @@
 # Iškur Engine
 
-Iškur Engine is a personal rendering engine built with DirectX 12, designed primarily as a platform for prototyping and experimenting with graphics techniques. Its public release is intended more as a portfolio piece than an attempt at widespread use.
+Iškur Engine is a personal DirectX 12 rendering engine focused on prototyping and experimenting with graphics techniques. This public repository is primarily a portfolio release rather than a general-purpose engine.
 
 > **Note:** This GitHub repository may show relatively few commits because I primarily develop Iškur Engine on a local Git server and only sync to GitHub when meaningful changes are made.
 
@@ -8,125 +8,170 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
 
 ## Features
 
-- **Mesh Shaders**
-- **Meshlet Frustum Culling:** engine-generated meshlets are culled on the GPU
-- **Ray-Traced Shadows (DXR):** BLAS and TLAS are built at runtime
-- **Diffuse GI via Path Tracing (DXR) + Radiance Cache:** caches radiance in a spatial hash keyed by quantized world-space grid cell and surface normal bin
-- **Bindless Resources:** textures, samplers, and buffers
 - **PBR Shading**
-- **HDR Pipeline:** full FP16 render targets with ACES tone mapping  
+- **Procedural Sky + Atmosphere**
+- **Hardware Ray-Traced Shadows:** BLAS and TLAS are built at runtime
+- **Hardware Ray-Traced Specular**
+- **Diffuse GI via Hardware Ray Tracing + Radiance Cache:** caches radiance in a spatial hash map
+- **HDR Pipeline:** full FP16 render targets with AgX tone mapping
 - **Auto-Exposure**
-- **Runtime Shader Compilation (DXC)** with hot-reload
+- **Bloom**
+- **NVIDIA DLSS Super Resolution + DLAA**
+- **Mesh Shaders**
+- **Meshlet Frustum and Backface Culling**
+- **Bindless Resources:** textures, samplers, and buffers
 - **Reverse-Z**
-- **FidelityFX Super Resolution (FSR)**
-- **Scene Packer:** compresses textures and generates meshlets
-- **Render pass live profiler**
-- **Dear ImGui**
+- **Runtime Shader Compilation** with manual reload
+- **Environment Presets**
+- **Scene Packer:** generates tangents, mipmaps, compressed textures, and meshlets
+- **Live CPU/GPU Pass Timings**
+- **In-engine debugging and tuning UI**
 
 ## Screenshots
 
 <p align="center">
-  <img src="screenshots/san-miguel.png" alt="San-Miguel scene"><br/>
-  <em>San-Miguel scene</em>
+  <img src="screenshots/bistro.jpg" alt="Bistro showcase"><br/>
+  <em>Bistro</em>
 </p>
 <br/>
 
 <p align="center">
-  <img src="screenshots/bistro.png" alt="Bistro scene"><br/>
-  <em>Bistro scene</em>
+  <img src="screenshots/sponza.jpg" alt="Sponza showcase"><br/>
+  <em>Sponza</em>
 </p>
 <br/>
 
 <p align="center">
-  <img src="screenshots/sponza.png" alt="Sponza scene"><br/>
-  <em>Sponza scene</em>
+  <img src="screenshots/san-miguel.jpg" alt="San-Miguel showcase"><br/>
+  <em>San-Miguel</em>
 </p>
 <br/>
 
 <p align="center">
-  <img src="screenshots/meshlets.png" alt="Meshlets debug view"><br/>
-  <em>Meshlets debug view</em>
+  <img src="screenshots/stanford-dragon.jpg" alt="Stanford Dragon meshlets view"><br/>
+  <em>Meshlets</em>
 </p>
 <br/>
 
 <p align="center">
-  <img src="screenshots/culling.png" alt="Meshlets frustum culling"><br/>
-  <em>Meshlets frustum culling</em>
+  <img src="screenshots/debug.jpg" alt="Debug view with ImGui panels"><br/>
+  <em>ImGui</em>
+</p>
+<br/>
+
+<p align="center">
+  <img src="screenshots/indirect-diffuse.jpg" alt="Indirect diffuse render target debug view"><br/>
+  <em>Indirect diffuse debug view</em>
 </p>
 
-## Dependencies
+## Third-Party Dependencies
 
-- [D3D12 Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/D3D12MemoryAllocator)
-- [DirectX 12](https://learn.microsoft.com/en-us/windows/win32/direct3d12/direct3d-12-graphics)
-- [DirectX-Headers](https://github.com/microsoft/DirectX-Headers)
-- [DirectXMesh](https://github.com/microsoft/DirectXMesh)
-- [DirectXTex](https://github.com/microsoft/DirectXTex)
-- [DirectXTK12](https://github.com/microsoft/DirectXTK12)
-- [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)
-- [FidelityFX-SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/)
-- [Dear ImGui](https://github.com/ocornut/imgui)
-- [meshoptimizer](https://github.com/zeux/meshoptimizer)
-- [MikkTSpace](https://github.com/mmikk/MikkTSpace)
-- [TinyGLTF](https://github.com/syoyo/tinygltf)
+- Engine:
+  - [D3D12 Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/D3D12MemoryAllocator)
+  - [DirectXTex](https://github.com/microsoft/DirectXTex)
+  - [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)
+  - [DirectX 12 Agility SDK](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12)
+  - [NVIDIA Streamline SDK](https://github.com/NVIDIA-RTX/Streamline)
+  - [Dear ImGui](https://github.com/ocornut/imgui)
+- Scene packer:
+  - [meshoptimizer](https://github.com/zeux/meshoptimizer)
+  - [MikkTSpace](https://github.com/mmikk/MikkTSpace)
+  - [fastgltf](https://github.com/spnda/fastgltf)
+  - [DirectXTex](https://github.com/microsoft/DirectXTex)
 
 ## Getting Started
 
 ### Prerequisites
 
-- Windows 11
+- Windows 11 (up to date)
 - Visual Studio 2026 (ensure the following components are installed)
-   - Windows 11 SDK (10.0.26100.X)
-- CMake 4.2 or higher
+   - Windows 11 SDK
+- CMake 4.3 or higher
+- NVIDIA GeForce RTX 20 Series GPU or newer
+  - Iškur Engine is a personal rendering engine, and I intentionally keep the hardware target narrow rather than adding extra complexity to support a wider range of GPUs.
 
 ### Setup Instructions
 
 1. **Clone Repository**
 
-  ```bash
-  git clone https://github.com/tmarrec/IskurEngine.git
-  cd IskurEngine
-  ```
+   ```bash
+   git clone https://github.com/tmarrec/IskurEngine.git
+   cd IskurEngine
+   ```
 
 2. **Execute Setup Script**
 
-  ```bash
-   setup.bat
+   ```bash
+   scripts\setup.bat
    ```
 
-3. **Generate Project Files**
+   If proprietary dependencies are missing, setup downloads Streamline and the DirectX 12 Agility SDK.
+   It also downloads the compressed scene archive and extracts it into `data/scenes`, overwriting existing extracted files. These downloads may take some time and require internet access.
 
-  ```bash
-   build.bat
+3. **Generate Visual Studio Solutions**
+
+   ```bash
+   scripts\generate_solution.bat
    ```
 
-   This creates the Visual Studio solution file (`build/IskurEngine.slnx`).
+   This script configures CMake for both the engine and the scene packer, generates the Visual Studio solution files (`build/engine/IskurEngine.slnx` and
+   `build/packer/IskurScenePacker.slnx`), and performs the required post-generation runtime setup.
 
-4. **Build Project**
+4. **Build**
 
-   Open `build/IskurEngine.slnx` in Visual Studio and build the solution.
+   For the IDE workflow, open `build/engine/IskurEngine.slnx` in Visual Studio and build the project there.
+
+   For a command-line build, run:
+
+   ```bash
+   scripts\build_release.bat
+   ```
+
+5. **Run**
+
+   After building, the engine executable is available in `bin\Release` (or `bin\Debug`).
+
+   ```bash
+   bin\Release\IskurEngine.exe
+   ```
 
 ## Command-Line Arguments
 
 You can specify which scene to load at startup using the `--scene` argument. For example:
 
 ```bash
-IskurEngine.exe --scene San-Miguel
+IskurEngine.exe --scene Sponza
 ```
 
-## Scene Packer (GLB to .iskurpack)
-glTF scenes need to be packed using **IskurScenePacker**; it compresses textures and prepares geometry.
+You can also enable the D3D12 debug layer's GPU-based validation with:
 
-Place your source `.glb` files in `data/scenes_sources/<SceneName>.glb`.
-Running the packer will generate `data/scenes/<SceneName>.iskurpack`, which the engine loads at runtime.
+```bash
+IskurEngine.exe --gpu-validation
+```
+
+## Controls and Runtime UI
+
+- `W/A/S/D`: move horizontally
+- `Q/E`: move down/up
+- `Shift`: move faster
+- `Ctrl`: move slower
+- `Space`: toggle mouse capture for freelook
+- `Esc`: release mouse capture
+
+## Scene Packer (.glb to .ikp)
+glTF `.glb` scenes need to be packed using **IskurScenePacker**; it generates MikkTSpace tangents, mipmaps, BC-compressed textures, and meshlets for runtime use.
+
+Place your source `.glb` files in `data/scenes/sources/<SceneName>.glb`.
+Running the packer will generate `data/scenes/<SceneName>.ikp`, which the engine loads at runtime.
 
 Typical usage:
 ```bash
-IskurScenePacker --scene San-Miguel --fast
-IskurScenePacker --all --fast
+IskurScenePacker.exe --all
+IskurScenePacker.exe --scene Sponza --fast
 ```
 
 ## License
 
 Iškur Engine is licensed under the MIT License. See [LICENSE](LICENSE) for more information.
 
-© 2025 Tristan Marrec
+© 2025-2026 Tristan Marrec

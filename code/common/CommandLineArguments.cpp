@@ -1,11 +1,12 @@
-﻿// Iškur Engine
+// Iskur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
 
 #include "CommandLineArguments.h"
 
-#include <Windows.h>
+#include "StringUtils.h"
+#include "UtfConversion.h"
 
 void ProcessCommandLineArguments(i32 argc, char** argv)
 {
@@ -14,11 +15,12 @@ void ProcessCommandLineArguments(i32 argc, char** argv)
     {
         for (i32 i = 1; i < argc; ++i)
         {
-            if (strcmp(argv[i], "--scene") == 0 && i + 1 < argc)
+            const String option = ToLowerAscii(argv[i]);
+            if (option == "--scene" && i + 1 < argc)
             {
                 args.sceneFile = argv[++i]; // consume the next argument
             }
-            else if (strcmp(argv[i], "--gpu-validation") == 0)
+            else if (option == "--gpu-validation")
             {
                 args.gpuValidation = true;
             }
@@ -32,7 +34,7 @@ const CommandLineArguments& GetCommandLineArguments()
     return args;
 }
 
-WString GetWindowTitle()
+String GetWindowTitle()
 {
     const LPWSTR cmdLine = GetCommandLineW();
 
@@ -66,12 +68,13 @@ WString GetWindowTitle()
         argsStart++;
     }
 
-    WString title = L"Iškur Engine";
+    String title = "Iskur Engine";
     if (*argsStart)
     {
-        title += L" ";
-        title += argsStart; // Append the raw arguments
+        title += " ";
+        title += WideToUtf8(argsStart);
     }
 
     return title;
 }
+

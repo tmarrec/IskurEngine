@@ -1,18 +1,18 @@
-﻿// Iškur Engine
+// Iskur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
 
 #pragma once
 
-struct Buffer
+#include "GpuResource.h"
+
+struct Buffer : public GpuResource
 {
     ComPtr<D3D12MA::Allocation> allocation;
-    ComPtr<ID3D12Resource> buffer;
     u32 srvIndex = UINT32_MAX;
     u32 uavIndex = UINT32_MAX;
     u32 numElements = 0;
-    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
 };
 
 struct BufferCreateDesc

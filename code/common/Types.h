@@ -1,4 +1,4 @@
-﻿// Iškur Engine
+// Iskur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
@@ -30,7 +30,6 @@ using f64 = double; // std::float64_t when C++23 is available
 template <class T, class Alloc = std::allocator<T>> using Vector = std::vector<T, Alloc>;
 template <class T, std::size_t N> using Array = std::array<T, N>;
 using String = std::string;
-using WString = std::wstring;
 
 template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 

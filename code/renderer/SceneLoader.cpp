@@ -1,189 +1,145 @@
-﻿// Iškur Engine
+// Iskur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
 
 #include "SceneLoader.h"
 
-#include "Primitive.h"
-#include "Raytracing.h"
-#include "Renderer.h"
 #include "SceneFileLoader.h"
-#include "common/Asserts.h"
+#include "SceneUtils.h"
 #include "common/IskurPackFormat.h"
-#include "window/Window.h"
 
-#include <DDSTextureLoader.h>
-#include <ResourceUploadBatch.h>
-#include <meshoptimizer.h>
-
-#include <filesystem>
-
-using namespace DirectX;
-namespace fs = std::filesystem;
-
-void SceneLoader::Load(Renderer& renderer, const String& sceneFile)
+namespace
 {
-    const String scenePath = String("data/scenes/") + sceneFile + ".glb";
-    const fs::path fsScenePath(scenePath.data());
-    const fs::path baseDir = fsScenePath.parent_path();
-    const fs::path packPath = baseDir / (fsScenePath.stem().wstring() + L".iskurpack");
-
-    SceneFileData sceneData = LoadSceneFile(packPath);
-
-    Renderer::PerFrameData& frameData = renderer.GetCurrentFrameData();
-
-    ComPtr<ID3D12GraphicsCommandList7> cmd;
-    IE_Check(renderer.GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frameData.commandAllocator.Get(), nullptr, IID_PPV_ARGS(&cmd)));
-
-    LoadTextures(renderer, sceneData);
-    LoadSamplers(renderer, sceneData);
-    LoadMaterials(renderer, sceneData, cmd);
-    BuildPrimitives(renderer, sceneData, cmd);
-
-    // Build raster buckets & RT instances from IEPack instances
-    Vector<Raytracing::RTInstance> rtInstances;
-    rtInstances.reserve(sceneData.instances.size());
-
-    for (const IEPack::InstanceRecord& inst : sceneData.instances)
-    {
-        const u32 localPrimId = inst.primIndex;
-        IE_Assert(localPrimId < renderer.m_Primitives.size());
-
-        const Material& mat = renderer.m_Materials[inst.materialIndex];
-        const AlphaMode am = static_cast<AlphaMode>(mat.alphaMode);
-        const CullMode cm = mat.doubleSided ? CullMode_None : CullMode_Back;
-
-        const Primitive& prim = renderer.m_Primitives[localPrimId];
-
-        XMMATRIX Mworld = XMLoadFloat4x4(&inst.world);
-        XMMATRIX MworldInv = XMMatrixInverse(nullptr, Mworld);
-        XMFLOAT4X4 worldIT{};
-        XMStoreFloat4x4(&worldIT, MworldInv);
-
-        PrimitiveConstants pc{};
-        pc.world = inst.world;
-        pc.worldIT = worldIT;
-        pc.meshletCount = prim.meshletCount;
-        pc.materialIdx = inst.materialIndex;
-        pc.verticesBufferIndex = prim.vertices->srvIndex;
-        pc.meshletsBufferIndex = prim.meshlets->srvIndex;
-        pc.meshletVerticesBufferIndex = prim.mlVerts->srvIndex;
-        pc.meshletTrianglesBufferIndex = prim.mlTris->srvIndex;
-        pc.meshletBoundsBufferIndex = prim.mlBounds->srvIndex;
-        pc.materialsBufferIndex = renderer.m_MaterialsBuffer->srvIndex;
-
-        Renderer::PrimitiveRenderData prd{};
-        prd.primIndex = localPrimId;
-        prd.primConstants = pc;
-        renderer.m_PrimitivesRenderData[am][cm].push_back(prd);
-
-        Raytracing::RTInstance rti{};
-        rti.primIndex = localPrimId;
-        rti.materialIndex = pc.materialIdx;
-        rti.world = pc.world;
-        rtInstances.push_back(rti);
-    }
-
-    SetupDepthResourcesAndLinearSampler(renderer);
-
-    Raytracing::GetInstance().Init(cmd, renderer.m_Primitives, rtInstances);
-
-    SubmitAndSync(renderer, frameData, cmd);
+bool IsFiniteFloat3(const XMFLOAT3& v)
+{
+    return IE_IsFinite(v.x) && IE_IsFinite(v.y) && IE_IsFinite(v.z);
 }
 
-void SceneLoader::LoadTextures(Renderer& renderer, const SceneFileData& scene)
+bool IsFiniteFloat4x4(const XMFLOAT4X4& m)
 {
+    return IE_IsFinite(m._11) && IE_IsFinite(m._12) && IE_IsFinite(m._13) && IE_IsFinite(m._14) && IE_IsFinite(m._21) && IE_IsFinite(m._22) && IE_IsFinite(m._23) && IE_IsFinite(m._24) &&
+           IE_IsFinite(m._31) && IE_IsFinite(m._32) && IE_IsFinite(m._33) && IE_IsFinite(m._34) && IE_IsFinite(m._41) && IE_IsFinite(m._42) && IE_IsFinite(m._43) && IE_IsFinite(m._44);
+}
+} // namespace
+
+LoadedScene SceneLoader::Load(const String& sceneFile)
+{
+    const std::filesystem::path packPath = SceneUtils::ResolveScenePackPath(sceneFile);
+    LoadedScene scene{};
+    scene.sourceData = LoadSceneFile(packPath);
+    const SceneFileData& sceneData = scene.sourceData;
+    LoadTextures(scene, sceneData);
+    LoadSamplers(scene, sceneData);
+    LoadMaterials(scene, sceneData);
+    BuildPrimitives(scene, sceneData);
+    BuildInstances(scene, sceneData);
+    return scene;
+}
+
+void SceneLoader::LoadTextures(LoadedScene& outScene, const SceneFileData& scene)
+{
+    outScene.textures.clear();
+
     const auto& texTable = scene.texTable;
     if (texTable.empty())
     {
-        renderer.m_TxhdToSrv.clear();
-        renderer.m_Textures.clear();
         return;
     }
 
-    const u32 texCount = static_cast<u32>(texTable.size());
-    renderer.m_TxhdToSrv.resize(texCount);
-    renderer.m_Textures.resize(texCount);
+    IE_Assert(scene.TexBlob() != nullptr);
+    IE_Assert(scene.texBlobSize > 0);
+    const u8* texBlob = scene.TexBlob();
 
-    IE_Assert(!scene.texBlob.empty());
-    const u8* texBlob = scene.texBlob.data();
-
-    ResourceUploadBatch batch(renderer.GetDevice().Get());
-    batch.Begin();
-
-    for (u32 i = 0; i < texCount; ++i)
+    outScene.textures.resize(texTable.size());
+    for (u32 i = 0; i < texTable.size(); ++i)
     {
         const auto& tr = texTable[i];
-        const u8* ddsPtr = texBlob + static_cast<size_t>(tr.byteOffset);
+        IE_Assert(static_cast<size_t>(tr.byteOffset) + static_cast<size_t>(tr.byteSize) <= static_cast<size_t>(scene.texBlobSize));
+        IE_Assert(static_cast<size_t>(tr.subresourceOffset) + static_cast<size_t>(tr.subresourceCount) <= static_cast<size_t>(scene.texSubresources.size()));
 
-        ComPtr<ID3D12Resource> res;
-        IE_Check(CreateDDSTextureFromMemory(renderer.GetDevice().Get(), batch, ddsPtr, tr.byteSize, &res, false, 0, nullptr, nullptr));
-
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = res->GetDesc().Format;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = UINT32_MAX;
-
-        const u32 srvIdx = renderer.m_BindlessHeaps.CreateSRV(res, srv);
-        renderer.m_TxhdToSrv[i] = srvIdx;
-        renderer.m_Textures[i] = res;
-    }
-
-    batch.End(renderer.m_CommandQueue.Get()).wait();
-}
-
-void SceneLoader::LoadSamplers(Renderer& renderer, const SceneFileData& scene)
-{
-    const auto& sampTable = scene.samplers;
-    const u32 sampCount = static_cast<u32>(sampTable.size());
-    renderer.m_SampToHeap.resize(sampCount);
-
-    for (u32 i = 0; i < sampCount; ++i)
-    {
-        renderer.m_SampToHeap[i] = renderer.m_BindlessHeaps.CreateSampler(sampTable[i]);
+        LoadedTexture texture{};
+        texture.format = tr.format;
+        texture.dimension = tr.dimension;
+        texture.miscFlags = tr.miscFlags;
+        texture.miscFlags2 = tr.miscFlags2;
+        texture.width = tr.width;
+        texture.height = tr.height;
+        texture.depth = tr.depth;
+        texture.arraySize = tr.arraySize;
+        texture.mipLevels = tr.mipLevels;
+        texture.subresources = scene.texSubresources.data() + tr.subresourceOffset;
+        texture.subresourceCount = tr.subresourceCount;
+        texture.texelBytes = texBlob + static_cast<size_t>(tr.byteOffset);
+        texture.texelByteCount = static_cast<size_t>(tr.byteSize);
+        outScene.textures[i] = std::move(texture);
     }
 }
 
-void SceneLoader::LoadMaterials(Renderer& renderer, const SceneFileData& scene, const ComPtr<ID3D12GraphicsCommandList7>& cmd)
+void SceneLoader::LoadSamplers(LoadedScene& outScene, const SceneFileData& scene)
 {
+    outScene.samplers = scene.samplers;
+}
+
+void SceneLoader::LoadMaterials(LoadedScene& outScene, const SceneFileData& scene)
+{
+    outScene.materials.clear();
+
     const auto& matlTable = scene.materials;
-    const u32 matCount = static_cast<u32>(matlTable.size());
-    renderer.m_Materials.resize(matCount);
+    if (matlTable.empty())
+    {
+        LoadedMaterial fallback{};
+        fallback.metallicFactor = 0.0f;
+        fallback.roughnessFactor = 1.0f;
+        fallback.baseColorFactor = {1.0f, 1.0f, 1.0f, 1.0f};
+        fallback.alphaMode = AlphaMode_Opaque;
+        fallback.alphaCutoff = 0.5f;
+        fallback.normalScale = 1.0f;
+        fallback.baseColorTextureIndex = -1;
+        fallback.baseColorSamplerIndex = -1;
+        fallback.metallicRoughnessTextureIndex = -1;
+        fallback.metallicRoughnessSamplerIndex = -1;
+        fallback.normalTextureIndex = -1;
+        fallback.normalSamplerIndex = -1;
+        fallback.aoTextureIndex = -1;
+        fallback.aoSamplerIndex = -1;
+        fallback.emissiveTextureIndex = -1;
+        fallback.emissiveSamplerIndex = -1;
+        fallback.emissiveFactor = {0.0f, 0.0f, 0.0f};
+        fallback.doubleSided = 0;
+        outScene.materials.push_back(fallback);
+        return;
+    }
 
-    for (u32 i = 0; i < matCount; ++i)
+    outScene.materials.resize(matlTable.size());
+    for (u32 i = 0; i < matlTable.size(); ++i)
     {
         const auto& mr = matlTable[i];
-        Material m;
+        LoadedMaterial m{};
         m.baseColorFactor = {mr.baseColorFactor[0], mr.baseColorFactor[1], mr.baseColorFactor[2], mr.baseColorFactor[3]};
         m.metallicFactor = mr.metallicFactor;
         m.roughnessFactor = mr.roughnessFactor;
         m.normalScale = mr.normalScale;
         m.alphaCutoff = mr.alphaCutoff;
-
-        // BLEND not supported -> treat as mask
-        if (mr.flags & IEPack::MATF_ALPHA_BLEND || mr.flags & IEPack::MATF_ALPHA_MASK)
-        {
-            m.alphaMode = AlphaMode_Mask;
-        }
-        else
-        {
-            m.alphaMode = AlphaMode_Opaque;
-        }
-        m.doubleSided = !!(mr.flags & IEPack::MATF_DOUBLE_SIDED);
+        m.alphaMode = (mr.flags & IEPack::MATF_ALPHA_BLEND || mr.flags & IEPack::MATF_ALPHA_MASK) ? AlphaMode_Mask : AlphaMode_Opaque;
+        m.doubleSided = (mr.flags & IEPack::MATF_DOUBLE_SIDED) ? 1 : 0;
+        m.emissiveFactor = {mr.emissiveFactor[0], mr.emissiveFactor[1], mr.emissiveFactor[2]};
 
         auto mapTex = [&](int txhdIdx) -> i32 {
             if (txhdIdx < 0)
+            {
                 return -1;
-            IE_Assert(static_cast<size_t>(txhdIdx) < renderer.m_TxhdToSrv.size());
-            return static_cast<i32>(renderer.m_TxhdToSrv[static_cast<u32>(txhdIdx)]);
+            }
+            IE_Assert(static_cast<size_t>(txhdIdx) < outScene.textures.size());
+            return txhdIdx;
         };
         auto mapSamp = [&](u32 sampIdx, int txhdIdx) -> i32 {
             if (txhdIdx < 0 || sampIdx == UINT32_MAX)
+            {
                 return -1;
-            IE_Assert(static_cast<size_t>(sampIdx) < renderer.m_SampToHeap.size());
-            return static_cast<i32>(renderer.m_SampToHeap[sampIdx]);
+            }
+            IE_Assert(static_cast<size_t>(sampIdx) < outScene.samplers.size());
+            return static_cast<i32>(sampIdx);
         };
 
         m.baseColorTextureIndex = mapTex(mr.baseColorTx);
@@ -194,148 +150,77 @@ void SceneLoader::LoadMaterials(Renderer& renderer, const SceneFileData& scene, 
         m.normalSamplerIndex = mapSamp(mr.normalSampler, mr.normalTx);
         m.aoTextureIndex = mapTex(mr.occlusionTx);
         m.aoSamplerIndex = mapSamp(mr.occlusionSampler, mr.occlusionTx);
+        m.emissiveTextureIndex = mapTex(mr.emissiveTx);
+        m.emissiveSamplerIndex = mapSamp(mr.emissiveSampler, mr.emissiveTx);
 
-        renderer.m_Materials[i] = m;
-    }
-
-    if (!renderer.m_Materials.empty())
-    {
-        const u32 byteSize = static_cast<u32>(renderer.m_Materials.size() * sizeof(Material));
-
-        BufferCreateDesc bufferDesc{};
-        bufferDesc.heapType = D3D12_HEAP_TYPE_DEFAULT;
-        bufferDesc.viewKind = BufferCreateDesc::ViewKind::Structured;
-        bufferDesc.createSRV = true;
-        bufferDesc.createUAV = false;
-        bufferDesc.resourceFlags = D3D12_RESOURCE_FLAG_NONE;
-        bufferDesc.initialState = D3D12_RESOURCE_STATE_COMMON;
-        bufferDesc.finalState = bufferDesc.initialState;
-        bufferDesc.sizeInBytes = byteSize;
-        bufferDesc.strideInBytes = sizeof(Material);
-        bufferDesc.name = L"Materials";
-        renderer.m_MaterialsBuffer = renderer.CreateBuffer(nullptr, bufferDesc);
-
-        renderer.SetBufferData(cmd, renderer.m_MaterialsBuffer, renderer.m_Materials.data(), byteSize, 0);
+        outScene.materials[i] = m;
     }
 }
 
-void SceneLoader::BuildPrimitives(Renderer& renderer, const SceneFileData& scene, const ComPtr<ID3D12GraphicsCommandList7>& cmd)
+void SceneLoader::BuildPrimitives(LoadedScene& outScene, const SceneFileData& scene)
 {
+    outScene.primitives.clear();
+
     const auto& prims = scene.prims;
-    renderer.m_Primitives.clear();
-    renderer.m_Primitives.reserve(prims.size());
-
     if (prims.empty())
-        return;
-
-    const u8* vertBase = scene.vertBlob.data();
-    const u8* idxBase = scene.idxBlob.data();
-    const u8* mshlBase = scene.mshlBlob.data();
-    const u8* mlvtBase = scene.mlvtBlob.data();
-    const u8* mltrBase = scene.mltrBlob.data();
-    const u8* mlbdBase = scene.mlbdBlob.data();
-
-    const u32 primCount = static_cast<u32>(prims.size());
-    for (u32 primId = 0; primId < primCount; ++primId)
     {
-        const auto& r = prims[primId];
+        return;
+    }
 
+    IE_Assert(scene.VertBlob() && scene.IdxBlob() && scene.MshlBlob() && scene.MlvtBlob() && scene.MltrBlob() && scene.MlbdBlob());
+    const u8* vertBase = scene.VertBlob();
+    const u8* idxBase = scene.IdxBlob();
+    const u8* mshlBase = scene.MshlBlob();
+    const u8* mlvtBase = scene.MlvtBlob();
+    const u8* mltrBase = scene.MltrBlob();
+    const u8* mlbdBase = scene.MlbdBlob();
+
+    outScene.primitives.reserve(prims.size());
+    for (const IEPack::PrimRecord& r : prims)
+    {
         const auto* vtx = reinterpret_cast<const Vertex*>(vertBase + r.vertexByteOffset);
         const auto* idx = reinterpret_cast<const u32*>(idxBase + r.indexByteOffset);
         const auto* mlt = reinterpret_cast<const Meshlet*>(mshlBase + r.meshletsByteOffset);
         const auto* mlv = reinterpret_cast<const u32*>(mlvtBase + r.mlVertsByteOffset);
         const auto* mltb = mltrBase + r.mlTrisByteOffset;
-        const auto* mlb = reinterpret_cast<const meshopt_Bounds*>(mlbdBase + r.mlBoundsByteOffset);
+        const auto* mlb = reinterpret_cast<const MeshletBounds*>(mlbdBase + r.mlBoundsByteOffset);
 
-        Primitive prim{};
-        prim.materialIdx = r.materialIndex;
-        prim.meshletCount = r.meshletCount;
-
-        // Structured
-        BufferCreateDesc bufferDesc{};
-        bufferDesc.heapType = D3D12_HEAP_TYPE_DEFAULT;
-        bufferDesc.viewKind = BufferCreateDesc::ViewKind::Structured;
-        bufferDesc.createSRV = true;
-        bufferDesc.createUAV = false;
-        bufferDesc.resourceFlags = D3D12_RESOURCE_FLAG_NONE;
-        bufferDesc.initialState = D3D12_RESOURCE_STATE_COMMON;
-        bufferDesc.finalState = bufferDesc.initialState;
-        bufferDesc.sizeInBytes = r.vertexCount * sizeof(Vertex);
-        bufferDesc.strideInBytes = sizeof(Vertex);
-        bufferDesc.name = L"SceneLoader/Vertices";
-        prim.vertices = renderer.CreateBuffer(nullptr, bufferDesc);
-        renderer.SetBufferData(cmd, prim.vertices, vtx, r.vertexCount * sizeof(Vertex), 0);
-
-        bufferDesc.sizeInBytes = r.mlVertsCount * sizeof(u32);
-        bufferDesc.strideInBytes = sizeof(u32);
-        bufferDesc.name = L"SceneLoader/MeshletVerts";
-        prim.mlVerts = renderer.CreateBuffer(nullptr, bufferDesc);
-        renderer.SetBufferData(cmd, prim.mlVerts, mlv, r.mlVertsCount * sizeof(u32), 0);
-
-        bufferDesc.sizeInBytes = r.meshletCount * sizeof(meshopt_Bounds);
-        bufferDesc.strideInBytes = sizeof(meshopt_Bounds);
-        bufferDesc.name = L"SceneLoader/MeshletBounds";
-        prim.mlBounds = renderer.CreateBuffer(nullptr, bufferDesc);
-        renderer.SetBufferData(cmd, prim.mlBounds, mlb, r.meshletCount * sizeof(meshopt_Bounds), 0);
-
-        // Raw
-        bufferDesc.viewKind = BufferCreateDesc::ViewKind::Raw;
-        bufferDesc.sizeInBytes = r.meshletCount * sizeof(Meshlet);
-        bufferDesc.name = L"SceneLoader/Meshlets";
-        prim.meshlets = renderer.CreateBuffer(nullptr, bufferDesc);
-        renderer.SetBufferData(cmd, prim.meshlets, mlt, r.meshletCount * sizeof(Meshlet), 0);
-
-        bufferDesc.sizeInBytes = r.mlTrisByteCount * sizeof(u32);
-        bufferDesc.name = L"SceneLoader/MeshletTris";
-        prim.mlTris = renderer.CreateBuffer(nullptr, bufferDesc);
-        renderer.SetBufferData(cmd, prim.mlTris, mltb, r.mlTrisByteCount, 0);
-
-        // CPU data for RT BLAS
-        prim.cpuVertices = vtx;
+        LoadedPrimitive prim{};
+        prim.vertices = vtx;
         prim.vertexCount = r.vertexCount;
-        prim.cpuIndices = idx;
+        prim.indices = idx;
         prim.indexCount = r.indexCount;
+        prim.meshlets = mlt;
+        prim.meshletVertices = mlv;
+        prim.meshletVertexCount = r.mlVertsCount;
+        prim.meshletTriangles = mltb;
+        prim.meshletTriangleByteCount = r.mlTrisByteCount;
+        prim.meshletBounds = mlb;
+        prim.meshletCount = r.meshletCount;
+        prim.localBoundsCenter = r.localBoundsCenter;
+        prim.localBoundsRadius = r.localBoundsRadius;
+        IE_Assert(IsFiniteFloat3(prim.localBoundsCenter));
+        IE_Assert(IE_IsFinite(prim.localBoundsRadius) && prim.localBoundsRadius >= 0.0f);
 
-        renderer.m_Primitives.push_back(std::move(prim));
+        outScene.primitives.push_back(std::move(prim));
     }
 }
 
-void SceneLoader::SetupDepthResourcesAndLinearSampler(Renderer& renderer)
+void SceneLoader::BuildInstances(LoadedScene& outScene, const SceneFileData& scene)
 {
-    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-    srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
-    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srvDesc.Texture2D.MipLevels = 1;
+    outScene.instances.clear();
+    outScene.instances.reserve(scene.instances.size());
 
-    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
+    for (const IEPack::InstanceRecord& inst : scene.instances)
     {
-        renderer.m_DepthPre.dsvSrvIdx[i] = renderer.m_BindlessHeaps.CreateSRV(renderer.m_DepthPre.dsvs[i], srvDesc);
+        IE_Assert(inst.primIndex < outScene.primitives.size());
+        IE_Assert(inst.materialIndex < outScene.materials.size());
+        IE_Assert(IsFiniteFloat4x4(inst.world));
+
+        InstanceData instance{};
+        instance.primIndex = inst.primIndex;
+        instance.materialIndex = inst.materialIndex;
+        instance.world = inst.world;
+        outScene.instances.push_back(instance);
     }
-
-    D3D12_SAMPLER_DESC linearClampDesc{};
-    linearClampDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    linearClampDesc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    linearClampDesc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    linearClampDesc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    linearClampDesc.MaxAnisotropy = 1;
-    linearClampDesc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-    linearClampDesc.MaxLOD = D3D12_FLOAT32_MAX;
-
-    renderer.m_LinearSamplerIdx = renderer.m_BindlessHeaps.CreateSampler(linearClampDesc);
-}
-
-void SceneLoader::SubmitAndSync(Renderer& renderer, Renderer::PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd)
-{
-    IE_Check(cmd->Close());
-    ID3D12CommandList* pCmd = cmd.Get();
-    renderer.m_CommandQueue->ExecuteCommandLists(1, &pCmd);
-
-    const u64 fenceToWait = ++frameData.frameFenceValue;
-    IE_Check(renderer.m_CommandQueue->Signal(frameData.frameFence.Get(), fenceToWait));
-
-    HANDLE evt = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    IE_Check(frameData.frameFence->SetEventOnCompletion(fenceToWait, evt));
-    WaitForSingleObject(evt, INFINITE);
-    CloseHandle(evt);
 }

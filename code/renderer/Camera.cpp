@@ -1,122 +1,115 @@
-﻿// Iškur Engine
+// Iskur Engine
 // Copyright (c) 2025 Tristan Marrec
 // Licensed under the MIT License.
 // See the LICENSE file in the project root for license information.
 
 #include "Camera.h"
 
+#include "common/StringUtils.h"
 #include "window/Window.h"
 
 #include <DirectXMath.h>
+#include <sstream>
 
 namespace
 {
-POINT GetClientCenter(HWND hwnd)
+struct CameraPreset
 {
-    RECT r;
-    GetClientRect(hwnd, &r);
-    return {r.left + (r.right - r.left) / 2, r.top + (r.bottom - r.top) / 2};
+    String sceneName;
+    XMFLOAT3 position{};
+    f32 yaw = 0.0f;
+    f32 pitch = 0.0f;
+};
+
+XMFLOAT3 ComputeFrontFromYawPitch(const f32 yawDeg, const f32 pitchDeg)
+{
+    const f32 yaw = IE_ToRadians(yawDeg);
+    const f32 pitch = IE_ToRadians(pitchDeg);
+    const f32 cx = IE_Cosf(yaw) * IE_Cosf(pitch);
+    const f32 cy = IE_Sinf(pitch);
+    const f32 cz = IE_Sinf(yaw) * IE_Cosf(pitch);
+
+    XMVECTOR dir = XMVector3Normalize(XMVectorSet(cx, cy, cz, 0.0f));
+    XMFLOAT3 front{};
+    XMStoreFloat3(&front, dir);
+    return front;
 }
 
-void CenterCursorOnClient(HWND hwnd)
+bool TryParsePresetLine(const String& line, CameraPreset& outPreset)
 {
-    POINT c = GetClientCenter(hwnd);
-    ClientToScreen(hwnd, &c);
-    SetCursorPos(c.x, c.y);
+    if (line.empty() || line[0] == '#')
+    {
+        return false;
+    }
+
+    std::istringstream stream(line);
+    if (!(stream >> outPreset.sceneName >> outPreset.position.x >> outPreset.position.y >> outPreset.position.z >> outPreset.yaw >> outPreset.pitch))
+    {
+        return false;
+    }
+
+    outPreset.sceneName = ToLowerAscii(outPreset.sceneName);
+    return true;
 }
 
-void ComputeMouseOffsetFromClient(i32 x, i32 y, HWND hwnd, XMFLOAT2& out)
+bool TryLoadPreset(const String& sceneName, CameraPreset& outPreset)
 {
-    POINT c = GetClientCenter(hwnd);
-    out.x = static_cast<f32>(x - c.x);
-    out.y = static_cast<f32>(y - c.y);
+    std::ifstream file("data/camera_presets.txt");
+    if (!file.is_open())
+    {
+        return false;
+    }
+
+    const String sceneNameLower = ToLowerAscii(sceneName);
+    String line;
+    while (std::getline(file, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+
+        CameraPreset preset{};
+        if (!TryParsePresetLine(line, preset))
+        {
+            continue;
+        }
+
+        if (preset.sceneName == sceneNameLower)
+        {
+            outPreset = preset;
+            return true;
+        }
+    }
+
+    return false;
 }
 } // namespace
 
+Camera::Camera(Window& window) : m_Window(window)
+{
+}
+
 void Camera::Init()
 {
-    ConfigurePerspective(Window::GetInstance().GetAspectRatio(), IE_PI_4, IE_PI_4, 0.01f, 0, 0);
+    ConfigurePerspective(m_Window.GetAspectRatio(), IE_PI_4, IE_PI_4, 0.01f, 0, 0);
 }
 
 void Camera::LoadSceneConfig(const String& sceneName)
 {
-    if (sceneName == "Bistro")
+    CameraPreset preset{};
+    if (TryLoadPreset(sceneName, preset))
     {
-        m_Position = {-17.504068, 6.6169343, -0.6422801};
-        m_Yaw = 360.59894;
-        m_Pitch = -14.899944;
-        m_Front = {0.96632355, -0.2571319, 0.010101734};
+        m_Position = preset.position;
+        m_Yaw = preset.yaw;
+        m_Pitch = preset.pitch;
+        m_Front = ComputeFrontFromYawPitch(m_Yaw, m_Pitch);
     }
-    else if (sceneName == "Sponza")
-    {
-        m_Position = {-6.7842293, 2.0273955, -1.6356962};
-        m_Yaw = 393.5991;
-        m_Pitch = -2.6999128;
-        m_Front = {0.8320053, -0.04710493, 0.55276424};
-    }
-    else if (sceneName == "Sponza2")
-    {
-        m_Position = {12.435444, 1.1098297, -0.71890974};
-        m_Yaw = 532.3988;
-        m_Pitch = 12.500055;
-        m_Front = {-0.96771693, 0.21644057, 0.12914129};
-    }
-    else if (sceneName == "San-Miguel")
-    {
-        m_Position = {20.144629, 11.589096, 5.851092};
-        m_Yaw = 208.59715;
-        m_Pitch = -34.299847;
-        m_Front = {-0.7253213, -0.5635238, -0.39541113};
-    }
-    else if (sceneName == "AlphaBlendModeTest")
-    {
-        m_Position = {-0.04540815, 2.3986704, 4.6940866};
-        m_Yaw = 270.3981;
-        m_Pitch = -11.699936;
-        m_Front = {0.00680406, -0.20278622, -0.9791994};
-    }
-    else if (sceneName == "NormalTangentTest" || sceneName == "NormalTangentMirrorTest")
-    {
-        m_Position = {0.014327605, 0.088846914, 2.6952298};
-        m_Yaw = 270.79776;
-        m_Pitch = -2.6999424;
-        m_Front = {0.013907751, -0.04710545, -0.9987931};
-    }
-    else if (sceneName == "MetalRoughSpheres" || sceneName == "MetalRoughSpheresNoTextures")
-    {
-        m_Position = {0.28876197, 0.8269017, 10.415524};
-        m_Yaw = 270.1988;
-        m_Pitch = -4.8999395;
-        m_Front = {0.0034567926, -0.08541588, -0.9963394};
-    }
-    else if (sceneName == "DamagedHelmet")
-    {
-        m_Position = {-1.2710273, 1.1039577, 1.8417152};
-        m_Yaw = 303.39874;
-        m_Pitch = -26.899942;
-        m_Front = {0.49090138, -0.45243382, -0.7445263};
-    }
-    else if (sceneName == "SSAO")
-    {
-        m_Position = {1.1467777, -0.1576769, 2.5923784};
-        m_Yaw = 251.5986;
-        m_Pitch = -29.49994;
-        m_Front = {-0.27474692, -0.49242267, -0.8258535};
-    }
-    else if (sceneName == "ABeautifulGame")
-    {
-        m_Position = {-13.332466, 6.18413, -1.7803445};
-        m_Yaw = 373.19904;
-        m_Pitch = -27.699947;
-        m_Front = {0.8620044, -0.46484122, 0.2021658};
-    }
-    else if (sceneName == "CompareAmbientOcclusion")
-    {
-        m_Position = {-0.0812394544, 1.96597433, 2.14788842};
-        m_Yaw = 270.798035;
-        m_Pitch = -39.2999687;
-        m_Front = {0.0107780313, -0.633380473, -0.773765504};
-    }
+}
+
+void Camera::ResetHistory()
+{
+    m_HavePrevVP = false;
 }
 
 void Camera::Update(f32 elapsedSeconds)
@@ -131,7 +124,6 @@ void Camera::Update(f32 elapsedSeconds)
         m_KeysPressed.space = false;
     }
 
-    // Movement
     XMVECTOR front = XMLoadFloat3(&m_Front);
     XMVECTOR up = XMLoadFloat3(&m_Up);
     XMVECTOR right = XMVector3Normalize(XMVector3Cross(front, up));
@@ -177,7 +169,6 @@ void Camera::Update(f32 elapsedSeconds)
     pos = XMVectorAdd(pos, XMVectorScale(move, scale));
     XMStoreFloat3(&m_Position, pos);
 
-    //  Mouse look
     if (m_MouseOffset.x != 0.0f || m_MouseOffset.y != 0.0f)
     {
         m_Yaw += m_MouseOffset.x * m_MouseSensitivity;
@@ -185,20 +176,26 @@ void Camera::Update(f32 elapsedSeconds)
 
         f32 yaw = IE_ToRadians(m_Yaw);
         f32 pitch = IE_ToRadians(m_Pitch);
-        f32 cx = cosf(yaw) * cosf(pitch);
-        f32 cy = sinf(pitch);
-        f32 cz = sinf(yaw) * cosf(pitch);
+        f32 cx = IE_Cosf(yaw) * IE_Cosf(pitch);
+        f32 cy = IE_Sinf(pitch);
+        f32 cz = IE_Sinf(yaw) * IE_Cosf(pitch);
         XMVECTOR dir = XMVector3Normalize(XMVectorSet(cx, cy, cz, 0.0f));
         XMStoreFloat3(&m_Front, dir);
         front = dir;
     }
     m_MouseOffset = {0.f, 0.f};
+}
 
-    // Camera frame data
+void Camera::BuildFrameData()
+{
+    XMVECTOR pos = XMLoadFloat3(&m_Position);
+    XMVECTOR front = XMLoadFloat3(&m_Front);
+    XMVECTOR up = XMLoadFloat3(&m_Up);
+
     f32 f = 1.0f / tanf(m_Yfov * 0.5f);
     f32 fC = 1.0f / tanf(m_FrustumCullingYfov * 0.5f);
 
-    XMMATRIX P_jit = XMMatrixSet(f / m_AspectRatio, 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, m_JitterX, m_JitterY, m_Znear, 0);
+    XMMATRIX P_jit = XMMatrixSet(f / m_AspectRatio, 0, 0, 0, 0, f, 0, 0, -m_JitterX, -m_JitterY, 0, -1, 0, 0, m_Znear, 0);
     XMMATRIX P_noj = XMMatrixSet(f / m_AspectRatio, 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, 0, 0, m_Znear, 0);
     XMMATRIX P_cull = XMMatrixSet(fC / m_AspectRatio, 0, 0, 0, 0, fC, 0, 0, 0, 0, 0, -1, 0, 0, m_Znear, 0);
 
@@ -242,16 +239,25 @@ void Camera::Update(f32 elapsedSeconds)
     if (!m_HavePrevVP)
     {
         m_FrameData.prevViewProjNoJ = m_FrameData.viewProjNoJ;
+        m_FrameData.prevView = m_FrameData.view;
+        m_FrameData.prevProjectionNoJitter = m_FrameData.projectionNoJitter;
         m_HavePrevVP = true;
     }
     else
     {
         m_FrameData.prevViewProjNoJ = m_PrevViewProjNoJ;
+        m_FrameData.prevView = m_PrevView;
+        m_FrameData.prevProjectionNoJitter = m_PrevProjectionNoJitter;
     }
+    XMStoreFloat4x4(&m_PrevView, V);
+    XMStoreFloat4x4(&m_PrevProjectionNoJitter, P_noj);
     XMStoreFloat4x4(&m_PrevViewProjNoJ, VP_noj);
 
     std::memcpy(m_FrameData.frustumCullingPlanes, m_FrustumCullingPlanes, sizeof(m_FrustumCullingPlanes));
     m_FrameData.position = m_Position;
+    m_FrameData.yaw = m_Yaw;
+    m_FrameData.pitch = m_Pitch;
+    m_FrameData.front = m_Front;
     m_FrameData.znearfar = znearfar;
 }
 
@@ -338,16 +344,15 @@ void Camera::OnKeyUp(u64 key)
     }
 }
 
-void Camera::OnMouseMove(i32 x, i32 y)
+void Camera::OnRawMouseDelta(i32 dx, i32 dy)
 {
     if (!m_IsFocused)
     {
         return;
     }
 
-    const HWND hwnd = Window::GetInstance().GetHwnd();
-    ComputeMouseOffsetFromClient(x, y, hwnd, m_MouseOffset);
-    CenterCursorOnClient(hwnd);
+    m_MouseOffset.x += static_cast<f32>(dx);
+    m_MouseOffset.y += static_cast<f32>(dy);
 }
 
 void Camera::OnLostFocus()
@@ -389,16 +394,35 @@ void Camera::ConfigurePerspective(f32 aspectRatio, f32 yfov, f32 frustumCullingY
 void Camera::SetFocus(bool value)
 {
     m_IsFocused = value;
+    m_MouseOffset = {0.f, 0.f};
 
-    const HWND hwnd = Window::GetInstance().GetHwnd();
+    HWND hwnd = m_Window.GetHwnd();
+    if (!hwnd)
+    {
+        return;
+    }
+
     if (m_IsFocused)
     {
-        POINT c = GetClientCenter(hwnd);
-        ComputeMouseOffsetFromClient(c.x, c.y, hwnd, m_MouseOffset);
-        CenterCursorOnClient(hwnd);
+        RECT clientRect{};
+        GetClientRect(hwnd, &clientRect);
+
+        POINT topLeft{clientRect.left, clientRect.top};
+        POINT bottomRight{clientRect.right, clientRect.bottom};
+        ClientToScreen(hwnd, &topLeft);
+        ClientToScreen(hwnd, &bottomRight);
+
+        RECT clipRect{topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
+        ClipCursor(&clipRect);
+        SetCapture(hwnd);
+
+        POINT center{(topLeft.x + bottomRight.x) / 2, (topLeft.y + bottomRight.y) / 2};
+        SetCursorPos(center.x, center.y);
     }
     else
     {
-        m_MouseOffset = {0.f, 0.f};
+        ClipCursor(nullptr);
+        ReleaseCapture();
     }
 }
+
