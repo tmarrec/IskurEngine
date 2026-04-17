@@ -11,6 +11,7 @@
 #include "RenderDevice.h"
 #include "SceneLoader.h"
 #include "SceneUtils.h"
+#include "common/IskurPackFormat.h"
 
 SceneResources::SceneResources(RenderDevice& renderDevice, BindlessHeaps& bindlessHeaps) : m_RenderDevice(renderDevice), m_BindlessHeaps(bindlessHeaps)
 {
@@ -44,39 +45,55 @@ void SceneResources::ImportScene(const LoadedScene& scene, const ComPtr<ID3D12Gr
 void SceneResources::RefreshAvailableScenes()
 {
     m_AvailableScenes = SceneUtils::EnumerateAvailableScenes();
+    m_LoadableScenes.clear();
+    m_LoadableScenes.reserve(m_AvailableScenes.size());
+    for (const SceneUtils::SceneListEntry& scene : m_AvailableScenes)
+    {
+        if (!scene.outOfDate)
+        {
+            m_LoadableScenes.push_back(scene.name);
+        }
+    }
+
     m_CurrentSceneFile = SceneUtils::ResolveSceneNameFromList(m_CurrentSceneFile, m_AvailableScenes);
 
     if (!m_PendingSceneFile.empty())
     {
-        const String resolvedPending = SceneUtils::ResolveSceneNameFromList(m_PendingSceneFile, m_AvailableScenes);
-
-        bool found = false;
-        for (const String& scene : m_AvailableScenes)
-        {
-            if (SceneUtils::EqualsIgnoreCaseAscii(scene, resolvedPending))
-            {
-                m_PendingSceneFile = scene;
-                found = true;
-                break;
-            }
-        }
-
-        if (!found)
+        const SceneUtils::SceneListEntry* pendingScene = FindAvailableScene(m_PendingSceneFile);
+        if (pendingScene == nullptr)
         {
             IE_LogWarn("Pending scene '{}' no longer exists, clearing pending switch", m_PendingSceneFile);
             m_PendingSceneFile.clear();
+        }
+        else if (pendingScene->outOfDate)
+        {
+            IE_LogWarn("Pending scene '{}' is incompatible (pack version {}, expected {}), clearing pending switch", pendingScene->name, pendingScene->packVersion,
+                       IEPack::PACK_VERSION_LATEST);
+            m_PendingSceneFile.clear();
+        }
+        else
+        {
+            m_PendingSceneFile = pendingScene->name;
         }
     }
 }
 
 void SceneResources::RequestSceneSwitch(const String& sceneFile)
 {
-    const String resolvedScene = ResolveSceneName(sceneFile);
-    if (resolvedScene.empty())
+    const SceneUtils::SceneListEntry* scene = FindAvailableScene(sceneFile);
+    if (scene == nullptr)
     {
         return;
     }
 
+    if (scene->outOfDate)
+    {
+        IE_LogWarn("Scene '{}' is incompatible (pack version {}, expected {}). Repack it with a scene packer that produces version {}.", scene->name, scene->packVersion,
+                   IEPack::PACK_VERSION_LATEST, IEPack::PACK_VERSION_LATEST);
+        return;
+    }
+
+    const String& resolvedScene = scene->name;
     if (SceneUtils::EqualsIgnoreCaseAscii(resolvedScene, m_CurrentSceneFile))
     {
         return;
@@ -111,9 +128,25 @@ const String& SceneResources::GetPendingSceneFile() const
     return m_PendingSceneFile;
 }
 
-const Vector<String>& SceneResources::GetAvailableScenes() const
+const Vector<SceneUtils::SceneListEntry>& SceneResources::GetAvailableScenes() const
 {
     return m_AvailableScenes;
+}
+
+const Vector<String>& SceneResources::GetLoadableScenes() const
+{
+    return m_LoadableScenes;
+}
+
+const SceneUtils::SceneListEntry* SceneResources::FindAvailableScene(const String& sceneFile) const
+{
+    return SceneUtils::FindSceneInList(sceneFile, m_AvailableScenes);
+}
+
+bool SceneResources::CanLoadScene(const String& sceneFile) const
+{
+    const SceneUtils::SceneListEntry* scene = FindAvailableScene(sceneFile);
+    return scene != nullptr && !scene->outOfDate;
 }
 
 void SceneResources::SetCurrentSceneFile(const String& sceneFile)

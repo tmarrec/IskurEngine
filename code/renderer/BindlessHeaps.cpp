@@ -5,6 +5,32 @@
 
 #include "BindlessHeaps.h"
 
+namespace
+{
+u32 AllocateDescriptorIndex(Array<u32, BindlessHeapType_Count>& nextIndex, Array<Vector<u32>, BindlessHeapType_Count>& freeIndices, const BindlessHeapType heapType, const u32 capacity)
+{
+    if (!freeIndices[heapType].empty())
+    {
+        const u32 index = freeIndices[heapType].back();
+        freeIndices[heapType].pop_back();
+        return index;
+    }
+
+    IE_Assert(nextIndex[heapType] < capacity);
+    return nextIndex[heapType]++;
+}
+
+void FreeDescriptorIndex(Array<Vector<u32>, BindlessHeapType_Count>& freeIndices, const BindlessHeapType heapType, const u32 index)
+{
+    if (index == UINT32_MAX)
+    {
+        return;
+    }
+
+    freeIndices[heapType].push_back(index);
+}
+} // namespace
+
 void BindlessHeaps::Init(const ComPtr<ID3D12Device14>& device)
 {
     m_Device = device;
@@ -35,9 +61,8 @@ void BindlessHeaps::Init(const ComPtr<ID3D12Device14>& device)
 
 u32 BindlessHeaps::CreateSRV(const ComPtr<ID3D12Resource>& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& srvDesc)
 {
-    IE_Assert(m_NextIndex[BindlessHeapType_CbvSrvUav] < m_Capacity[BindlessHeapType_CbvSrvUav]);
     D3D12_CPU_DESCRIPTOR_HANDLE handle = m_Heaps[BindlessHeapType_CbvSrvUav]->GetCPUDescriptorHandleForHeapStart();
-    const u32 index = m_NextIndex[BindlessHeapType_CbvSrvUav]++;
+    const u32 index = AllocateDescriptorIndex(m_NextIndex, m_FreeIndices, BindlessHeapType_CbvSrvUav, m_Capacity[BindlessHeapType_CbvSrvUav]);
     handle.ptr += static_cast<size_t>(index) * m_HandleSize[BindlessHeapType_CbvSrvUav];
     m_Device->CreateShaderResourceView(resource.Get(), &srvDesc, handle);
     return index;
@@ -45,9 +70,8 @@ u32 BindlessHeaps::CreateSRV(const ComPtr<ID3D12Resource>& resource, const D3D12
 
 u32 BindlessHeaps::CreateUAV(const ComPtr<ID3D12Resource>& resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC& uavDesc)
 {
-    IE_Assert(m_NextIndex[BindlessHeapType_CbvSrvUav] < m_Capacity[BindlessHeapType_CbvSrvUav]);
     D3D12_CPU_DESCRIPTOR_HANDLE handle = m_Heaps[BindlessHeapType_CbvSrvUav]->GetCPUDescriptorHandleForHeapStart();
-    const u32 index = m_NextIndex[BindlessHeapType_CbvSrvUav]++;
+    const u32 index = AllocateDescriptorIndex(m_NextIndex, m_FreeIndices, BindlessHeapType_CbvSrvUav, m_Capacity[BindlessHeapType_CbvSrvUav]);
     handle.ptr += static_cast<size_t>(index) * m_HandleSize[BindlessHeapType_CbvSrvUav];
     m_Device->CreateUnorderedAccessView(resource.Get(), nullptr, &uavDesc, handle);
     return index;
@@ -55,17 +79,25 @@ u32 BindlessHeaps::CreateUAV(const ComPtr<ID3D12Resource>& resource, const D3D12
 
 u32 BindlessHeaps::CreateSampler(const D3D12_SAMPLER_DESC& samplerDesc)
 {
-    IE_Assert(m_NextIndex[BindlessHeapType_Sampler] < m_Capacity[BindlessHeapType_Sampler]);
     D3D12_CPU_DESCRIPTOR_HANDLE handle = m_Heaps[BindlessHeapType_Sampler]->GetCPUDescriptorHandleForHeapStart();
-    const u32 index = m_NextIndex[BindlessHeapType_Sampler]++;
+    const u32 index = AllocateDescriptorIndex(m_NextIndex, m_FreeIndices, BindlessHeapType_Sampler, m_Capacity[BindlessHeapType_Sampler]);
     handle.ptr += static_cast<size_t>(index) * m_HandleSize[BindlessHeapType_Sampler];
     m_Device->CreateSampler(&samplerDesc, handle);
     return index;
 }
 
+void BindlessHeaps::FreeCbvSrvUav(const u32 index)
+{
+    FreeDescriptorIndex(m_FreeIndices, BindlessHeapType_CbvSrvUav, index);
+}
+
 void BindlessHeaps::ResetAll()
 {
     m_NextIndex.fill(0);
+    for (Vector<u32>& freeIndices : m_FreeIndices)
+    {
+        freeIndices.clear();
+    }
 }
 
 const Array<ID3D12DescriptorHeap*, BindlessHeapType_Count>& BindlessHeaps::GetDescriptorHeaps() const

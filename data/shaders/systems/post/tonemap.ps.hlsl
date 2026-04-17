@@ -57,13 +57,6 @@ float3 AgXDecode(float3 color)
     return saturate(color);
 }
 
-float ComputeSaturation(float3 color)
-{
-    float maxC = max(color.r, max(color.g, color.b));
-    float minC = min(color.r, min(color.g, color.b));
-    return (maxC > 1e-6f) ? ((maxC - minC) / maxC) : 0.0f;
-}
-
 float3 LinearToSRGB(float3 color)
 {
     float3 lo = color * 12.92f;

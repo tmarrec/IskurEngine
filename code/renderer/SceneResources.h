@@ -9,6 +9,7 @@
 #include "Primitive.h"
 #include "Raytracing.h"
 #include "RenderSceneTypes.h"
+#include "SceneUtils.h"
 #include "Texture.h"
 #include "common/Types.h"
 #include "shaders/CPUGPU.h"
@@ -32,7 +33,10 @@ class SceneResources
     bool HasPendingSceneSwitch() const;
     const String& GetCurrentSceneFile() const;
     const String& GetPendingSceneFile() const;
-    const Vector<String>& GetAvailableScenes() const;
+    const Vector<SceneUtils::SceneListEntry>& GetAvailableScenes() const;
+    const Vector<String>& GetLoadableScenes() const;
+    const SceneUtils::SceneListEntry* FindAvailableScene(const String& sceneFile) const;
+    bool CanLoadScene(const String& sceneFile) const;
 
     void SetCurrentSceneFile(const String& sceneFile);
     void ClearPendingSceneSwitch();
@@ -75,7 +79,8 @@ class SceneResources
     Vector<InstanceData> m_Instances;
     bool m_InstancesDirty = true;
 
-    Vector<String> m_AvailableScenes;
+    Vector<SceneUtils::SceneListEntry> m_AvailableScenes;
+    Vector<String> m_LoadableScenes;
     String m_CurrentSceneFile;
     String m_PendingSceneFile;
 

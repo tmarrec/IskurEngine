@@ -174,6 +174,9 @@ void SceneLoader::BuildPrimitives(LoadedScene& outScene, const SceneFileData& sc
     const u8* mlvtBase = scene.MlvtBlob();
     const u8* mltrBase = scene.MltrBlob();
     const u8* mlbdBase = scene.MlbdBlob();
+    const i32* ommIndexBase = scene.ommIndices.empty() ? nullptr : scene.ommIndices.data();
+    const auto* ommDescBase = scene.ommDescs.empty() ? nullptr : scene.ommDescs.data();
+    const u8* ommDataBase = scene.OmmDataBlob();
 
     outScene.primitives.reserve(prims.size());
     for (const IEPack::PrimRecord& r : prims)
@@ -184,6 +187,9 @@ void SceneLoader::BuildPrimitives(LoadedScene& outScene, const SceneFileData& sc
         const auto* mlv = reinterpret_cast<const u32*>(mlvtBase + r.mlVertsByteOffset);
         const auto* mltb = mltrBase + r.mlTrisByteOffset;
         const auto* mlb = reinterpret_cast<const MeshletBounds*>(mlbdBase + r.mlBoundsByteOffset);
+        const auto* ommIdx = r.ommIndexCount ? (ommIndexBase + r.ommIndexOffset) : nullptr;
+        const auto* ommDesc = r.ommDescCount ? (ommDescBase + r.ommDescOffset) : nullptr;
+        const auto* ommData = r.ommDataByteSize ? (ommDataBase + r.ommDataByteOffset) : nullptr;
 
         LoadedPrimitive prim{};
         prim.vertices = vtx;
@@ -196,6 +202,13 @@ void SceneLoader::BuildPrimitives(LoadedScene& outScene, const SceneFileData& sc
         prim.meshletTriangles = mltb;
         prim.meshletTriangleByteCount = r.mlTrisByteCount;
         prim.meshletBounds = mlb;
+        prim.ommIndices = ommIdx;
+        prim.ommIndexCount = r.ommIndexCount;
+        prim.ommDescs = ommDesc;
+        prim.ommDescCount = r.ommDescCount;
+        prim.ommData = ommData;
+        prim.ommDataByteCount = r.ommDataByteSize;
+        prim.ommFormat = r.ommFormat;
         prim.meshletCount = r.meshletCount;
         prim.localBoundsCenter = r.localBoundsCenter;
         prim.localBoundsRadius = r.localBoundsRadius;

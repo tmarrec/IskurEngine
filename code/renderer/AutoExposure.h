@@ -22,6 +22,7 @@ class AutoExposure
   public:
     void CreateResources(RenderDevice& renderDevice, BindlessHeaps& bindlessHeaps);
     void CreatePipelines(const ComPtr<ID3D12Device14>& device, const Vector<String>& globalDefines);
+    void InvalidateDescriptorIndices();
 
     void Pass(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers, const BindlessHeaps& bindlessHeaps, GpuResource& hdrTexture, u32 hdrSrvIndex, u32 depthSrvIndex,
               const XMUINT2& renderSize, f32 frameTimeMs);

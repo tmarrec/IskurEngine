@@ -20,6 +20,11 @@ enum ShaderType : u8
     IE_SHADER_TYPE_LIB
 };
 
+namespace ShaderRequirements
+{
+inline constexpr D3D_SHADER_MODEL kRequiredShaderModel = D3D_SHADER_MODEL_6_9;
+}
+
 class Shader
 {
   public:
@@ -36,6 +41,7 @@ class Shader
     static bool ReloadOrCreate(SharedPtr<Shader>& shader, ShaderType type, const String& filename, const Vector<String>& defines);
     static void ResetReloadStats();
     static ReloadStats GetReloadStats();
+    static void VerifyRequiredShaderModelSupport(const ComPtr<ID3D12Device14>& device);
 
     D3D12_SHADER_BYTECODE GetBytecode() const;
 
@@ -59,4 +65,3 @@ class Shader
     ComPtr<ID3D12RootSignature> m_CachedRootSig;
     ID3D12Device14* m_CachedRootSigDevice = nullptr;
 };
-

@@ -20,6 +20,7 @@ class BindlessHeaps
     u32 CreateSRV(const ComPtr<ID3D12Resource>& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& srvDesc);
     u32 CreateUAV(const ComPtr<ID3D12Resource>& resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC& uavDesc);
     u32 CreateSampler(const D3D12_SAMPLER_DESC& samplerDesc);
+    void FreeCbvSrvUav(u32 index);
     void ResetAll();
 
     const Array<ID3D12DescriptorHeap*, BindlessHeapType_Count>& GetDescriptorHeaps() const;
@@ -30,6 +31,7 @@ class BindlessHeaps
     Array<u32, BindlessHeapType_Count> m_NextIndex{};
     Array<u32, BindlessHeapType_Count> m_Capacity{};
     Array<u32, BindlessHeapType_Count> m_HandleSize{};
+    Array<Vector<u32>, BindlessHeapType_Count> m_FreeIndices{};
     Array<ComPtr<ID3D12DescriptorHeap>, BindlessHeapType_Count> m_Heaps{};
     Array<ID3D12DescriptorHeap*, BindlessHeapType_Count> m_DescriptorHeaps{};
 };

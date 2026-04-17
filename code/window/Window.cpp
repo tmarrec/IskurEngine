@@ -10,6 +10,8 @@
 #include <imgui_impl_win32.h>
 
 #include "Core.h"
+#include "renderer/RuntimeState.h"
+#include "renderer/Streamline.h"
 #include "common/UtfConversion.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -175,6 +177,14 @@ void Window::Run(Core& core, const RunInfo& runInfo)
     {
         if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
         {
+            if (msg.message == Streamline::GetPCLStatsWindowMessage())
+            {
+                // This engine's present-frame index always points at the next frame
+                // that will run simulation and present, so the ping can be tagged
+                // immediately without deferring it into the simulation step.
+                Streamline::SetPCLMarker(sl::PCLMarker::ePCLatencyPing, m_Core->GetRenderer().GetStreamlineFrameIndex());
+            }
+
             TranslateMessage(&msg);
             DispatchMessage(&msg);
 
@@ -188,7 +198,10 @@ void Window::Run(Core& core, const RunInfo& runInfo)
                 continue;
             }
 
+            Streamline::SleepReflex(m_Core->GetRenderer().GetStreamlineFrameIndex());
+            Streamline::SetPCLMarker(sl::PCLMarker::eSimulationStart, m_Core->GetRenderer().GetStreamlineFrameIndex());
             m_Core->OnUpdate();
+            Streamline::SetPCLMarker(sl::PCLMarker::eSimulationEnd, m_Core->GetRenderer().GetStreamlineFrameIndex());
             m_Core->OnRender();
 
             const steady_clock::time_point now = steady_clock::now();

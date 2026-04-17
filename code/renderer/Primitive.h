@@ -24,6 +24,11 @@ struct Primitive
     // BLAS resources
     SharedPtr<Buffer> blas;
     SharedPtr<Buffer> blasScratch;
+    SharedPtr<Buffer> ommArray;
+    SharedPtr<Buffer> ommArrayScratch;
+    SharedPtr<Buffer> ommIndices;
+    SharedPtr<Buffer> ommDescs;
+    SharedPtr<Buffer> ommData;
 
     SharedPtr<Buffer> rtVertices;
     SharedPtr<Buffer> rtIndices;

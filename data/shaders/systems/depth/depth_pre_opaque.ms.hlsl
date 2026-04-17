@@ -4,6 +4,7 @@
 // See the LICENSE file in the project root for license information.
 
 #include "CPUGPU.h"
+#include "include/geometry/meshlet.hlsli"
 
 ConstantBuffer<VertexConstants> VertexConstants : register(b1);
 ConstantBuffer<PrimitiveConstants> Constants : register(b0);
@@ -21,29 +22,6 @@ struct VertexOut
 {
     float4 clipPos : SV_Position;
 };
-
-uint3 GetTriangle(uint triangleOffset, uint index)
-{
-    ByteAddressBuffer meshletTrianglesBuffer = ResourceDescriptorHeap[Constants.meshletTrianglesBufferIndex];
-
-    uint baseOffset = triangleOffset + index * 3;
-    uint chunk0 = meshletTrianglesBuffer.Load(baseOffset & ~3);
-    uint chunk1 = meshletTrianglesBuffer.Load((baseOffset + 4) & ~3);
-    uint byteOffset = baseOffset & 3;
-
-    uint3 tri;
-    tri.z = (chunk0 >> (byteOffset * 8)) & 0xFF;
-    tri.y = ((byteOffset + 1) < 4) ? (chunk0 >> ((byteOffset + 1) * 8)) & 0xFF : (chunk1 >> ((byteOffset + 1 - 4) * 8)) & 0xFF;
-    tri.x = ((byteOffset + 2) < 4) ? (chunk0 >> ((byteOffset + 2) * 8)) & 0xFF : (chunk1 >> ((byteOffset + 2 - 4) * 8)) & 0xFF;
-
-    return tri;
-}
-
-uint GetVertexIndex(uint vertexOffset, uint index)
-{
-    StructuredBuffer<uint> meshletVerticesBuffer = ResourceDescriptorHeap[Constants.meshletVerticesBufferIndex];
-    return meshletVerticesBuffer[vertexOffset + index];
-}
 
 [RootSignature(ROOT_SIG)]
 [OutputTopology("triangle")]
@@ -63,34 +41,23 @@ void main(
         return;
     }
 
-    static const uint MESHLET_BYTE_SIZE = 12;
     ByteAddressBuffer meshletsRaw = ResourceDescriptorHeap[Constants.meshletsBufferIndex];
-    uint3 meshletRaw = meshletsRaw.Load3(meshletIndex * MESHLET_BYTE_SIZE);
-
-    uint vertexOffset = meshletRaw.x;
-    uint triangleOffset = meshletRaw.y;
-    uint vertexCount = meshletRaw.z & 0xFFFF;
-    uint triangleCount = meshletRaw.z >> 16;
+    ByteAddressBuffer meshletTrianglesBuffer = ResourceDescriptorHeap[Constants.meshletTrianglesBufferIndex];
+    StructuredBuffer<uint> meshletVerticesBuffer = ResourceDescriptorHeap[Constants.meshletVerticesBufferIndex];
+    StructuredBuffer<Vertex> verticesBuffer = ResourceDescriptorHeap[Constants.verticesBufferIndex];
+    MeshletInfo meshletInfo = LoadMeshletInfo(meshletsRaw, meshletIndex);
     const float worldSign = Constants.worldSign;
 
-    SetMeshOutputCounts(vertexCount, triangleCount);
+    SetMeshOutputCounts(meshletInfo.vertexCount, meshletInfo.triangleCount);
 
-    if (gtid < triangleCount)
+    if (gtid < meshletInfo.triangleCount)
     {
-        uint3 tri = GetTriangle(triangleOffset, gtid);
-        if (worldSign < 0.0f)
-        {
-            const uint tmp = tri.x;
-            tri.x = tri.y;
-            tri.y = tmp;
-        }
-        tris[gtid] = tri;
+        tris[gtid] = ApplyMeshletWinding(GetMeshletTriangle(meshletTrianglesBuffer, meshletInfo.triangleOffset, gtid), worldSign);
     }
 
-    if (gtid < vertexCount)
+    if (gtid < meshletInfo.vertexCount)
     {
-        StructuredBuffer<Vertex> verticesBuffer = ResourceDescriptorHeap[Constants.verticesBufferIndex];
-        Vertex v = verticesBuffer[GetVertexIndex(vertexOffset, gtid)];
+        Vertex v = verticesBuffer[GetMeshletVertexIndex(meshletVerticesBuffer, meshletInfo.vertexOffset, gtid)];
         float4 worldPos = mul(float4(v.position, 1.0f), Constants.world);
 
         VertexOut o;

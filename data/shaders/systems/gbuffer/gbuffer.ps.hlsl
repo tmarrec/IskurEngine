@@ -5,6 +5,7 @@
 
 #include "Common.hlsli"
 #include "CPUGPU.h"
+#include "include/core/hash.hlsli"
 #include "include/geometry/normal.hlsli"
 
 ConstantBuffer<PrimitiveConstants> Constants : register(b0);
@@ -13,23 +14,13 @@ ConstantBuffer<VertexConstants> VertexConstants : register(b1);
 struct PSOut
 {
     float4 albedo : SV_Target0;
-    float2 normal : SV_Target1;
+    float4 normal : SV_Target1;
     float2 normalGeo : SV_Target2;
-    float2 material : SV_Target3;
+    float material : SV_Target3;
     float2 motion : SV_Target4;
     float ao : SV_Target5;
     float3 emissive : SV_Target6;
 };
-
-uint HashUint(uint x)
-{
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    x *= 0x846ca68bu;
-    x ^= x >> 16;
-    return x;
-}
 
 float HashToUnit(uint x)
 {
@@ -127,8 +118,6 @@ PSOut main(VertexOut input, bool isFrontFace : SV_IsFrontFace)
         geoN = -geoN;
     }
 
-    float2 encodedNormal = EncodeNormal(N);
-
     float ao = 1.f;
     if (material.aoTextureIndex != -1)
     {
@@ -147,9 +136,9 @@ PSOut main(VertexOut input, bool isFrontFace : SV_IsFrontFace)
     
     PSOut output;
     output.albedo = float4(baseColor.rgb, baseColor.a);
-    output.normal = encodedNormal;
+    output.normal = float4(N, saturate(roughness));
     output.normalGeo = EncodeNormal(geoN);
-    output.material = float2(metallic, roughness);
+    output.material = saturate(metallic);
     // DLSS expects backward-looking motion vectors that map the current pixel
     // to its previous-frame position, in normalized screen-space.
     float2 mv = (input.prevClipPosNoJ.xy / input.prevClipPosNoJ.z) - (input.currentClipPosNoJ.xy / input.currentClipPosNoJ.z);

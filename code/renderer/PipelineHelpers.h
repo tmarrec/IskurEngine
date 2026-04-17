@@ -13,6 +13,17 @@
 
 namespace PipelineHelpers
 {
+inline void CreateComputePipeline(const ComPtr<ID3D12Device14>& device, const SharedPtr<Shader>& shader, ComPtr<ID3D12RootSignature>& outRootSig, ComPtr<ID3D12PipelineState>& outPso)
+{
+    IE_Assert(shader && shader->IsValid());
+    outRootSig = shader->GetOrCreateRootSignature(device);
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = outRootSig.Get();
+    psoDesc.CS = shader->GetBytecode();
+    IE_Check(device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&outPso)));
+}
+
 inline void CreateFullscreenGraphicsPipeline(const ComPtr<ID3D12Device14>& device, const SharedPtr<Shader>& vertexShader, const SharedPtr<Shader>& pixelShader, DXGI_FORMAT rtvFormat,
                                              ComPtr<ID3D12RootSignature>& outRootSig, ComPtr<ID3D12PipelineState>& outPso)
 {

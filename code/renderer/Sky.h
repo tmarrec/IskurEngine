@@ -19,8 +19,6 @@
 #include "common/Types.h"
 #include "shaders/CPUGPU.h"
 
-class Raytracing;
-
 class Sky
 {
   public:
@@ -33,10 +31,8 @@ class Sky
     void CreateSkyMotionPassPipelines(const ComPtr<ID3D12Device14>& device, const Vector<String>& globalDefines);
 
     void PassSkyMotion(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers, u32 frameInFlightIdx, const Camera::FrameData& cameraFrameData,
-                       const Array<D3D12_CPU_DESCRIPTOR_HANDLE, GBuffer::targetCount>& gbufferRtvHandles, GpuResource& gbufferMotionVector, u32 depthSrvIndex,
-                       const BindlessHeaps& bindlessHeaps);
-    void PassProceduralSkyCube(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers, const Environment& env, const BindlessHeaps& bindlessHeaps,
-                               Raytracing& raytracing);
+                       const Array<D3D12_CPU_DESCRIPTOR_HANDLE, GBuffer::targetCount>& gbufferRtvHandles, GpuResource& gbufferMotionVector, u32 depthSrvIndex, const BindlessHeaps& bindlessHeaps);
+    void PassProceduralSkyCube(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers, const Environment& env, const BindlessHeaps& bindlessHeaps);
 
     void MarkProceduralSkyDirty();
     u32 GetSkyCubeSrvIndex() const;
@@ -92,4 +88,3 @@ class Sky
     ProceduralSkyCubeResources m_ProceduralSkyCube{};
     SkyMotionPassResources m_SkyMotion{};
 };
-

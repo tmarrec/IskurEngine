@@ -115,6 +115,9 @@ SceneFileData LoadSceneFile(const std::filesystem::path& packFile)
     const auto* cMLVT = findChunk(CH_MLVT);
     const auto* cMLTR = findChunk(CH_MLTR);
     const auto* cMLBD = findChunk(CH_MLBD);
+    const auto* cOMIX = findChunk(CH_OMIX);
+    const auto* cOMDS = findChunk(CH_OMDS);
+    const auto* cOMDT = findChunk(CH_OMDT);
     const auto* cTXHD = findChunk(CH_TXHD);
     const auto* cTXSR = findChunk(CH_TXSR);
     const auto* cTXTB = findChunk(CH_TXTB);
@@ -122,7 +125,7 @@ SceneFileData LoadSceneFile(const std::filesystem::path& packFile)
     const auto* cMATL = findChunk(CH_MATL);
     const auto* cINST = findChunk(CH_INST);
 
-    IE_Assert(cPRIM && cVERT && cINDX && cMSHL && cMLVT && cMLTR && cMLBD);
+    IE_Assert(cPRIM && cVERT && cINDX && cMSHL && cMLVT && cMLTR && cMLBD && cOMIX && cOMDS && cOMDT);
 
     SetChunkView(cVERT, blobSize, out.vertBlobOffset, out.vertBlobSize);
     SetChunkView(cINDX, blobSize, out.idxBlobOffset, out.idxBlobSize);
@@ -130,12 +133,16 @@ SceneFileData LoadSceneFile(const std::filesystem::path& packFile)
     SetChunkView(cMLVT, blobSize, out.mlvtBlobOffset, out.mlvtBlobSize);
     SetChunkView(cMLTR, blobSize, out.mltrBlobOffset, out.mltrBlobSize);
     SetChunkView(cMLBD, blobSize, out.mlbdBlobOffset, out.mlbdBlobSize);
+    SetChunkView(cOMDT, blobSize, out.ommDataBlobOffset, out.ommDataBlobSize);
 
     IE_Assert(hdr->primCount <= (cPRIM->size / sizeof(PrimRecord)));
     {
         const auto* prim = reinterpret_cast<const PrimRecord*>(blob + cPRIM->offset);
         out.prims.assign(prim, prim + hdr->primCount);
     }
+
+    CopyChunkArray<i32>(out.ommIndices, cOMIX, blob, blobSize);
+    CopyChunkArray<OpacityMicromapDescRecord>(out.ommDescs, cOMDS, blob, blobSize);
 
     if (cTXHD && cTXTB)
     {
@@ -182,6 +189,20 @@ SceneFileData LoadSceneFile(const std::filesystem::path& packFile)
         IE_Assert(primCount > 0);
 
         out.instances.assign(id, id + instCount);
+    }
+
+    for (const PrimRecord& prim : out.prims)
+    {
+        IE_Assert(prim.ommFormat == 0 || prim.ommFormat == 4);
+        IE_Assert(static_cast<size_t>(prim.ommIndexOffset) + static_cast<size_t>(prim.ommIndexCount) <= out.ommIndices.size());
+        IE_Assert(static_cast<size_t>(prim.ommDescOffset) + static_cast<size_t>(prim.ommDescCount) <= out.ommDescs.size());
+        IE_Assert(prim.ommDataByteOffset + prim.ommDataByteSize <= out.ommDataBlobSize);
+
+        for (u32 i = 0; i < prim.ommDescCount; ++i)
+        {
+            const auto& desc = out.ommDescs[prim.ommDescOffset + i];
+            IE_Assert(desc.dataByteOffset + desc.dataByteSize <= prim.ommDataByteSize);
+        }
     }
 
     return out;

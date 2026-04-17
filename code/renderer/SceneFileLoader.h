@@ -27,6 +27,10 @@ struct SceneFileData
     u64 mltrBlobSize = 0;
     u64 mlbdBlobOffset = 0;
     u64 mlbdBlobSize = 0;
+    Vector<i32> ommIndices;
+    Vector<IEPack::OpacityMicromapDescRecord> ommDescs;
+    u64 ommDataBlobOffset = 0;
+    u64 ommDataBlobSize = 0;
 
     // Primitive table from the pack file
     Vector<IEPack::PrimRecord> prims;
@@ -48,6 +52,7 @@ struct SceneFileData
     const u8* MlvtBlob() const { return mlvtBlobSize ? fileBytes.data() + mlvtBlobOffset : nullptr; }
     const u8* MltrBlob() const { return mltrBlobSize ? fileBytes.data() + mltrBlobOffset : nullptr; }
     const u8* MlbdBlob() const { return mlbdBlobSize ? fileBytes.data() + mlbdBlobOffset : nullptr; }
+    const u8* OmmDataBlob() const { return ommDataBlobSize ? fileBytes.data() + ommDataBlobOffset : nullptr; }
     const u8* TexBlob() const { return texBlobSize ? fileBytes.data() + texBlobOffset : nullptr; }
 };
 

@@ -10,7 +10,7 @@
 
 namespace
 {
-void PushHistorySample(TimingState::TimingSmoother& smoother, const double sample, const float dtMs)
+void PushHistorySample(TimingState::TimingSmoother& smoother, const f64 sample, const f32 dtMs)
 {
     const u32 capacity = TimingState::kHistoryCapacity;
     if (capacity == 0u)
@@ -37,7 +37,7 @@ void PushHistorySample(TimingState::TimingSmoother& smoother, const double sampl
     smoother.historyStart = (smoother.historyStart + 1u) % capacity;
 }
 
-double ComputeBoxAverage(const TimingState::TimingSmoother& smoother, const float windowMs)
+f64 ComputeBoxAverage(const TimingState::TimingSmoother& smoother, const f32 windowMs)
 {
     if (smoother.historyCount == 0u)
     {
@@ -50,21 +50,21 @@ double ComputeBoxAverage(const TimingState::TimingSmoother& smoother, const floa
         return smoother.history[newestIndex].value;
     }
 
-    double weightedSum = 0.0;
-    double coveredMs = 0.0;
+    f64 weightedSum = 0.0;
+    f64 coveredMs = 0.0;
 
     for (u32 age = 0; age < smoother.historyCount && coveredMs < windowMs; ++age)
     {
         const u32 idx = (smoother.historyStart + smoother.historyCount - 1u - age) % TimingState::kHistoryCapacity;
         const TimingState::TimingSample& entry = smoother.history[idx];
-        const double sampleDtMs = entry.dtMs > 0.0f ? static_cast<double>(entry.dtMs) : 0.0;
+        const f64 sampleDtMs = entry.dtMs > 0.0f ? static_cast<f64>(entry.dtMs) : 0.0;
         if (sampleDtMs <= 0.0)
         {
             continue;
         }
 
-        const double remainingMs = static_cast<double>(windowMs) - coveredMs;
-        const double takeMs = std::min(sampleDtMs, remainingMs);
+        const f64 remainingMs = static_cast<f64>(windowMs) - coveredMs;
+        const f64 takeMs = std::min(sampleDtMs, remainingMs);
 
         weightedSum += entry.value * takeMs;
         coveredMs += takeMs;
@@ -130,12 +130,12 @@ void CPU_MARKER_END(CpuTimers& timers)
     p.ms = dtMs;
 }
 
-void Timings_UpdateAverages(TimingState& s, float dtMs, float windowMs)
+void Timings_UpdateAverages(TimingState& s, f32 dtMs, f32 windowMs)
 {
     for (u32 i = 0; i < s.lastCount; ++i)
     {
         const char* name = s.last[i].name;
-        double sample = s.last[i].ms;
+        f64 sample = s.last[i].ms;
 
         u32 j = 0;
         for (; j < s.smoothCount; ++j)
@@ -157,7 +157,7 @@ void Timings_UpdateAverages(TimingState& s, float dtMs, float windowMs)
     }
 }
 
-double Timings_ComputeAverageWindowMs(const TimingState& s, const char* name, float windowMs)
+f64 Timings_ComputeAverageWindowMs(const TimingState& s, const char* name, f32 windowMs)
 {
     for (u32 i = 0; i < s.smoothCount; ++i)
     {

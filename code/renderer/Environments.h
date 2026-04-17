@@ -55,9 +55,8 @@ class Environments
         f32 sunElevationDeg = 240.0f;
         f32 sunIntensity = 1.0f;
         f32 skyIntensity = 5.0f;
-        f32 ambientStrength = 0.005f;
         f32 shadowMinVisibility = 0.0f;
-        f32 rtIndirectDiffuseStrength = 1.0f;
+        f32 specularShadowMinVisibility = 0.0f;
         f32 exposureCompensationEV = 0.0f;
     };
 

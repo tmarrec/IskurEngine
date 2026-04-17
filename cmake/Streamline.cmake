@@ -13,8 +13,13 @@ if (STREAMLINE_BIN_DIR)
     "${STREAMLINE_BIN_DIR}/sl.interposer.dll"
     "${STREAMLINE_BIN_DIR}/sl.common.dll"
     "${STREAMLINE_BIN_DIR}/sl.dlss.dll"
+    "${STREAMLINE_BIN_DIR}/sl.dlss_d.dll"
+    "${STREAMLINE_BIN_DIR}/sl.dlss_g.dll"
+    "${STREAMLINE_BIN_DIR}/sl.reflex.dll"
     "${STREAMLINE_BIN_DIR}/sl.pcl.dll"
     "${STREAMLINE_BIN_DIR}/nvngx_dlss.dll"
+    "${STREAMLINE_BIN_DIR}/nvngx_dlssd.dll"
+    "${STREAMLINE_BIN_DIR}/nvngx_dlssg.dll"
   )
   foreach(_dll IN LISTS STREAMLINE_RUNTIME_DLLS)
     if (NOT EXISTS "${_dll}")
@@ -28,15 +33,10 @@ if (STREAMLINE_BIN_DIR)
   set(STREAMLINE_UNUSED_DLLS
     sl.deepdvc.dll
     sl.directsr.dll
-    sl.dlss_d.dll
-    sl.dlss_g.dll
     sl.imgui.dll
     sl.nis.dll
     sl.nvperf.dll
-    sl.reflex.dll
     nvngx_deepdvc.dll
-    nvngx_dlssd.dll
-    nvngx_dlssg.dll
   )
 
   set(STREAMLINE_UNUSED_DLL_TARGET_PATHS)

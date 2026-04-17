@@ -7,6 +7,7 @@
 
 #include <cctype>
 #include <format>
+#include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -43,6 +44,26 @@ Shader::ReloadStats g_ShaderReloadStats;
 
 constexpr u64 kFnvOffsetBasis = 14695981039346656037ull;
 constexpr u64 kFnvPrime = 1099511628211ull;
+
+u32 ShaderModelMajor(const D3D_SHADER_MODEL shaderModel)
+{
+    return (static_cast<u32>(shaderModel) >> 4) & 0xF;
+}
+
+u32 ShaderModelMinor(const D3D_SHADER_MODEL shaderModel)
+{
+    return static_cast<u32>(shaderModel) & 0xF;
+}
+
+String FormatShaderModelName(const D3D_SHADER_MODEL shaderModel)
+{
+    if (static_cast<u32>(shaderModel) == 0u)
+    {
+        return "unknown";
+    }
+
+    return std::format("{}.{}", ShaderModelMajor(shaderModel), ShaderModelMinor(shaderModel));
+}
 
 void HashBytes(u64& hash, const void* data, const size_t size)
 {
@@ -332,24 +353,29 @@ DxcContext& GetDxcContext()
     return ctx;
 }
 
-LPCWSTR ToTargetName(const ShaderType type)
+const wchar_t* ToTargetPrefix(const ShaderType type)
 {
     switch (type)
     {
     case IE_SHADER_TYPE_VERTEX:
-        return L"vs_6_9";
+        return L"vs";
     case IE_SHADER_TYPE_PIXEL:
-        return L"ps_6_9";
+        return L"ps";
     case IE_SHADER_TYPE_COMPUTE:
-        return L"cs_6_9";
+        return L"cs";
     case IE_SHADER_TYPE_MESH:
-        return L"ms_6_9";
+        return L"ms";
     case IE_SHADER_TYPE_AMPLIFICATION:
-        return L"as_6_9";
+        return L"as";
     case IE_SHADER_TYPE_LIB:
-        return L"lib_6_9";
+        return L"lib";
     }
     return L"undefined";
+}
+
+std::wstring MakeTargetName(const ShaderType type)
+{
+    return std::format(L"{}_{}_{}", ToTargetPrefix(type), ShaderModelMajor(ShaderRequirements::kRequiredShaderModel), ShaderModelMinor(ShaderRequirements::kRequiredShaderModel));
 }
 
 ShaderCompileResult Fail(HRESULT hr, const char* context, ShaderCompileResult& result)
@@ -389,6 +415,7 @@ ShaderCompileResult CompileShader(ShaderType type, const String& filename, const
 
     const std::wstring filenameWide = Utf8ToWide(filename);
     const std::wstring shaderPath = L"data/shaders/" + filenameWide;
+    const std::wstring targetName = MakeTargetName(type);
     hr = dxc.library->CreateBlobFromFile(shaderPath.c_str(), &codePage, &sourceBlob);
     if (!IE_Try(hr))
     {
@@ -423,7 +450,7 @@ ShaderCompileResult CompileShader(ShaderType type, const String& filename, const
         break;
     }
     arguments.push_back(L"-T");
-    arguments.push_back(ToTargetName(type));
+    arguments.push_back(targetName.c_str());
     arguments.push_back(L"-I");
     arguments.push_back(L"data/shaders");
     for (const std::wstring& arg : defineArgs)
@@ -494,6 +521,28 @@ ShaderCompileResult CompileShader(ShaderType type, const String& filename, const
     return result;
 }
 } // namespace
+
+void Shader::VerifyRequiredShaderModelSupport(const ComPtr<ID3D12Device14>& device)
+{
+    D3D12_FEATURE_DATA_SHADER_MODEL requestedShaderModel{};
+    requestedShaderModel.HighestShaderModel = ShaderRequirements::kRequiredShaderModel;
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &requestedShaderModel, sizeof(requestedShaderModel))) &&
+        requestedShaderModel.HighestShaderModel >= ShaderRequirements::kRequiredShaderModel)
+    {
+        return;
+    }
+
+    D3D12_FEATURE_DATA_SHADER_MODEL highestShaderModel{};
+    highestShaderModel.HighestShaderModel = D3D_HIGHEST_SHADER_MODEL;
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &highestShaderModel, sizeof(highestShaderModel))))
+    {
+        highestShaderModel.HighestShaderModel = static_cast<D3D_SHADER_MODEL>(0);
+    }
+
+    IE_LogFatal("Shader Model {} is required but the device only supports {}.", FormatShaderModelName(ShaderRequirements::kRequiredShaderModel),
+                FormatShaderModelName(highestShaderModel.HighestShaderModel));
+    IE_Assert(false);
+}
 
 Shader::Shader(ShaderType type, String filename, Vector<String> defines)
     : m_Type(type), m_Filename(std::move(filename)), m_Defines(std::move(defines))

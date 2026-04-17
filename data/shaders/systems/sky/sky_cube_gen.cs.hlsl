@@ -203,24 +203,30 @@ float3 ApplySunDiskAndGlow(float3 base, float3 viewDir, uint skyCubeSize, float3
     return base;
 }
 
-float3 EvaluateProceduralSky(float3 viewDir, uint skyCubeSize, float3 sunDir, float sunIntensity, float3 sunColor, float sunDiskAngleDeg, float sunDiskSoftness, float sunGlowPower,
-                             float sunGlowIntensity, float sunDiskIntensityScale, float atmosphereThicknessKm, float atmosphereSunIntensityScale, float mieG,
-                             float3 rayleighScattering, float rayleighScaleHeightKm, float3 mieScattering, float mieScaleHeightKm, float3 ozoneAbsorption,
-                             float ozoneLayerCenterKm, float ozoneLayerWidthKm, float multiScatteringStrength)
+float3 EvaluateProceduralSkyBase(float3 viewDir, float3 sunDir, float sunIntensity, float atmosphereThicknessKm, float atmosphereSunIntensityScale, float mieG,
+                                 float3 rayleighScattering, float rayleighScaleHeightKm, float3 mieScattering, float mieScaleHeightKm, float3 ozoneAbsorption,
+                                 float ozoneLayerCenterKm, float ozoneLayerWidthKm, float multiScatteringStrength)
 {
     float3 originalViewDir = normalize(viewDir);
     float3 mirroredViewDir = originalViewDir;
     bool isUpperHemisphere = originalViewDir.y >= 0.0f;
     // Mirror the lower hemisphere, but keep solar highlights in the upper one.
     mirroredViewDir.y = abs(mirroredViewDir.y);
-    sunColor = max(sunColor, 0.0.xxx);
 
     // Suppress Mie sun glow below the horizon when mirroring the sky.
     float3 mieForAtmo = isUpperHemisphere ? mieScattering : 0.0.xxx;
     float mieGForAtmo = isUpperHemisphere ? mieG : 0.0f;
-    float3 base = IntegrateAtmosphereSingleScattering(mirroredViewDir, sunDir, sunIntensity, rayleighScattering, rayleighScaleHeightKm, mieForAtmo, mieScaleHeightKm, mieGForAtmo,
-                                                      atmosphereThicknessKm, atmosphereSunIntensityScale, ozoneAbsorption, ozoneLayerCenterKm, ozoneLayerWidthKm,
-                                                      multiScatteringStrength);
+    return IntegrateAtmosphereSingleScattering(mirroredViewDir, sunDir, sunIntensity, rayleighScattering, rayleighScaleHeightKm, mieForAtmo, mieScaleHeightKm, mieGForAtmo,
+                                               atmosphereThicknessKm, atmosphereSunIntensityScale, ozoneAbsorption, ozoneLayerCenterKm, ozoneLayerWidthKm,
+                                               multiScatteringStrength);
+}
+
+float3 AddProceduralSunVisuals(float3 base, float3 viewDir, uint skyCubeSize, float3 sunDir, float sunIntensity, float3 sunColor, float sunDiskAngleDeg, float sunDiskSoftness,
+                               float sunGlowPower, float sunGlowIntensity, float sunDiskIntensityScale)
+{
+    float3 originalViewDir = normalize(viewDir);
+    bool isUpperHemisphere = originalViewDir.y >= 0.0f;
+    sunColor = max(sunColor, 0.0.xxx);
 
     // Only render the sun in the upper hemisphere.
     if (isUpperHemisphere)
@@ -251,11 +257,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     uv = uv * 2.0 - 1.0;
 
     float3 dir = CubeFaceUvToDir(tid.z, uv);
-    float3 sky = EvaluateProceduralSky(dir, Constants.size, Constants.sunDir, Constants.sunIntensity, Constants.sunColor, Constants.sunDiskAngleDeg, Constants.sunDiskSoftness,
-                                       Constants.sunGlowPower, Constants.sunGlowIntensity, Constants.sunDiskIntensityScale, Constants.atmosphereThicknessKm,
-                                       Constants.atmosphereSunIntensityScale, Constants.mieG, Constants.rayleighScattering, Constants.rayleighScaleHeightKm, Constants.mieScattering,
-                                       Constants.mieScaleHeightKm, Constants.ozoneAbsorption, Constants.ozoneLayerCenterKm, Constants.ozoneLayerWidthKm,
-                                       Constants.multiScatteringStrength);
-    skyCube[uint3(tid.xy, tid.z)] = float4(sky, 1.0);
+    float3 skyBase = EvaluateProceduralSkyBase(dir, Constants.sunDir, Constants.sunIntensity, Constants.atmosphereThicknessKm, Constants.atmosphereSunIntensityScale, Constants.mieG,
+                                               Constants.rayleighScattering, Constants.rayleighScaleHeightKm, Constants.mieScattering, Constants.mieScaleHeightKm,
+                                               Constants.ozoneAbsorption, Constants.ozoneLayerCenterKm, Constants.ozoneLayerWidthKm, Constants.multiScatteringStrength);
+    float3 skyWithSun = AddProceduralSunVisuals(skyBase, dir, Constants.size, Constants.sunDir, Constants.sunIntensity, Constants.sunColor, Constants.sunDiskAngleDeg,
+                                                Constants.sunDiskSoftness, Constants.sunGlowPower, Constants.sunGlowIntensity, Constants.sunDiskIntensityScale);
+
+    skyCube[uint3(tid.xy, tid.z)] = float4(max(skyWithSun, 0.0.xxx), 1.0);
 }
 

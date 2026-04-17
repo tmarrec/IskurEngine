@@ -7,11 +7,13 @@
 
 #include "Renderer.h"
 #include "SceneUtils.h"
+#include "common/IskurPackFormat.h"
 #include "common/MathUtils.h"
 #include "common/StringUtils.h"
 #include "window/Window.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cfloat>
 #include <cmath>
@@ -43,6 +45,23 @@ u32 gDebugSrvCount = 0;
 std::vector<u32> gFreeSrvIndices;
 std::unordered_map<ID3D12Resource*, D3D12_GPU_DESCRIPTOR_HANDLE> gDebugSrvCache;
 
+struct TimeSample
+{
+    f64 valueMs = 0.0;
+    f32 dtMs = 0.0f;
+};
+
+struct WindowedAverageState
+{
+    static constexpr u32 kHistoryCapacity = 8192u;
+
+    std::array<TimeSample, kHistoryCapacity> history{};
+    u32 historyStart = 0u;
+    u32 historyCount = 0u;
+};
+
+WindowedAverageState g_CpuFrameAvgState{};
+
 D3D12_CPU_DESCRIPTOR_HANDLE GetCpuHandle(u32 index)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
@@ -61,67 +80,60 @@ u32 GetHandleIndex(D3D12_CPU_DESCRIPTOR_HANDLE cpu)
 {
     IM_ASSERT(gAlloc.inc > 0 && cpu.ptr >= gAlloc.cpu.ptr);
     const size_t byteOffset = cpu.ptr - gAlloc.cpu.ptr;
-    IM_ASSERT((byteOffset % gAlloc.inc) == 0 && "Descriptor handle must be aligned to the heap increment");
+    IM_ASSERT((byteOffset % gAlloc.inc) == 0);
     return static_cast<u32>(byteOffset / gAlloc.inc);
 }
 
-double UpdateCpuFrameAvgMs(double frameMs, float windowMs)
+f64 UpdateWindowedAverageMs(WindowedAverageState& state, f64 valueMs, f32 sampleDtMs, f32 windowMs)
 {
-    struct Sample
+    if (state.historyCount < WindowedAverageState::kHistoryCapacity)
     {
-        double value = 0.0;
-        float dtMs = 0.0f;
-    };
-
-    constexpr u32 kHistoryCapacity = 8192u;
-    static Vector<Sample> s_History(kHistoryCapacity);
-    static u32 s_HistoryStart = 0u;
-    static u32 s_HistoryCount = 0u;
-
-    const float sampleDtMs = static_cast<float>(frameMs);
-    if (s_HistoryCount < kHistoryCapacity)
-    {
-        const u32 writeIndex = (s_HistoryStart + s_HistoryCount) % kHistoryCapacity;
-        s_History[writeIndex].value = frameMs;
-        s_History[writeIndex].dtMs = sampleDtMs;
-        ++s_HistoryCount;
+        const u32 writeIndex = (state.historyStart + state.historyCount) % WindowedAverageState::kHistoryCapacity;
+        state.history[writeIndex].valueMs = valueMs;
+        state.history[writeIndex].dtMs = sampleDtMs;
+        ++state.historyCount;
     }
     else
     {
-        s_History[s_HistoryStart].value = frameMs;
-        s_History[s_HistoryStart].dtMs = sampleDtMs;
-        s_HistoryStart = (s_HistoryStart + 1u) % kHistoryCapacity;
+        state.history[state.historyStart].valueMs = valueMs;
+        state.history[state.historyStart].dtMs = sampleDtMs;
+        state.historyStart = (state.historyStart + 1u) % WindowedAverageState::kHistoryCapacity;
     }
 
     if (windowMs <= 0.0f)
     {
-        return frameMs;
+        return valueMs;
     }
 
-    double weightedSum = 0.0;
-    double coveredMs = 0.0;
-    for (u32 age = 0; age < s_HistoryCount && coveredMs < windowMs; ++age)
+    f64 weightedSum = 0.0;
+    f64 coveredMs = 0.0;
+    for (u32 age = 0; age < state.historyCount && coveredMs < windowMs; ++age)
     {
-        const u32 idx = (s_HistoryStart + s_HistoryCount - 1u - age) % kHistoryCapacity;
-        const Sample& entry = s_History[idx];
-        const double entryDtMs = entry.dtMs > 0.0f ? static_cast<double>(entry.dtMs) : 0.0;
+        const u32 idx = (state.historyStart + state.historyCount - 1u - age) % WindowedAverageState::kHistoryCapacity;
+        const TimeSample& entry = state.history[idx];
+        const f64 entryDtMs = entry.dtMs > 0.0f ? static_cast<f64>(entry.dtMs) : 0.0;
         if (entryDtMs <= 0.0)
         {
             continue;
         }
 
-        const double remainingMs = static_cast<double>(windowMs) - coveredMs;
-        const double takeMs = std::min(entryDtMs, remainingMs);
-        weightedSum += entry.value * takeMs;
+        const f64 remainingMs = static_cast<f64>(windowMs) - coveredMs;
+        const f64 takeMs = std::min(entryDtMs, remainingMs);
+        weightedSum += entry.valueMs * takeMs;
         coveredMs += takeMs;
     }
 
     if (coveredMs <= 0.0)
     {
-        return frameMs;
+        return valueMs;
     }
 
     return weightedSum / coveredMs;
+}
+
+f64 UpdateCpuFrameAvgMs(f64 frameMs, f32 windowMs)
+{
+    return UpdateWindowedAverageMs(g_CpuFrameAvgState, frameMs, static_cast<f32>(frameMs), windowMs);
 }
 
 f32 HorizontalFovFromVerticalDegrees(f32 verticalFovDeg, f32 aspectRatio)
@@ -164,18 +176,20 @@ String FormatSceneFileSize(const String& sceneName)
     }
     else if (sizeBytes < 1024ull * 1024ull)
     {
-        std::snprintf(buffer, sizeof(buffer), "%.1f KB", static_cast<double>(sizeBytes) / 1024.0);
+        std::snprintf(buffer, sizeof(buffer), "%.1f KB", static_cast<f64>(sizeBytes) / 1024.0);
     }
     else if (sizeBytes < 1024ull * 1024ull * 1024ull)
     {
-        std::snprintf(buffer, sizeof(buffer), "%.1f MB", static_cast<double>(sizeBytes) / (1024.0 * 1024.0));
+        std::snprintf(buffer, sizeof(buffer), "%.1f MB", static_cast<f64>(sizeBytes) / (1024.0 * 1024.0));
     }
     else
     {
-        std::snprintf(buffer, sizeof(buffer), "%.2f GB", static_cast<double>(sizeBytes) / (1024.0 * 1024.0 * 1024.0));
+        std::snprintf(buffer, sizeof(buffer), "%.2f GB", static_cast<f64>(sizeBytes) / (1024.0 * 1024.0 * 1024.0));
     }
     return buffer;
 }
+
+constexpr ImVec4 kOutOfDateSceneColor = ImVec4(0.95f, 0.26f, 0.26f, 1.0f);
 
 } // namespace
 
@@ -197,7 +211,7 @@ void ImGui_Init(const ImGui_InitParams& p)
         ImGuiIO& io = ImGui::GetIO();
         io.Fonts->Clear();
         ImFont* f = io.Fonts->AddFontFromFileTTF(p.fontPath, p.fontSize);
-        IM_ASSERT(f && "Failed to load font");
+        IM_ASSERT(f);
         io.FontDefault = f;
     }
 
@@ -211,7 +225,7 @@ void ImGui_Init(const ImGui_InitParams& p)
     desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     IE_Check(p.device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&gSrvHeap)));
 
-    IM_ASSERT(desc.NumDescriptors > kImGuiDebugSrvReserve && "ImGui debug SRV reserve must fit within the descriptor heap");
+    IM_ASSERT(desc.NumDescriptors > kImGuiDebugSrvReserve);
     gAlloc.cpu = gSrvHeap->GetCPUDescriptorHandleForHeapStart();
     gAlloc.gpu = gSrvHeap->GetGPUDescriptorHandleForHeapStart();
     gAlloc.capacity = desc.NumDescriptors - kImGuiDebugSrvReserve;
@@ -234,7 +248,7 @@ void ImGui_Init(const ImGui_InitParams& p)
         }
         else
         {
-            IM_ASSERT(gAlloc.next < gAlloc.capacity && "ImGui SRV heap exhausted");
+            IM_ASSERT(gAlloc.next < gAlloc.capacity);
             index = gAlloc.next;
             gAlloc.next++;
         }
@@ -247,7 +261,7 @@ void ImGui_Init(const ImGui_InitParams& p)
             return;
 
         const u32 index = GetHandleIndex(cpu);
-        IM_ASSERT(index < gAlloc.capacity && "ImGui backend tried to free a debug-reserved descriptor");
+        IM_ASSERT(index < gAlloc.capacity);
         gFreeSrvIndices.push_back(index);
     };
     ImGui_ImplDX12_Init(&ii);
@@ -283,15 +297,18 @@ void ImGui_Render(const ImGui_RenderParams& p)
     ImGui::NewFrame();
 
     IE_Assert(p.renderer != nullptr);
-    const double displayedFrameTimeMs = UpdateCpuFrameAvgMs(p.renderer->GetWindow().GetFrameTimeMs(), g_Settings.timingAverageWindowMs);
-    const f32 displayedFps = (displayedFrameTimeMs > 0.0) ? static_cast<f32>(1000.0 / displayedFrameTimeMs) : 0.0f;
+    const f32 rawFrameTimeMs = p.renderer->GetWindow().GetFrameTimeMs();
+    const f64 displayedFrameTimeMs = UpdateCpuFrameAvgMs(rawFrameTimeMs, g_Settings.timingAverageWindowMs);
+    const f32 engineFps = (displayedFrameTimeMs > 0.0) ? static_cast<f32>(1000.0 / displayedFrameTimeMs) : 0.0f;
+    const u32 fgPresentedFrames = p.renderer->GetFrameGenerationPresentedFrames();
+    const f32 displayedFps = engineFps * static_cast<f32>(fgPresentedFrames);
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    constexpr float topToolbarHeight = 42.0f;
+    constexpr f32 topToolbarHeight = 42.0f;
     static bool showStatsWindow = true;
     static bool showViewWindow = false;
     static bool showEnvironmentWindow = false;
-    static bool showPathTraceWindow = false;
+    static bool showRayTracingWindow = false;
     static bool showTonemapWindow = false;
     static bool showDebugWindow = false;
 
@@ -301,13 +318,14 @@ void ImGui_Render(const ImGui_RenderParams& p)
         ImGuiWindowFlags statsFlags =
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar;
         ImGui::Begin("##Stats", nullptr, statsFlags);
-        float timingAverageWindowSec = g_Settings.timingAverageWindowMs * 0.001f;
+        f32 timingAverageWindowSec = g_Settings.timingAverageWindowMs * 0.001f;
         if (ImGui::SliderFloat("Timing Average Window (s)", &timingAverageWindowSec, 0.0f, 10.0f, "%.1f"))
         {
             g_Settings.timingAverageWindowMs = timingAverageWindowSec * 1000.0f;
         }
-        const double statsFrameTimeMs = UpdateCpuFrameAvgMs(p.renderer->GetWindow().GetFrameTimeMs(), g_Settings.timingAverageWindowMs);
+        const f64 statsFrameTimeMs = UpdateCpuFrameAvgMs(rawFrameTimeMs, g_Settings.timingAverageWindowMs);
         ImGui::Text("%s %.3f", (g_Settings.timingAverageWindowMs <= 0.0f) ? "Frame Time (Raw, ms):" : "Frame Time (Average, ms):", static_cast<f32>(statsFrameTimeMs));
+        ImGui::Text("DLSS FG Presented Frames: %u", fgPresentedFrames);
 
         const char* timingValueLabel = (g_Settings.timingAverageWindowMs <= 0.0f) ? "Raw (ms)" : "Average (ms)";
 
@@ -318,7 +336,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
             ImGui::TableSetupColumn("% of Total", ImGuiTableColumnFlags_WidthFixed, 110.0f);
             ImGui::TableHeadersRow();
 
-            double cpuTotal = 0.0;
+            f64 cpuTotal = 0.0;
             for (u32 i = 0; i < p.cpuTimingsCount; ++i)
             {
                 cpuTotal += p.cpuTimings[i].ms;
@@ -355,7 +373,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
             ImGui::TableSetupColumn("% of Total", ImGuiTableColumnFlags_WidthFixed, 110.0f);
             ImGui::TableHeadersRow();
 
-            double gpuTotal = 0.0;
+            f64 gpuTotal = 0.0;
             for (u32 i = 0; i < p.gpuTimingsCount; ++i)
             {
                 gpuTotal += p.gpuTimings[i].ms;
@@ -386,10 +404,8 @@ void ImGui_Render(const ImGui_RenderParams& p)
         }
         const f32 culledPct =
             (g_Stats.cpuFrustumCullTotalInstances > 0) ? (100.0f * static_cast<f32>(g_Stats.cpuFrustumCullRasterCulled) / static_cast<f32>(g_Stats.cpuFrustumCullTotalInstances)) : 0.0f;
-        ImGui::Text("Raster Instances: %u submitted / %u total (%u culled, %.1f%%)", g_Stats.cpuFrustumCullRasterSubmitted, g_Stats.cpuFrustumCullTotalInstances,
-                    g_Stats.cpuFrustumCullRasterCulled, culledPct);
-        ImGui::Text("Radiance Cache Memory: %.2f / %.2f MB (%.1f%%)", p.radianceCacheUsedMB, p.radianceCacheMaxMB,
-                    (p.radianceCacheMaxMB > 0.0f) ? (p.radianceCacheUsedMB * 100.0f / p.radianceCacheMaxMB) : 0.0f);
+        ImGui::Text("Raster Instances: %u submitted / %u total (%u culled, %.1f%%)", g_Stats.cpuFrustumCullRasterSubmitted, g_Stats.cpuFrustumCullTotalInstances, g_Stats.cpuFrustumCullRasterCulled,
+                    culledPct);
 
         ImGui::End();
     }
@@ -403,16 +419,27 @@ void ImGui_Render(const ImGui_RenderParams& p)
     static i32 selectedScene = 0;
     static String syncedCurrentScene;
 
-    const Vector<String>& scenes = renderer.GetAvailableScenes();
+    const Vector<SceneUtils::SceneListEntry>& scenes = renderer.GetAvailableScenes();
     if (!scenes.empty())
     {
         if (selectedScene < 0 || selectedScene >= static_cast<i32>(scenes.size()))
             selectedScene = 0;
 
+        auto findFirstLoadableSceneIndex = [&]() -> i32 {
+            for (i32 i = 0; i < static_cast<i32>(scenes.size()); ++i)
+            {
+                if (!scenes[static_cast<size_t>(i)].outOfDate)
+                {
+                    return i;
+                }
+            }
+            return 0;
+        };
+
         auto syncSceneSelection = [&](const String& sceneName) {
             for (i32 i = 0; i < static_cast<i32>(scenes.size()); ++i)
             {
-                if (scenes[static_cast<size_t>(i)] == sceneName)
+                if (scenes[static_cast<size_t>(i)].name == sceneName)
                 {
                     selectedScene = i;
                     break;
@@ -429,6 +456,11 @@ void ImGui_Render(const ImGui_RenderParams& p)
         {
             syncSceneSelection(currentScene);
             syncedCurrentScene = currentScene;
+        }
+
+        if (scenes[static_cast<size_t>(selectedScene)].outOfDate)
+        {
+            selectedScene = findFirstLoadableSceneIndex();
         }
     }
 
@@ -452,7 +484,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
             const bool shouldEnable = !enabled;
             showViewWindow = false;
             showEnvironmentWindow = false;
-            showPathTraceWindow = false;
+            showRayTracingWindow = false;
             showTonemapWindow = false;
             showDebugWindow = false;
             showRenderTargets = false;
@@ -476,7 +508,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
 
         if (!scenes.empty())
         {
-            const char* preview = scenes[static_cast<size_t>(selectedScene)].c_str();
+            const char* preview = scenes[static_cast<size_t>(selectedScene)].name.c_str();
             ImGui::SetNextItemWidth(360.0f);
             ImGui::BeginDisabled(sceneSwitchPending);
             if (ImGui::BeginCombo("##SceneToolbar", preview, ImGuiComboFlags_HeightLargest))
@@ -489,7 +521,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
 
                 for (i32 i = 0; i < static_cast<i32>(scenes.size()); ++i)
                 {
-                    const String& sceneName = scenes[static_cast<size_t>(i)];
+                    const String& sceneName = scenes[static_cast<size_t>(i)].name;
                     if (IsShowcaseScene(sceneName))
                     {
                         showcaseSceneIndices.push_back(i);
@@ -507,11 +539,19 @@ void ImGui_Render(const ImGui_RenderParams& p)
                     ImGui::SeparatorText(title);
                     for (i32 sceneIndex : sceneIndices)
                     {
-                        const String& sceneName = scenes[static_cast<size_t>(sceneIndex)];
+                        const SceneUtils::SceneListEntry& scene = scenes[static_cast<size_t>(sceneIndex)];
+                        const String& sceneName = scene.name;
                         const String sceneSizeLabel = FormatSceneFileSize(sceneName);
+                        const char* statusLabel = scene.outOfDate ? "Incompatible" : nullptr;
                         const bool selected = (sceneIndex == selectedScene);
                         ImGui::PushID(sceneIndex);
-                        if (ImGui::Selectable(sceneName.c_str(), selected) && !selected)
+                        if (scene.outOfDate)
+                        {
+                            ImGui::PushStyleColor(ImGuiCol_Text, kOutOfDateSceneColor);
+                        }
+
+                        const ImGuiSelectableFlags selectableFlags = scene.outOfDate ? ImGuiSelectableFlags_Disabled : ImGuiSelectableFlags_None;
+                        if (ImGui::Selectable(sceneName.c_str(), selected, selectableFlags) && !selected)
                         {
                             selectedScene = sceneIndex;
                             sceneSelectionChanged = true;
@@ -519,16 +559,35 @@ void ImGui_Render(const ImGui_RenderParams& p)
 
                         const ImVec2 itemMax = ImGui::GetItemRectMax();
                         const ImVec2 framePadding = ImGui::GetStyle().FramePadding;
-                        const float sizeTextWidth = ImGui::CalcTextSize(sceneSizeLabel.c_str()).x;
-                        const float sizeRight = itemMax.x - framePadding.x;
-                        const float textY = ImGui::GetItemRectMin().y + framePadding.y;
+                        const f32 sizeTextWidth = ImGui::CalcTextSize(sceneSizeLabel.c_str()).x;
+                        const f32 statusTextWidth = statusLabel != nullptr ? ImGui::CalcTextSize(statusLabel).x : 0.0f;
+                        const f32 sizeRight = itemMax.x - framePadding.x;
+                        const f32 sizeLeft = sizeRight - sizeTextWidth;
+                        const f32 textY = ImGui::GetItemRectMin().y + framePadding.y;
 
                         ImDrawList* drawList = ImGui::GetWindowDrawList();
                         const ImU32 sizeColor = ImGui::GetColorU32(ImGuiCol_TextDisabled);
-                        drawList->AddText(ImVec2(sizeRight - sizeTextWidth, textY), sizeColor, sceneSizeLabel.c_str());
+                        drawList->AddText(ImVec2(sizeLeft, textY), sizeColor, sceneSizeLabel.c_str());
+
+                        if (statusLabel != nullptr)
+                        {
+                            const f32 statusLeft = sizeLeft - framePadding.x - statusTextWidth;
+                            drawList->AddText(ImVec2(statusLeft, textY), ImGui::GetColorU32(kOutOfDateSceneColor), statusLabel);
+
+                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                            {
+                                ImGui::SetTooltip("Scene pack version %u is incompatible with this engine. This engine expects .ikp version %u. Repack it with a compatible scene packer.",
+                                                  scene.packVersion, IEPack::PACK_VERSION_LATEST);
+                            }
+                        }
 
                         if (selected)
                             ImGui::SetItemDefaultFocus();
+
+                        if (scene.outOfDate)
+                        {
+                            ImGui::PopStyleColor();
+                        }
                         ImGui::PopID();
                     }
                 };
@@ -539,9 +598,9 @@ void ImGui_Render(const ImGui_RenderParams& p)
 
                 if (sceneSelectionChanged && !sceneSwitchPending)
                 {
-                    renderer.RequestSceneSwitch(scenes[static_cast<size_t>(selectedScene)]);
+                    renderer.RequestSceneSwitch(scenes[static_cast<size_t>(selectedScene)].name);
                     sceneSwitchPending = renderer.HasPendingSceneSwitch();
-                    syncedCurrentScene = scenes[static_cast<size_t>(selectedScene)];
+                    syncedCurrentScene = scenes[static_cast<size_t>(selectedScene)].name;
                 }
             }
             ImGui::EndDisabled();
@@ -612,8 +671,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
         const f32 renderTargetsWidth = toggleButtonWidth("Texture Debug");
         const f32 buttonSpacing = ImGui::GetStyle().ItemSpacing.x;
         char toolbarStats[160];
-        std::snprintf(toolbarStats, sizeof(toolbarStats), "FPS %.1f | Position %.1f %.1f %.1f | Yaw %.1f | Pitch %.1f", displayedFps, p.frame.cameraPos[0],
-                      p.frame.cameraPos[1], p.frame.cameraPos[2],
+        std::snprintf(toolbarStats, sizeof(toolbarStats), "FPS %.1f | Position %.1f %.1f %.1f | Yaw %.1f | Pitch %.1f", displayedFps, p.frame.cameraPos[0], p.frame.cameraPos[1], p.frame.cameraPos[2],
                       p.frame.cameraYaw, p.frame.cameraPitch);
         const f32 toolbarStatsWidth = ImGui::CalcTextSize(toolbarStats).x;
         const f32 buttonBlockWidth = viewButtonWidth + environmentButtonWidth + rayTracingButtonWidth + tonemapButtonWidth + debugButtonWidth + renderTargetsWidth + buttonSpacing * 5.0f;
@@ -634,7 +692,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
         ImGui::SameLine();
         drawExclusiveToolbarToggle("Environment", showEnvironmentWindow);
         ImGui::SameLine();
-        drawExclusiveToolbarToggle("Ray Tracing", showPathTraceWindow);
+        drawExclusiveToolbarToggle("Ray Tracing", showRayTracingWindow);
         ImGui::SameLine();
         drawExclusiveToolbarToggle("Tone Mapping", showTonemapWindow);
         ImGui::SameLine();
@@ -658,7 +716,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
         }
         else if (!scenes.empty() && selectedScene >= 0 && selectedScene < static_cast<i32>(scenes.size()))
         {
-            pendingSceneLabel = scenes[static_cast<size_t>(selectedScene)].c_str();
+            pendingSceneLabel = scenes[static_cast<size_t>(selectedScene)].name.c_str();
         }
 
         char loadingText[512];
@@ -743,9 +801,10 @@ void ImGui_Render(const ImGui_RenderParams& p)
 
         ImGui::SeparatorText("Upscaling");
         const DLSS::Mode dlssModeValues[] = {
-            DLSS::Mode::Disabled, DLSS::Mode::DLAA, DLSS::Mode::Quality, DLSS::Mode::Balanced, DLSS::Mode::Performance, DLSS::Mode::UltraPerformance,
+            DLSS::Mode::DLAA, DLSS::Mode::Quality, DLSS::Mode::Balanced, DLSS::Mode::Performance, DLSS::Mode::UltraPerformance,
         };
-        const char* dlssModeLabels[] = {"Disabled", "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"};
+        const char* dlssModeLabels[] = {"DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"};
+        const bool frameGenerationEnabled = renderer.IsFrameGenerationEnabled();
         const DLSS::Mode activeDLSSMode = renderer.GetDLSSMode();
         i32 currentDLSSMode = 0;
         for (i32 i = 0; i < static_cast<i32>(IM_ARRAYSIZE(dlssModeValues)); ++i)
@@ -756,11 +815,16 @@ void ImGui_Render(const ImGui_RenderParams& p)
                 break;
             }
         }
-        if (beginSettingsTable("##ViewUpscalingTbl", "DLSS Mode", 220.0f))
+        if (beginSettingsTable("##ViewUpscalingTbl", "DLSS Frame Generation", 220.0f))
         {
             if (settingsRow("DLSS Mode", [&] { return ImGui::Combo("##ViewDlssMode", &currentDLSSMode, dlssModeLabels, IM_ARRAYSIZE(dlssModeLabels)); }))
             {
                 renderer.RequestDLSSMode(dlssModeValues[currentDLSSMode]);
+            }
+            bool currentFrameGenerationEnabled = frameGenerationEnabled;
+            if (settingsRow("DLSS Frame Generation", [&] { return ImGui::Checkbox("##ViewDlssFrameGeneration", &currentFrameGenerationEnabled); }))
+            {
+                renderer.RequestFrameGenerationEnabled(currentFrameGenerationEnabled);
             }
             ImGui::EndTable();
         }
@@ -769,19 +833,30 @@ void ImGui_Render(const ImGui_RenderParams& p)
 
     if (showEnvironmentWindow)
     {
-        setPinnedPanelLayout(700.0f, "Ray-Traced Indirect Diffuse Strength", 240.0f);
+        setPinnedPanelLayout(700.0f, "Exposure Compensation (EV)", 240.0f);
         ImGui::Begin("##Environment", nullptr, panelWindowFlags);
 
+        const i32 currentEnvironmentPresetIndex = renderer.GetCurrentEnvironmentIndex();
+        ImGui::BeginDisabled(currentEnvironmentPresetIndex < 0);
+        if (ImGui::Button("Reload Preset Defaults"))
+        {
+            renderer.SetCurrentEnvironmentIndex(currentEnvironmentPresetIndex);
+        }
+        ImGui::EndDisabled();
+        if (currentEnvironmentPresetIndex >= 0)
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Preset: %s", renderer.GetCurrentEnvironmentName().c_str());
+        }
+
         ImGui::SeparatorText("Sun");
-        if (beginSettingsTable("##EnvironmentSunTbl", "Ray-Traced Indirect Diffuse Strength", 240.0f))
+        if (beginSettingsTable("##EnvironmentSunTbl", "Exposure Compensation (EV)", 240.0f))
         {
             settingsRow("Azimuth", [&] { return ImGui::SliderAngle("##EnvironmentSunAzimuth", &g_Settings.sunAzimuth, 0.0f, 360.0f); });
             settingsRow("Elevation", [&] { return ImGui::SliderAngle("##EnvironmentSunElevation", &g_Settings.sunElevation, 180.0f, 360.0f); });
             settingsRow("Intensity", [&] { return ImGui::SliderFloat("##EnvironmentSunIntensity", &g_Settings.sunIntensity, 0.f, 10.f); });
-            settingsRow("Ambient Strength", [&] { return ImGui::SliderFloat("##EnvironmentAmbientStrength", &g_Settings.ambientStrength, 0.0f, 0.05f, "%.3f"); });
             settingsRow("Shadow Minimum Visibility", [&] { return ImGui::SliderFloat("##EnvironmentShadowMinVisibility", &g_Settings.shadowMinVisibility, 0.0f, 0.1f, "%.3f"); });
-            settingsRow("Ray-Traced Indirect Diffuse Strength",
-                        [&] { return ImGui::SliderFloat("##EnvironmentRTIndirectDiffuseStrength", &g_Settings.rtIndirectDiffuseStrength, 0.0f, 2.0f, "%.3f"); });
+            settingsRow("Specular Shadow Min Visibility", [&] { return ImGui::SliderFloat("##EnvironmentSpecularShadowMinVisibility", &g_Settings.specularShadowMinVisibility, 0.0f, 0.1f, "%.3f"); });
             settingsRow("Exposure Compensation (EV)", [&] { return ImGui::SliderFloat("##EnvironmentExposureCompensationEV", &g_Settings.toneMappingExposureCompensationEV, -4.0f, 4.0f, "%.2f"); });
             ImGui::EndTable();
         }
@@ -827,109 +902,58 @@ void ImGui_Render(const ImGui_RenderParams& p)
         ImGui::End();
     }
 
-    if (showPathTraceWindow)
+    if (showRayTracingWindow)
     {
-        setPinnedPanelLayout(760.0f, "Minimum Samples for Present", 240.0f);
+        setPinnedPanelLayout(760.0f, "Use 2-State On Selected Rays", 240.0f);
         ImGui::Begin("##RayTracing", nullptr, panelWindowFlags);
 
         ImGui::SeparatorText("Path Tracing");
-        if (beginSettingsTable("##RayTracingPathTracingTbl", "Samples Per Pixel", 240.0f))
+        if (beginSettingsTable("##RayTracingIndirectDiffuseTbl", "Samples Per Pixel", 240.0f))
         {
             {
-                const u32 minv = 0, maxv = 8;
-                settingsRow("Samples Per Pixel", [&] { return ImGui::SliderScalar("##RayTracingSpp", ImGuiDataType_U32, &g_Settings.pathTraceSpp, &minv, &maxv); });
+                const u32 minv = 1, maxv = 12;
+                settingsRow("Path Trace SPP", [&] { return ImGui::SliderScalar("##RayTracingSpp", ImGuiDataType_U32, &g_Settings.rtPathTraceSpp, &minv, &maxv); });
             }
             {
-                const u32 minv = 0, maxv = 8;
-                settingsRow("Bounce Count", [&] { return ImGui::SliderScalar("##RayTracingBounceCount", ImGuiDataType_U32, &g_Settings.pathTraceBounceCount, &minv, &maxv); });
+                const u32 minv = 1, maxv = 16;
+                settingsRow("Max Bounces", [&] { return ImGui::SliderScalar("##RayTracingMaxBounces", ImGuiDataType_U32, &g_Settings.rtMaxBounces, &minv, &maxv); });
             }
             ImGui::EndTable();
         }
 
-        ImGui::SeparatorText("Radiance Cache");
-        if (beginSettingsTable("##RayTracingRadianceCacheTbl", "Soft Normal Interpolation", 240.0f))
-        {
-            {
-                const u32 minv = 0u, maxv = 256u;
-                settingsRow("Minimum Extra Samples",
-                            [&] { return ImGui::SliderScalar("##RayTracingRcMinExtraSppCount", ImGuiDataType_U32, &g_Settings.radianceCacheMinExtraSppCount, &minv, &maxv); });
-            }
-            {
-                const u32 minv = 1, maxv = 64;
-                settingsRow("Normal Bin Resolution",
-                            [&] { return ImGui::SliderScalar("##RayTracingRcNormalBinRes", ImGuiDataType_U32, &g_Settings.radianceCacheNormalBinRes, &minv, &maxv); });
-            }
-            {
-                const u32 minv = 0u, maxv = 64u;
-                settingsRow("Maximum Probes", [&] { return ImGui::SliderScalar("##RayTracingRcMaxProbes", ImGuiDataType_U32, &g_Settings.radianceCacheMaxProbes, &minv, &maxv); });
-            }
-            {
-                const u32 minv = 1u, maxv = 262144u;
-                settingsRow("Maximum Samples", [&] { return ImGui::SliderScalar("##RayTracingRcMaxSamples", ImGuiDataType_U32, &g_Settings.radianceCacheMaxSamples, &minv, &maxv); });
-            }
-            settingsRow("Cell Size", [&] { return ImGui::SliderFloat("##RayTracingRcCellSize", &g_Settings.radianceCacheCellSize, 0.01f, 2.0f); });
-            settingsRow("Trilinear Filtering", [&] { return ImGui::Checkbox("##RayTracingRcTrilinear", &g_Settings.radianceCacheTrilinear); });
-            settingsRow("Soft Normal Interpolation", [&] { return ImGui::Checkbox("##RayTracingRcSoftNormalInterpolation", &g_Settings.radianceCacheSoftNormalInterpolation); });
-            ImGui::BeginDisabled(!g_Settings.radianceCacheSoftNormalInterpolation);
-            settingsRow("Soft Normal Dot Threshold", [&] { return ImGui::SliderFloat("##RayTracingRcSoftNormalMinDot", &g_Settings.radianceCacheSoftNormalMinDot, 0.0f, 0.9f, "%.2f"); });
-            ImGui::EndDisabled();
-            ImGui::BeginDisabled(!g_Settings.radianceCacheTrilinear);
-            {
-                const u32 minv = 0, maxv = 4096;
-                settingsRow("Minimum Corner Samples",
-                            [&] { return ImGui::SliderScalar("##RayTracingRcMinCornerSamples", ImGuiDataType_U32, &g_Settings.radianceCacheTrilinearMinCornerSamples, &minv, &maxv); });
-            }
-            {
-                const u32 minv = 0, maxv = 8;
-                settingsRow("Minimum Hits", [&] { return ImGui::SliderScalar("##RayTracingRcMinHits", ImGuiDataType_U32, &g_Settings.radianceCacheTrilinearMinHits, &minv, &maxv); });
-            }
-            {
-                const u32 minv = 0, maxv = 4096;
-                settingsRow("Minimum Samples for Present",
-                            [&] { return ImGui::SliderScalar("##RayTracingRcPresentMinSamples", ImGuiDataType_U32, &g_Settings.radianceCacheTrilinearPresentMinSamples, &minv, &maxv); });
-            }
-            ImGui::EndDisabled();
-            ImGui::EndTable();
-        }
-
-        ImGui::SeparatorText("Ray-Traced Shadows");
-        const char* rtResLabels[] = {"Full Resolution", "Full Width / Half Height", "Half Resolution", "Quarter Resolution"};
-        i32 currentRTRes = static_cast<i32>(g_Settings.rtShadowsResolution);
+        ImGui::SeparatorText("Shadows");
         if (beginSettingsTable("##RayTracingShadowsTbl", "Resolution", 240.0f))
         {
             settingsRow("Enabled", [&] { return ImGui::Checkbox("##RayTracingShadowsEnabled", &g_Settings.rtShadowsEnabled); });
-            if (settingsRow("Resolution", [&] { return ImGui::Combo("##RayTracingResolution", &currentRTRes, rtResLabels, IM_ARRAYSIZE(rtResLabels)); }))
-            {
-                g_Settings.rtShadowsResolution = static_cast<RayTracingResolution>(currentRTRes);
-            }
             ImGui::EndTable();
         }
 
-        ImGui::SeparatorText("Ray-Traced Specular");
-        i32 currentRTSpecRes = static_cast<i32>(g_Settings.rtSpecularResolution);
-        if (beginSettingsTable("##RayTracingSpecularTbl", "Maximum Samples Per Pixel", 240.0f))
+        ImGui::SeparatorText("Opacity Micromaps");
+        if (beginSettingsTable("##RayTracingOmmsTbl", "Use 2-State On Selected Rays", 240.0f))
         {
-            settingsRow("Enabled", [&] { return ImGui::Checkbox("##RayTracingSpecularEnabled", &g_Settings.rtSpecularEnabled); });
-            if (settingsRow("Resolution", [&] { return ImGui::Combo("##RayTracingSpecularResolution", &currentRTSpecRes, rtResLabels, IM_ARRAYSIZE(rtResLabels)); }))
+            if (settingsRow("Enabled", [&] { return ImGui::Checkbox("##RayTracingOmmsEnabled", &g_Settings.rtOmmsEnabled); }))
             {
-                g_Settings.rtSpecularResolution = static_cast<RayTracingResolution>(currentRTSpecRes);
+                renderer.MarkInstancesDirty();
             }
-            settingsRow("Strength", [&] { return ImGui::SliderFloat("##RayTracingSpecularStrength", &g_Settings.rtSpecularStrength, 0.0f, 2.0f); });
-            {
-                const u32 minv = 0u, maxv = 16u;
-                settingsRow("Minimum Samples Per Pixel",
-                            [&] { return ImGui::SliderScalar("##RayTracingSpecularSppMin", ImGuiDataType_U32, &g_Settings.rtSpecularSppMin, &minv, &maxv); });
-                settingsRow("Maximum Samples Per Pixel",
-                            [&] { return ImGui::SliderScalar("##RayTracingSpecularSppMax", ImGuiDataType_U32, &g_Settings.rtSpecularSppMax, &minv, &maxv); });
-            }
+            ImGui::BeginDisabled(!g_Settings.rtOmmsEnabled);
+            settingsRow("Use 2-State On Selected Rays", [&] { return ImGui::Checkbox("##RayTracingUse2StateOmmRays", &g_Settings.rtUse2StateOmmRays); });
+            ImGui::EndDisabled();
             ImGui::EndTable();
         }
+
+        ImGui::SeparatorText("Shader Execution Reordering");
+        if (beginSettingsTable("##RayTracingSerTbl", "Enabled", 240.0f))
+        {
+            settingsRow("Enabled", [&] { return ImGui::Checkbox("##RayTracingSerEnabled", &g_Settings.rtSerEnabled); });
+            ImGui::EndTable();
+        }
+
         ImGui::End();
     }
 
     if (showTonemapWindow)
     {
-        setPinnedPanelLayout(620.0f, "High Reject Percentile", 220.0f);
+        setPinnedPanelLayout(620.0f, "Bright Scene Adapt Time (s)", 220.0f);
         ImGui::Begin("##Tonemap", nullptr, panelWindowFlags);
 
         ImGui::SeparatorText("Tone Mapping");
@@ -951,7 +975,7 @@ void ImGui_Render(const ImGui_RenderParams& p)
         }
 
         ImGui::SeparatorText("Auto Exposure");
-        if (beginSettingsTable("##TonemapAutoExposureTbl", "High Reject Percentile", 220.0f))
+        if (beginSettingsTable("##TonemapAutoExposureTbl", "Bright Scene Adapt Time (s)", 220.0f))
         {
             settingsRow("Target Percentile", [&] { return ImGui::SliderFloat("##TonemapAutoExposureTargetPct", &g_Settings.autoExposureTargetPct, 0.0f, 1.0f, "%.2f"); });
             settingsRow("Low Reject Percentile", [&] { return ImGui::SliderFloat("##TonemapAutoExposureLowReject", &g_Settings.autoExposureLowReject, 0.0f, 0.2f, "%.2f"); });
@@ -970,12 +994,12 @@ void ImGui_Render(const ImGui_RenderParams& p)
 
     if (showDebugWindow)
     {
-        setPinnedPanelLayout(520.0f, "Lighting Debug View", 220.0f);
+        setPinnedPanelLayout(520.0f, "Instance Count (0 = All)", 220.0f);
         ImGui::Begin("##Debug", nullptr, panelWindowFlags);
 
-        const char* lightingDebugLabels[] = {"None", "Indirect Diffuse", "Surface Normals"};
+        const char* lightingDebugLabels[] = {"None", "Surface Normals"};
         i32 lightingDebugMode = static_cast<i32>(g_Settings.lightingDebugMode);
-        if (beginSettingsTable("##DebugTbl", "Lighting Debug View", 220.0f))
+        if (beginSettingsTable("##DebugTbl", "Instance Count (0 = All)", 220.0f))
         {
             settingsRow("Meshlet Debug Colors", [&] { return ImGui::Checkbox("##DebugMeshletColor", &g_Settings.debugMeshletColor); });
             if (settingsRow("Lighting Debug View", [&] { return ImGui::Combo("##DebugLightingMode", &lightingDebugMode, lightingDebugLabels, IM_ARRAYSIZE(lightingDebugLabels)); }))
@@ -1005,16 +1029,19 @@ void ImGui_Render(const ImGui_RenderParams& p)
             }
         };
         maybe_add("Albedo", p.gbufferAlbedo);
-        maybe_add("Shading Normal", p.gbufferNormal);
+        maybe_add("Shading Normal / Roughness", p.gbufferNormal);
         maybe_add("Geometric Normal", p.gbufferNormalGeo);
-        maybe_add("Metallic / Roughness", p.gbufferMaterial);
+        maybe_add("Metallic", p.gbufferMaterial);
         maybe_add("Motion Vectors", p.gbufferMotion);
         maybe_add("Ambient Occlusion", p.gbufferAO);
         maybe_add("Emissive", p.gbufferEmissive);
         maybe_add("Scene Depth", p.depth);
-        maybe_add("Ray-Traced Shadows", p.rtShadows);
-        maybe_add("Ray-Traced Indirect Diffuse", p.rtIndirectDiffuse);
-        maybe_add("Ray-Traced Specular", p.rtSpecular);
+        maybe_add("Path-Traced Lighting", p.pathTrace);
+        maybe_add("DLSS RR Diffuse Albedo", p.dlssRRDiffuseAlbedo);
+        maybe_add("DLSS RR Specular Albedo", p.dlssRRSpecularAlbedo);
+        maybe_add("DLSS RR Normal Roughness", p.dlssRRNormalRoughness);
+        maybe_add("DLSS RR Specular Hit Distance", p.dlssRRSpecularHitDistance);
+        maybe_add("DLSS RR Output", p.dlssRROutput);
         if (!labels.empty())
         {
             auto getSrv = [&](ID3D12Resource* res) -> D3D12_GPU_DESCRIPTOR_HANDLE {

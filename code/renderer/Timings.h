@@ -58,14 +58,14 @@ struct TimingState
 
     struct TimingSample
     {
-        double value = 0.0;
-        float dtMs = 0.0f;
+        f64 value = 0.0;
+        f32 dtMs = 0.0f;
     };
 
     struct TimingSmoother
     {
         const char* name = nullptr; // expected to be a stable literal
-        double value = 0.0;
+        f64 value = 0.0;
         bool initialized = false;
         Vector<TimingSample> history{};
         u32 historyStart = 0;
@@ -81,10 +81,10 @@ void CPU_MARKER_BEGIN(CpuTimers& timers, const char* name);
 void CPU_MARKER_END(CpuTimers& timers);
 
 // Update strict box averages over the requested time window for the latest timings.
-void Timings_UpdateAverages(TimingState& s, float dtMs, float windowMs);
+void Timings_UpdateAverages(TimingState& s, f32 dtMs, f32 windowMs);
 
 // Compute a strict box average for one timing entry over the requested time window.
-double Timings_ComputeAverageWindowMs(const TimingState& s, const char* name, float windowMs);
+f64 Timings_ComputeAverageWindowMs(const TimingState& s, const char* name, f32 windowMs);
 
 // Clear timing history/averages while keeping timestamp frequency.
 void Timings_ResetAverages(TimingState& s);

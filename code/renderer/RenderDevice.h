@@ -44,9 +44,8 @@ class RenderDevice
     void CreateGPUTimers(TimingState& timingState);
     void WaitForGpuIdle();
     void WaitForFrame(PerFrameData& frameData);
-    void ExecuteFrame(const PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd);
+    void ExecuteFrame(const PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd, u32 streamlineFrameIndex);
     void ExecuteAndWait(PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd);
-
     void TrackUpload(UploadTemp&& upload);
     void ClearTrackedUploads(u32 frameInFlightIdx);
     void ClearAllTrackedUploads();

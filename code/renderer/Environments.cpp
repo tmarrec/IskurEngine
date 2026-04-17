@@ -44,8 +44,8 @@ bool TryParsePresetLine(const String& line, Environments::EnvironmentPreset& out
 
     Environment env{};
     std::istringstream stream(line);
-    if (!(stream >> outPreset.name >> outPreset.sunAzimuthDeg >> outPreset.sunElevationDeg >> outPreset.sunIntensity >> outPreset.skyIntensity >> outPreset.ambientStrength >>
-          outPreset.shadowMinVisibility >> outPreset.rtIndirectDiffuseStrength >> outPreset.exposureCompensationEV >> env.sky.sunColor.x >>
+    if (!(stream >> outPreset.name >> outPreset.sunAzimuthDeg >> outPreset.sunElevationDeg >> outPreset.sunIntensity >> outPreset.skyIntensity >>
+          outPreset.shadowMinVisibility >> outPreset.specularShadowMinVisibility >> outPreset.exposureCompensationEV >> env.sky.sunColor.x >>
           env.sky.sunColor.y >> env.sky.sunColor.z >> env.sky.sunDiskAngleDeg >> env.sky.sunGlowPower >> env.sky.sunGlowIntensity >> env.sky.sunDiskIntensityScale >>
           env.sky.atmosphere.rayleighScattering.x >> env.sky.atmosphere.rayleighScattering.y >> env.sky.atmosphere.rayleighScattering.z >> env.sky.atmosphere.rayleighScaleHeightKm >>
           env.sky.atmosphere.mieScattering.x >> env.sky.atmosphere.mieScattering.y >> env.sky.atmosphere.mieScattering.z >> env.sky.atmosphere.mieScaleHeightKm >> env.sky.atmosphere.mieG >>
@@ -181,8 +181,7 @@ void Environments::ApplyPreset(const EnvironmentPreset& preset)
     g_Settings.sunElevation = IE_ToRadians(preset.sunElevationDeg);
     g_Settings.sunIntensity = preset.sunIntensity;
     g_Settings.skyIntensity = preset.skyIntensity;
-    g_Settings.ambientStrength = preset.ambientStrength;
     g_Settings.shadowMinVisibility = preset.shadowMinVisibility;
-    g_Settings.rtIndirectDiffuseStrength = preset.rtIndirectDiffuseStrength;
+    g_Settings.specularShadowMinVisibility = preset.specularShadowMinVisibility;
     g_Settings.toneMappingExposureCompensationEV = preset.exposureCompensationEV;
 }

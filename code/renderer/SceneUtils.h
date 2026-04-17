@@ -11,9 +11,17 @@
 
 namespace SceneUtils
 {
+struct SceneListEntry
+{
+    String name;
+    u32 packVersion = 0;
+    bool outOfDate = false;
+};
+
 bool EqualsIgnoreCaseAscii(const String& a, const String& b);
 String SceneStemFromArg(String sceneArg);
-Vector<String> EnumerateAvailableScenes();
-String ResolveSceneNameFromList(const String& sceneArg, const Vector<String>& availableScenes);
+Vector<SceneListEntry> EnumerateAvailableScenes();
+String ResolveSceneNameFromList(const String& sceneArg, const Vector<SceneListEntry>& availableScenes);
+const SceneListEntry* FindSceneInList(const String& sceneArg, const Vector<SceneListEntry>& availableScenes);
 std::filesystem::path ResolveScenePackPath(const String& sceneArg);
 } // namespace SceneUtils

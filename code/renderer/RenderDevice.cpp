@@ -11,6 +11,7 @@
 #include "BindlessHeaps.h"
 #include "DLSS.h"
 #include "Streamline.h"
+#include "common/Asserts.h"
 #include "common/CommandLineArguments.h"
 #include "window/Window.h"
 
@@ -47,6 +48,7 @@ void RenderDevice::Init(const Window& window, const XMUINT2& presentSize)
     CreateDevice();
     CreateAllocator();
     CreateCommandQueue();
+    DLSS::SetFrameGenerationFeatureLoaded(true);
     CreateSwapchain(window, presentSize);
     CreateCommands();
     CreateFrameSynchronizationFences();
@@ -54,6 +56,8 @@ void RenderDevice::Init(const Window& window, const XMUINT2& presentSize)
 
 void RenderDevice::Terminate()
 {
+    IE_SetDeviceRemovedReasonDevice(nullptr);
+
     for (PerFrameData& frameData : m_AllFrameData)
     {
         if (frameData.fenceEvent)
@@ -120,7 +124,7 @@ SharedPtr<Buffer> RenderDevice::CreateBuffer(BindlessHeaps& bindlessHeaps, ID3D1
     }
     else if (createDesc.heapType == D3D12_HEAP_TYPE_READBACK)
     {
-        createState = D3D12_RESOURCE_STATE_COPY_DEST;
+        createState = D3D12_RESOURCE_STATE_COMMON;
     }
     else if (createDesc.initialState == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)
     {
@@ -320,7 +324,7 @@ void RenderDevice::CreateGPUTimers(TimingState& timingState)
 
         const CD3DX12_RESOURCE_DESC rb = CD3DX12_RESOURCE_DESC::Buffer(maxTimestamps * sizeof(u64));
         const CD3DX12_HEAP_PROPERTIES hp(D3D12_HEAP_TYPE_READBACK);
-        IE_Check(m_Device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&frameData.gpuTimers.readback)));
+        IE_Check(m_Device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&frameData.gpuTimers.readback)));
         IE_Check(frameData.gpuTimers.readback->SetName(L"GpuTimers Readback"));
 
         frameData.gpuTimers.nextIdx = 0;
@@ -347,15 +351,20 @@ void RenderDevice::WaitForFrame(PerFrameData& frameData)
     WaitOnFence(frameData.frameFence, frameData.frameFenceValue, frameData.fenceEvent);
 }
 
-void RenderDevice::ExecuteFrame(const PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd)
+void RenderDevice::ExecuteFrame(const PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd, const u32 streamlineFrameIndex)
 {
     IE_Check(cmd->Close());
     ID3D12CommandList* pCmdList = cmd.Get();
+
+    Streamline::SetPCLMarker(sl::PCLMarker::eRenderSubmitStart, streamlineFrameIndex);
     m_CommandQueue->ExecuteCommandLists(1, &pCmdList);
     IE_Check(m_CommandQueue->Signal(frameData.frameFence.Get(), frameData.frameFenceValue));
+    Streamline::SetPCLMarker(sl::PCLMarker::eRenderSubmitEnd, streamlineFrameIndex);
 
     constexpr UINT presentFlags = DXGI_PRESENT_ALLOW_TEARING;
+    Streamline::SetPCLMarker(sl::PCLMarker::ePresentStart, streamlineFrameIndex);
     IE_Check(m_Swapchain->Present(0, presentFlags));
+    Streamline::SetPCLMarker(sl::PCLMarker::ePresentEnd, streamlineFrameIndex);
 }
 
 void RenderDevice::ExecuteAndWait(PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd)
@@ -507,10 +516,30 @@ void RenderDevice::CreateDevice()
         IE_Assert(false);
     }
 
+    IE_SetDeviceRemovedReasonDevice(m_Device.Get());
+
+    DXGI_ADAPTER_DESC1 adapterDesc{};
+    IE_Check(m_Adapter->GetDesc1(&adapterDesc));
+    Streamline::VerifyPCLSupport(adapterDesc.AdapterLuid);
+    Streamline::VerifyReflexSupport(adapterDesc.AdapterLuid);
+    Streamline::VerifyDLSSGSupport(adapterDesc.AdapterLuid);
+
 #ifdef _DEBUG
     ComPtr<ID3D12InfoQueue> infoQueue;
     if (SUCCEEDED(m_Device.As(&infoQueue)))
     {
+        // Streamline DLSS-G lazily allocates an internal buffer with COPY_DEST as
+        // the requested initial state. D3D12 ignores that state for buffers and
+        // emits warning #1328, but the resource is valid. Keep breaking on
+        // warnings generally, while filtering this known external warning.
+        D3D12_MESSAGE_ID deniedMessageIds[] = {
+            D3D12_MESSAGE_ID_CREATERESOURCE_STATE_IGNORED,
+        };
+        D3D12_INFO_QUEUE_FILTER storageFilter{};
+        storageFilter.DenyList.NumIDs = static_cast<UINT>(std::size(deniedMessageIds));
+        storageFilter.DenyList.pIDList = deniedMessageIds;
+        IE_Check(infoQueue->AddStorageFilterEntries(&storageFilter));
+
         infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
         infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
         infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
@@ -518,6 +547,8 @@ void RenderDevice::CreateDevice()
 #endif
 
     Streamline::SetD3DDevice(m_Device.Get());
+    Streamline::VerifyReflexLowLatencyAvailable();
+    Streamline::VerifyDLSSGLoaded();
     DLSS::VerifyLoaded();
     m_DeviceProxy = CreateStreamlineProxy(m_Device, "ID3D12Device");
 }

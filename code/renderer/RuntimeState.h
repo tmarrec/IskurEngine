@@ -8,14 +8,6 @@
 #include "common/MathUtils.h"
 #include "common/Types.h"
 
-enum class RayTracingResolution : u8
-{
-    Full = 0,        // Full resolution (x, y)
-    FullX_HalfY = 1, // Full resolution in x, half resolution in y
-    Half = 2,        // Both x and y at half resolution
-    Quarter = 3      // Both x and y at quarter resolution
-};
-
 struct RuntimeSettings
 {
     f32 timingAverageWindowMs = 2000.0f;
@@ -40,9 +32,8 @@ struct RuntimeSettings
     f32 sunIntensity = 1.0f;
 
     f32 skyIntensity = 5.0f;
-    f32 ambientStrength = 0.005f;
     f32 shadowMinVisibility = 0.0f;
-    f32 rtIndirectDiffuseStrength = 1.0f;
+    f32 specularShadowMinVisibility = 0.0f;
 
     f32 autoExposureTargetPct = 0.65f;
     f32 autoExposureLowReject = 0.01f;
@@ -56,33 +47,19 @@ struct RuntimeSettings
     f32 autoExposureTauDark = 1.0f;
 
     bool rtShadowsEnabled = true;
-    RayTracingResolution rtShadowsResolution = RayTracingResolution::FullX_HalfY;
-    bool rtSpecularEnabled = true;
-    RayTracingResolution rtSpecularResolution = RayTracingResolution::FullX_HalfY;
-    f32 rtSpecularStrength = 1.0f;
-    u32 rtSpecularSppMin = 1;
-    u32 rtSpecularSppMax = 1;
+    bool rtOmmsEnabled = true;
+    bool rtUse2StateOmmRays = true;
+    bool rtSerEnabled = true;
 
-    u32 pathTraceSpp = 1;
-    u32 pathTraceBounceCount = 2;
-    bool radianceCacheTrilinear = true;
-    bool radianceCacheSoftNormalInterpolation = true;
-    f32 radianceCacheSoftNormalMinDot = 0.50f;
-    u32 radianceCacheTrilinearMinCornerSamples = 128;
-    u32 radianceCacheTrilinearMinHits = 2;
-    u32 radianceCacheTrilinearPresentMinSamples = 64;
-    u32 radianceCacheNormalBinRes = 8;
-    u32 radianceCacheMinExtraSppCount = 32u;
-    u32 radianceCacheMaxProbes = 64;
-    u32 radianceCacheMaxSamples = 131072u;
-    f32 radianceCacheCellSize = 0.10f;
+    u32 rtPathTraceSpp = 1;
+    u32 rtMaxBounces = 12;
 
     bool testMoveInstances = false;
     f32 testMoveInstancesAmplitude = 0.05f;
     f32 testMoveInstancesSpeed = 0.05f;
     u32 testMoveInstancesCount = 64;
     bool debugMeshletColor = false;
-    u32 lightingDebugMode = 0; // 0=None, 1=Indirect Diffuse, 2=Normal
+    u32 lightingDebugMode = 0; // 0=None, 1=Surface Normals
 };
 
 struct RuntimeStats

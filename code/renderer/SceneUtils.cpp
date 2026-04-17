@@ -8,11 +8,46 @@
 #include "common/IskurPackFormat.h"
 #include "common/StringUtils.h"
 
+#include <cstring>
+#include <fstream>
+
 namespace SceneUtils
 {
 namespace
 {
 namespace fs = std::filesystem;
+
+bool MagicOk(const char magic[9])
+{
+    constexpr char mk[9] = {'I', 'S', 'K', 'U', 'R', 'P', 'A', 'C', 'K'};
+    return std::memcmp(magic, mk, 9) == 0;
+}
+
+bool TryReadPackVersion(const fs::path& packPath, u32& outVersion)
+{
+    outVersion = 0;
+
+    std::ifstream file(packPath, std::ios::binary);
+    if (!file.is_open())
+    {
+        return false;
+    }
+
+    IEPack::PackHeader header{};
+    file.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!file || file.gcount() != static_cast<std::streamsize>(sizeof(header)))
+    {
+        return false;
+    }
+
+    if (!MagicOk(header.magic))
+    {
+        return false;
+    }
+
+    outVersion = header.version;
+    return true;
+}
 } // namespace
 
 bool EqualsIgnoreCaseAscii(const String& a, const String& b)
@@ -41,10 +76,10 @@ String SceneStemFromArg(String sceneArg)
     return sceneArg;
 }
 
-Vector<String> EnumerateAvailableScenes()
+Vector<SceneListEntry> EnumerateAvailableScenes()
 {
     const fs::path baseDir = fs::path("data") / "scenes";
-    Vector<String> scenes;
+    Vector<SceneListEntry> scenes;
 
     if (!fs::exists(baseDir) || !fs::is_directory(baseDir))
     {
@@ -62,24 +97,46 @@ Vector<String> EnumerateAvailableScenes()
         {
             continue;
         }
-        scenes.push_back(p.stem().string());
+
+        SceneListEntry scene{};
+        scene.name = p.stem().string();
+        if (!TryReadPackVersion(p, scene.packVersion))
+        {
+            continue;
+        }
+        scene.outOfDate = scene.packVersion != IEPack::PACK_VERSION_LATEST;
+        scenes.push_back(std::move(scene));
     }
 
-    std::sort(scenes.begin(), scenes.end(), [](const String& a, const String& b) { return ToLowerAscii(a) < ToLowerAscii(b); });
+    std::sort(scenes.begin(), scenes.end(), [](const SceneListEntry& a, const SceneListEntry& b) { return ToLowerAscii(a.name) < ToLowerAscii(b.name); });
     return scenes;
 }
 
-String ResolveSceneNameFromList(const String& sceneArg, const Vector<String>& availableScenes)
+String ResolveSceneNameFromList(const String& sceneArg, const Vector<SceneListEntry>& availableScenes)
 {
     const String stem = SceneStemFromArg(sceneArg);
-    for (const String& scene : availableScenes)
+    for (const SceneListEntry& scene : availableScenes)
     {
-        if (EqualsIgnoreCaseAscii(scene, stem))
+        if (EqualsIgnoreCaseAscii(scene.name, stem))
         {
-            return scene;
+            return scene.name;
         }
     }
     return stem;
+}
+
+const SceneListEntry* FindSceneInList(const String& sceneArg, const Vector<SceneListEntry>& availableScenes)
+{
+    const String stem = SceneStemFromArg(sceneArg);
+    for (const SceneListEntry& scene : availableScenes)
+    {
+        if (EqualsIgnoreCaseAscii(scene.name, stem))
+        {
+            return &scene;
+        }
+    }
+
+    return nullptr;
 }
 
 std::filesystem::path ResolveScenePackPath(const String& sceneArg)

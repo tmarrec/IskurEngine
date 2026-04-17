@@ -52,8 +52,8 @@ void Sky::PassSkyMotion(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers
 
         cmd->OMSetRenderTargets(1, &gbufferRtvHandles[kGBufferMotionTargetIndex], false, nullptr);
         cmd->SetPipelineState(m_SkyMotion.pso.Get());
-        cmd->SetGraphicsRootSignature(m_SkyMotion.rootSig.Get());
         cmd->SetDescriptorHeaps(bindlessHeaps.GetDescriptorHeaps().size(), bindlessHeaps.GetDescriptorHeaps().data());
+        cmd->SetGraphicsRootSignature(m_SkyMotion.rootSig.Get());
         cmd->SetGraphicsRootConstantBufferView(0, m_SkyMotion.cb[frameInFlightIdx]->GetGPUVirtualAddress());
         cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmd->DrawInstanced(3, 1, 0, 0);
@@ -133,7 +133,7 @@ void Sky::CacheProceduralSkyState(const Environment& env)
     m_ProceduralSkyCube.lastMultiScatteringStrength = atmosphere.multiScatteringStrength;
 }
 
-void Sky::PassProceduralSkyCube(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers, const Environment& env, const BindlessHeaps& bindlessHeaps, Raytracing& raytracing)
+void Sky::PassProceduralSkyCube(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers, const Environment& env, const BindlessHeaps& bindlessHeaps)
 {
     static_assert(kSkyCubeGenRootConstantsCount == 36);
     if (IsProceduralSkyDirty(env))
@@ -145,9 +145,6 @@ void Sky::PassProceduralSkyCube(const ComPtr<ID3D12GraphicsCommandList7>& cmd, G
     {
         return;
     }
-
-    // Sky lighting changed: invalidate radiance cache so indirect diffuse is rebuilt against the new sky/sun distribution.
-    raytracing.InvalidatePathTraceRadianceCache();
 
     const Array<ID3D12DescriptorHeap*, 2> descriptorHeaps = bindlessHeaps.GetDescriptorHeaps();
     cmd->SetDescriptorHeaps(descriptorHeaps.size(), descriptorHeaps.data());
@@ -176,12 +173,7 @@ void Sky::PassProceduralSkyCube(const ComPtr<ID3D12GraphicsCommandList7>& cmd, G
 void Sky::CreateProceduralSkyCubePipelines(const ComPtr<ID3D12Device14>& device, const Vector<String>& globalDefines)
 {
     Shader::ReloadOrCreate(m_ProceduralSkyCube.genSkyShader, IE_SHADER_TYPE_COMPUTE, "systems/sky/sky_cube_gen.cs.hlsl", globalDefines);
-    m_ProceduralSkyCube.genSkyRootSig = m_ProceduralSkyCube.genSkyShader->GetOrCreateRootSignature(device);
-
-    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-    psoDesc.pRootSignature = m_ProceduralSkyCube.genSkyRootSig.Get();
-    psoDesc.CS = m_ProceduralSkyCube.genSkyShader->GetBytecode();
-    IE_Check(device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_ProceduralSkyCube.genSkyPso)));
+    PipelineHelpers::CreateComputePipeline(device, m_ProceduralSkyCube.genSkyShader, m_ProceduralSkyCube.genSkyRootSig, m_ProceduralSkyCube.genSkyPso);
 }
 
 void Sky::CreateSkyMotionPassPipelines(const ComPtr<ID3D12Device14>& device, const Vector<String>& globalDefines)

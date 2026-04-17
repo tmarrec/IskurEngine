@@ -7,7 +7,11 @@
 
 #include <Windows.h>
 
+struct ID3D12Device;
+
 void IE_Assert(bool condition);
+
+void IE_SetDeviceRemovedReasonDevice(ID3D12Device* device);
 
 bool IE_Try(HRESULT hr);
 

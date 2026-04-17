@@ -29,9 +29,9 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY
     "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # Third-Party Dependencies (subset)
-add_subdirectory("${THIRD_PARTY_OS_ROOT}/meshoptimizer-1.0" "${CMAKE_BINARY_DIR}/_deps/meshoptimizer" EXCLUDE_FROM_ALL)
+add_subdirectory("${THIRD_PARTY_OS_ROOT}/meshoptimizer-1.1" "${CMAKE_BINARY_DIR}/_deps/meshoptimizer" EXCLUDE_FROM_ALL)
 add_subdirectory("${THIRD_PARTY_OS_ROOT}/fastgltf-0.9.0" "${CMAKE_BINARY_DIR}/_deps/fastgltf" EXCLUDE_FROM_ALL)
-add_subdirectory("${THIRD_PARTY_OS_ROOT}/DirectXTex-oct2025" "${CMAKE_BINARY_DIR}/_deps/DirectXTex" EXCLUDE_FROM_ALL)
+add_subdirectory("${THIRD_PARTY_OS_ROOT}/DirectXTex-mar2026" "${CMAKE_BINARY_DIR}/_deps/DirectXTex" EXCLUDE_FROM_ALL)
 
 # MikkTSpace
 add_library(mikktspace STATIC "${THIRD_PARTY_OS_ROOT}/MikkTSpace/mikktspace.c")

@@ -6,19 +6,14 @@
 #pragma once
 
 #include <DirectXMath.h>
-#include <cstdint>
+
+#include "common/Types.h"
 
 namespace IEPack
 {
-// Short type aliases
-using u8 = std::uint8_t;
-using u32 = std::uint32_t;
-using u64 = std::uint64_t;
-using i32 = std::int32_t;
-
 inline constexpr char PACK_FILE_EXTENSION[] = ".ikp";
 
-constexpr u32 PACK_VERSION_LATEST = 18;
+constexpr u32 PACK_VERSION_LATEST = 19;
 
 constexpr u32 FourCC(char a, char b, char c, char d)
 {
@@ -35,6 +30,9 @@ enum : u32
     CH_MLVT = FourCC('M', 'L', 'V', 'T'),
     CH_MLTR = FourCC('M', 'L', 'T', 'R'),
     CH_MLBD = FourCC('M', 'L', 'B', 'D'),
+    CH_OMIX = FourCC('O', 'M', 'I', 'X'),
+    CH_OMDS = FourCC('O', 'M', 'D', 'S'),
+    CH_OMDT = FourCC('O', 'M', 'D', 'T'),
 
     // Textures
     CH_TXHD = FourCC('T', 'X', 'H', 'D'),
@@ -88,12 +86,25 @@ struct PrimRecord
     u32 vertexCount, indexCount, meshletCount;
     u64 vertexByteOffset, indexByteOffset, meshletsByteOffset, mlVertsByteOffset, mlTrisByteOffset, mlBoundsByteOffset;
     u32 mlVertsCount, mlTrisByteCount;
+    u32 ommIndexOffset, ommIndexCount;
+    u32 ommDescOffset, ommDescCount;
+    u64 ommDataByteOffset;
+    u32 ommDataByteSize, ommFormat;
 
     // Primitive-local bounding sphere (object space).
     DirectX::XMFLOAT3 localBoundsCenter;
-    float localBoundsRadius;
+    f32 localBoundsRadius;
 };
-static_assert(sizeof(PrimRecord) == 96);
+static_assert(sizeof(PrimRecord) == 128);
+
+struct OpacityMicromapDescRecord
+{
+    u32 dataByteOffset;
+    u32 dataByteSize;
+    u32 subdivisionLevel;
+    u32 reserved;
+};
+static_assert(sizeof(OpacityMicromapDescRecord) == 16);
 
 // Texture table entry
 struct TextureRecord
@@ -129,7 +140,7 @@ struct MaterialRecord
     // Sampler indices into SAMP (UINT32_MAX for none)
     u32 baseColorSampler, normalSampler, metallicRoughSampler, occlusionSampler, emissiveSampler;
 
-    float baseColorFactor[4], emissiveFactor[3], metallicFactor, roughnessFactor, normalScale, occlusionStrength, alphaCutoff;
+    f32 baseColorFactor[4], emissiveFactor[3], metallicFactor, roughnessFactor, normalScale, occlusionStrength, alphaCutoff;
     u32 flags; // MATF_ALPHA_* | MATF_DOUBLE_SIDED
 };
 

@@ -8,22 +8,24 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
 
 ## Features
 
+- **Hardware Path-Traced Lighting**
+- **Opacity Micromaps**
+- **Shader Execution Reordering**
+- **NVIDIA DLSS Ray Reconstruction**
 - **PBR Shading**
 - **Procedural Sky + Atmosphere**
-- **Hardware Ray-Traced Shadows:** BLAS and TLAS are built at runtime
-- **Hardware Ray-Traced Specular**
-- **Diffuse GI via Hardware Ray Tracing + Radiance Cache:** caches radiance in a spatial hash map
-- **HDR Pipeline:** full FP16 render targets with AgX tone mapping
+- **HDR Pipeline (AgX Tone Mapping)**
 - **Auto-Exposure**
 - **Bloom**
 - **NVIDIA DLSS Super Resolution + DLAA**
+- **NVIDIA DLSS Frame Generation**
 - **Mesh Shaders**
 - **Meshlet Frustum and Backface Culling**
-- **Bindless Resources:** textures, samplers, and buffers
+- **Bindless Resources**
 - **Reverse-Z**
-- **Runtime Shader Compilation** with manual reload
+- **Runtime Shader Compilation**
 - **Environment Presets**
-- **Scene Packer:** generates tangents, mipmaps, compressed textures, and meshlets
+- **Scene Packer**
 - **Live CPU/GPU Pass Timings**
 - **In-engine debugging and tuning UI**
 
@@ -36,32 +38,32 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
 <br/>
 
 <p align="center">
-  <img src="screenshots/sponza.jpg" alt="Sponza showcase"><br/>
-  <em>Sponza</em>
-</p>
-<br/>
-
-<p align="center">
   <img src="screenshots/san-miguel.jpg" alt="San-Miguel showcase"><br/>
   <em>San-Miguel</em>
 </p>
 <br/>
 
 <p align="center">
+  <img src="screenshots/sponza.jpg" alt="Sponza showcase"><br/>
+  <em>Sponza</em>
+</p>
+<br/>
+
+<p align="center">
+  <img src="screenshots/raw-path-trace.jpg" alt="Raw path-traced lighting output"><br/>
+  <em>Raw Path-Traced Lighting</em>
+</p>
+<br/>
+
+<p align="center">
   <img src="screenshots/stanford-dragon.jpg" alt="Stanford Dragon meshlets view"><br/>
-  <em>Meshlets</em>
+  <em>Meshlet Visualization</em>
 </p>
 <br/>
 
 <p align="center">
   <img src="screenshots/debug.jpg" alt="Debug view with ImGui panels"><br/>
-  <em>ImGui</em>
-</p>
-<br/>
-
-<p align="center">
-  <img src="screenshots/indirect-diffuse.jpg" alt="Indirect diffuse render target debug view"><br/>
-  <em>Indirect diffuse debug view</em>
+  <em>Runtime Debug UI</em>
 </p>
 
 ## Third-Party Dependencies
@@ -84,11 +86,11 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
 ### Prerequisites
 
 - Windows 11 (up to date)
-- Visual Studio 2026 (ensure the following components are installed)
+- Visual Studio 2026 (C++ desktop workload)
    - Windows 11 SDK
 - CMake 4.3 or higher
-- NVIDIA GeForce RTX 20 Series GPU or newer
-  - Iškur Engine is a personal rendering engine, and I intentionally keep the hardware target narrow rather than adding extra complexity to support a wider range of GPUs.
+- NVIDIA GeForce RTX 40 Series GPU or newer
+  - I intentionally keep the hardware target narrow rather than adding extra complexity to support a wider range of GPUs.
 
 ### Setup Instructions
 
@@ -125,11 +127,15 @@ I share brief articles and experiments on computer graphics at [tmarrec.dev](htt
 
    ```bash
    scripts\build_release.bat
+
+   # If you want a debug build instead, run:
+   # scripts\build_debug.bat
    ```
 
 5. **Run**
 
-   After building, the engine executable is available in `bin\Release` (or `bin\Debug`).
+   After a release build, the engine executable is available in `bin\Release`.
+   After a debug build, it is available in `bin\Debug`.
 
    ```bash
    bin\Release\IskurEngine.exe
@@ -149,17 +155,18 @@ You can also enable the D3D12 debug layer's GPU-based validation with:
 IskurEngine.exe --gpu-validation
 ```
 
-## Controls and Runtime UI
+## Controls
 
 - `W/A/S/D`: move horizontally
 - `Q/E`: move down/up
+- `Mouse`: look around while captured
 - `Shift`: move faster
 - `Ctrl`: move slower
 - `Space`: toggle mouse capture for freelook
 - `Esc`: release mouse capture
 
 ## Scene Packer (.glb to .ikp)
-glTF `.glb` scenes need to be packed using **IskurScenePacker**; it generates MikkTSpace tangents, mipmaps, BC-compressed textures, and meshlets for runtime use.
+glTF `.glb` scenes need to be packed using **IskurScenePacker**; it generates MikkTSpace tangents, mipmaps, compressed textures, meshlets, and opacity micromap data for runtime use.
 
 Place your source `.glb` files in `data/scenes/sources/<SceneName>.glb`.
 Running the packer will generate `data/scenes/<SceneName>.ikp`, which the engine loads at runtime.

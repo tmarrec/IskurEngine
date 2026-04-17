@@ -21,7 +21,7 @@ set(DIRECTX_DXC_PATH "${DXC_BIN_DIR}")
 # Open-source dependencies used by the engine target.
 set(ENGINE_OPEN_SOURCE_DEPENDENCIES
   D3D12MemoryAllocator-3.1.0
-  DirectXTex-oct2025
+  DirectXTex-mar2026
 )
 foreach(dep IN LISTS ENGINE_OPEN_SOURCE_DEPENDENCIES)
   add_subdirectory("${THIRD_PARTY_OS_ROOT}/${dep}" EXCLUDE_FROM_ALL)
@@ -29,7 +29,7 @@ endforeach()
 
 # Open-source dependencies used by the scene packer target.
 set(PACKER_OPEN_SOURCE_DEPENDENCIES
-  meshoptimizer-1.0
+  meshoptimizer-1.1
   fastgltf-0.9.0
 )
 foreach(dep IN LISTS PACKER_OPEN_SOURCE_DEPENDENCIES)
@@ -37,7 +37,7 @@ foreach(dep IN LISTS PACKER_OPEN_SOURCE_DEPENDENCIES)
 endforeach()
 
 # ImGui
-set(IMGUI_DIR "${THIRD_PARTY_OS_ROOT}/imgui-1.92.6")
+set(IMGUI_DIR "${THIRD_PARTY_OS_ROOT}/imgui-1.92.7")
 add_library(imgui STATIC
   ${IMGUI_DIR}/imgui.cpp
   ${IMGUI_DIR}/imgui_draw.cpp

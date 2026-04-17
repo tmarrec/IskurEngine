@@ -134,48 +134,16 @@ struct PrimitiveConstants
 	u32 allowBackfaceConeCull;
 };
 
-struct
-#ifdef __cplusplus
-	alignas(256)
-#endif
-	LightingPassConstants
+struct DLSSRRGuideConstants
 {
+	XMFLOAT4X4 invViewProj;
+	XMFLOAT3 cameraPos;
 	u32 albedoTextureIndex;
 	u32 normalTextureIndex;
 	u32 materialTextureIndex;
 	u32 depthTextureIndex;
-
-	u32 samplerIndex;
-	XMFLOAT3 cameraPos;
-
-	XMFLOAT4X4 invViewProj;
-
-	XMFLOAT3 sunDir;
-	u32 rtShadowTextureIndex;
-
-	u32 skyCubeIndex;
-	u32 rtShadowsEnabled;
-
-	u32 rtSpecularTextureIndex;
-	u32 rtSpecularEnabled;
-	f32 rtSpecularStrength;
-
-	XMFLOAT2 renderSize;
-	u32 _padBeforeSunColor;
-	XMFLOAT3 sunColor;
-	f32 sunIntensity;
-	f32 skyIntensity;
-	f32 ambientStrength;
-	f32 shadowMinVisibility;
-	f32 rtIndirectDiffuseStrength;
-	u32 aoTextureIndex;
-	u32 indirectDiffuseTextureIndex;
-	u32 emissiveTextureIndex;
-	u32 debugViewMode;
-	u32 debugMeshletColorEnabled;
-	u32 _padLighting0;
-	u32 _padLighting1;
-	u32 _padLighting2;
+	u32 diffuseAlbedoOutputTextureIndex;
+	u32 specularAlbedoOutputTextureIndex;
 };
 
 struct ClearConstants
@@ -233,6 +201,13 @@ struct TonemapConstants
 	f32 bloomIntensity;
 };
 
+struct PresentCompositeConstants
+{
+	u32 hudlessTextureIndex;
+	u32 uiTextureIndex;
+	u32 samplerIndex;
+};
+
 struct BloomDownsampleConstants
 {
 	u32 inputTextureIndex;
@@ -268,38 +243,6 @@ struct
 	XMFLOAT4X4 prevProjectionNoJitter;
 };
 
-struct RTShadowsBlurConstants
-{
-	f32 zNear;
-	u32 inputTextureIndex;
-	u32 depthTextureIndex;
-	u32 normalGeoTextureIndex;
-
-	u32 outputTextureIndex;
-	XMUINT2 axis;
-};
-
-struct RTShadowsTraceConstants
-{
-	XMFLOAT4X4 invViewProj;
-
-	u32 outputTextureIndex;
-	u32 tlasIndex;
-	XMUINT2 ditherOffset;
-
-	XMFLOAT3 cameraPos;
-	u32 depthTextureIndex;
-
-	XMFLOAT2 fullDimInv;
-	XMUINT2 ditherFactors;
-
-	XMFLOAT3 sunDir;
-	u32 normalGeoTextureIndex;
-
-	u32 primInfoBufferIndex;
-	u32 materialsBufferIndex;
-};
-
 struct RTPrimInfo
 {
 	u32 vbSrvIndex;
@@ -313,94 +256,59 @@ struct PathTraceConstants
 	XMFLOAT4X4 invViewProj;
 
 	XMFLOAT3 cameraPos;
-	u32 indirectDiffuseTextureIndex;
-
-	XMFLOAT3 sunDir;
-	u32 normalGeoTextureIndex;
-
-	XMFLOAT2 fullDimInv;
-	u32 tlasIndex;
+	u32 outputTextureIndex;
+	u32 hitDistanceTextureIndex;
 	u32 depthTextureIndex;
 
-	u32 primInfoBufferIndex;
-	u32 materialsBufferIndex;
-	u32 radianceCacheUavIndex;
-	u32 radianceCacheSrvIndex;
-
-	u32 radianceSamplesUavIndex;
-	u32 samplesCount;
-	f32 radianceCacheCellSize;
-	u32 frameIndex;
-
-	u32 skyCubeIndex;
-	f32 skyIntensity;
-	u32 samplerIndex;
-	f32 _pad0;
-	XMFLOAT3 sunRadiance;
-	u32 spp;
-
-	u32 bounceCount;
-	u32 useTrilinear;
-	u32 useSoftNormalInterpolation;
-	f32 softNormalMinDot;
-
-	u32 trilinearMinCornerSamples;
-	u32 trilinearMinHits;
-	u32 trilinearPresentMinSamples;
-	u32 normalBinRes;
-
-	u32 minExtraSppCount;
-	u32 maxProbes;
-	u32 maxSamples;
-};
-
-struct PathTraceUpsampleConstants
-{
-	u32 inputTextureIndex;
-	u32 outputTextureIndex;
-	u32 depthTextureIndex;
-	u32 normalGeoTextureIndex;
-};
-
-struct RTSpecularConstants
-{
-	XMFLOAT4X4 invViewProj;
-
-	XMFLOAT3 cameraPos;
-	u32 outputTextureIndex;
-
-	XMFLOAT3 sunDir;
+	u32 albedoTextureIndex;
 	u32 normalTextureIndex;
-
-	XMFLOAT2 fullDimInv;
-	u32 tlasIndex;
-	u32 depthTextureIndex;
-
+	u32 normalGeoTextureIndex;
 	u32 materialTextureIndex;
+
+	u32 emissiveTextureIndex;
+	u32 tlasIndex;
 	u32 primInfoBufferIndex;
+
 	u32 materialsBufferIndex;
 	u32 skyCubeIndex;
-
 	u32 samplerIndex;
-	f32 skyIntensity;
-	f32 sunIntensity;
+	// Keep sunDir + frameIndex together to match HLSL cbuffer packing for root constants.
+	XMFLOAT3 sunDir;
 	u32 frameIndex;
 
 	XMFLOAT3 sunColor;
-	f32 roughnessRaySpread;
-	u32 sppMin;
-	u32 sppMax;
-	u32 _padAfterSpp; // keep next uint2 aligned on 16-byte boundary for HLSL cbuffer packing
-	u32 _padBeforeDitherFactors;
-	XMUINT2 ditherFactors;
-	XMUINT2 ditherOffset;
+	u32 rtPathTraceSpp;
+
+	XMFLOAT2 fullDimInv;
+	f32 skyIntensity;
+	f32 sunIntensity;
+	f32 sunDiskAngleDeg;
+
+	f32 shadowMinVisibility;
+	f32 specularShadowMinVisibility;
+	u32 rtMaxBounces;
+	u32 _padPathTrace0;
+
+	u32 rtShadowsEnabled;
+	u32 rtUse2StateOmmRays;
+	u32 rtOmmsEnabled;
+	u32 rtSerEnabled;
+
+	u32 debugViewMode;
+	u32 debugMeshletColorEnabled;
+	u32 _padPathTrace1;
+	u32 _padPathTrace2;
 };
+
+STATIC_C u32 PathTraceDebugView_None = 0u;
+STATIC_C u32 PathTraceDebugView_SurfaceNormals = 1u;
 
 struct SkyCubeGenConstants
 {
 	u32 outUavIndex;
 	u32 size;
-	XMFLOAT2 _pad;
+	u32 _pad0;
+	u32 _pad1;
 	XMFLOAT3 sunDir;
 	f32 sunIntensity;
 
@@ -431,70 +339,5 @@ struct SkyCubeGenConstants
 	f32 multiScatteringStrength;
 	// Keep struct dword-aligned for root constants upload.
 	XMFLOAT2 _pad2;
-};
-
-// Radiance cache
-
-STATIC_C u32 RC_ENTRIES = 1u << 25;
-STATIC_C u32 RC_MASK = RC_ENTRIES - 1;
-STATIC_C u32 RC_EMPTY = 0xFFFFFFFFu;
-STATIC_C u32 RC_LOCKED = 0xFFFFFFFEu;
-
-struct RadianceCacheEntry
-{
-	u32 key; // 0xFFFFFFFF = empty
-	u32 normalOct;
-	u32 radianceR;
-	u32 radianceG;
-	u32 radianceB;
-	u32 sampleCount;
-	u32 lastFrame;
-	u32 pad;
-};
-
-struct RadianceSample
-{
-	u32 key;
-	u32 keySignature;
-	u32 radianceR;
-	u32 radianceG;
-	u32 radianceB;
-};
-
-struct PathTraceCacheClearSamplesConstants
-{
-	u32 radianceSamplesUavIndex;
-	u32 samplesCount;
-};
-
-struct PathTraceCacheIntegrateSamplesConstants
-{
-	u32 radianceSamplesSrvIndex;
-	u32 radianceCacheUavIndex;
-	u32 radianceCacheUsageCounterUavIndex;
-	u32 samplesCount;
-	u32 frameIndex;
-
-	u32 maxProbes;
-	u32 maxSamples;
-};
-
-struct PathTraceCachePruneConstants
-{
-	u32 radianceCacheUavIndex;
-	u32 radianceCacheUsageCounterUavIndex;
-	u32 frameIndex;
-	u32 minAgeToPrune;
-
-	u32 minSamplesToKeep;
-	u32 attemptsPerThread;
-	u32 randomSeed;
-};
-
-struct PathTraceCacheClearCacheConstants
-{
-	u32 radianceCacheUavIndex;
-	u32 cacheEntries;
-	u32 dispatchGroupsX;
 };
 

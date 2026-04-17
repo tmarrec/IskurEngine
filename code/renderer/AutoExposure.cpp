@@ -5,14 +5,25 @@
 
 #include "AutoExposure.h"
 
+#include "PipelineHelpers.h"
 #include "RenderDevice.h"
 #include "RuntimeState.h"
 #include "shaders/CPUGPU.h"
 
 namespace
 {
+void ReleaseTextureDescriptors(BindlessHeaps& bindlessHeaps, Texture& texture)
+{
+    bindlessHeaps.FreeCbvSrvUav(texture.srvIndex);
+    bindlessHeaps.FreeCbvSrvUav(texture.uavIndex);
+    texture.srvIndex = UINT32_MAX;
+    texture.uavIndex = UINT32_MAX;
+}
+
 void CreateExposureTexture(const ComPtr<ID3D12Device14>& device, BindlessHeaps& bindlessHeaps, Texture& outTexture, const wchar_t* name)
 {
+    ReleaseTextureDescriptors(bindlessHeaps, outTexture);
+
     const CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
     const CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R32_FLOAT, 1, 1, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
 
@@ -40,6 +51,14 @@ void AutoExposure::CreateResources(RenderDevice& renderDevice, BindlessHeaps& bi
     m_ResetHistory = true;
     const ComPtr<ID3D12Device14>& device = renderDevice.GetDevice();
 
+    if (m_Resources.histogramBuffer)
+    {
+        bindlessHeaps.FreeCbvSrvUav(m_Resources.histogramBuffer->srvIndex);
+        bindlessHeaps.FreeCbvSrvUav(m_Resources.histogramBuffer->uavIndex);
+        m_Resources.histogramBuffer->srvIndex = UINT32_MAX;
+        m_Resources.histogramBuffer->uavIndex = UINT32_MAX;
+    }
+
     BufferCreateDesc bufferDesc;
     bufferDesc.heapType = D3D12_HEAP_TYPE_DEFAULT;
     bufferDesc.viewKind = BufferCreateDesc::ViewKind::Structured;
@@ -59,29 +78,35 @@ void AutoExposure::CreateResources(RenderDevice& renderDevice, BindlessHeaps& bi
     CreateExposureTexture(device, bindlessHeaps, m_Resources.finalExposureTexture, L"Final Exposure Scale");
 }
 
+void AutoExposure::InvalidateDescriptorIndices()
+{
+    if (m_Resources.histogramBuffer)
+    {
+        m_Resources.histogramBuffer->srvIndex = UINT32_MAX;
+        m_Resources.histogramBuffer->uavIndex = UINT32_MAX;
+    }
+
+    m_Resources.exposureTexture.srvIndex = UINT32_MAX;
+    m_Resources.exposureTexture.uavIndex = UINT32_MAX;
+    m_Resources.adaptedExposureTexture.srvIndex = UINT32_MAX;
+    m_Resources.adaptedExposureTexture.uavIndex = UINT32_MAX;
+    m_Resources.finalExposureTexture.srvIndex = UINT32_MAX;
+    m_Resources.finalExposureTexture.uavIndex = UINT32_MAX;
+}
+
 void AutoExposure::CreatePipelines(const ComPtr<ID3D12Device14>& device, const Vector<String>& globalDefines)
 {
-    auto CreateComputePipeline = [&](const SharedPtr<Shader>& shader, ComPtr<ID3D12RootSignature>& outRootSig, ComPtr<ID3D12PipelineState>& outPso) {
-        IE_Assert(shader && shader->IsValid());
-        outRootSig = shader->GetOrCreateRootSignature(device);
-
-        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-        psoDesc.pRootSignature = outRootSig.Get();
-        psoDesc.CS = shader->GetBytecode();
-        IE_Check(device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&outPso)));
-    };
-
     Shader::ReloadOrCreate(m_Resources.clearUintShader, IE_SHADER_TYPE_COMPUTE, "systems/exposure/clear_uint.cs.hlsl", globalDefines);
-    CreateComputePipeline(m_Resources.clearUintShader, m_Resources.clearUintRootSig, m_Resources.clearUintPso);
+    PipelineHelpers::CreateComputePipeline(device, m_Resources.clearUintShader, m_Resources.clearUintRootSig, m_Resources.clearUintPso);
 
     Shader::ReloadOrCreate(m_Resources.histogramShader, IE_SHADER_TYPE_COMPUTE, "systems/exposure/histogram.cs.hlsl", globalDefines);
-    CreateComputePipeline(m_Resources.histogramShader, m_Resources.histogramRootSig, m_Resources.histogramPso);
+    PipelineHelpers::CreateComputePipeline(device, m_Resources.histogramShader, m_Resources.histogramRootSig, m_Resources.histogramPso);
 
     Shader::ReloadOrCreate(m_Resources.exposureShader, IE_SHADER_TYPE_COMPUTE, "systems/exposure/exposure.cs.hlsl", globalDefines);
-    CreateComputePipeline(m_Resources.exposureShader, m_Resources.exposureRootSig, m_Resources.exposurePso);
+    PipelineHelpers::CreateComputePipeline(device, m_Resources.exposureShader, m_Resources.exposureRootSig, m_Resources.exposurePso);
 
     Shader::ReloadOrCreate(m_Resources.adaptExposureShader, IE_SHADER_TYPE_COMPUTE, "systems/exposure/adapt_exposure.cs.hlsl", globalDefines);
-    CreateComputePipeline(m_Resources.adaptExposureShader, m_Resources.adaptExposureRootSig, m_Resources.adaptExposurePso);
+    PipelineHelpers::CreateComputePipeline(device, m_Resources.adaptExposureShader, m_Resources.adaptExposureRootSig, m_Resources.adaptExposurePso);
 }
 
 void AutoExposure::Pass(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers, const BindlessHeaps& bindlessHeaps, GpuResource& hdrTexture, u32 hdrSrvIndex, u32 depthSrvIndex,

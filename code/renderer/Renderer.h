@@ -46,13 +46,12 @@ class Renderer
     SharedPtr<Buffer> CreateBuffer(ID3D12GraphicsCommandList7* cmd, const BufferCreateDesc& createDesc);
     void SetBufferData(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const SharedPtr<Buffer>& dst, const void* data, u32 sizeInBytes, u32 offsetInBytes = 0);
 
-    BindlessHeaps& GetBindlessHeaps();
     const ComPtr<ID3D12Device14>& GetDevice() const;
     Window& GetWindow();
     const Window& GetWindow() const;
-    XMUINT2 GetRenderSize() const;
     Camera& GetCamera();
     const Camera& GetCamera() const;
+    u32 GetStreamlineFrameIndex() const;
 
     using PerFrameData = RenderDevice::PerFrameData;
     PerFrameData& GetCurrentFrameData();
@@ -67,18 +66,25 @@ class Renderer
     void RequestShaderReload();
     void RequestSceneSwitch(const String& sceneFile);
     void RequestDLSSMode(DLSS::Mode mode);
+    void RequestFrameGenerationEnabled(bool enabled);
     DLSS::Mode GetDLSSMode() const;
+    bool IsFrameGenerationEnabled() const;
+    u32 GetFrameGenerationPresentedFrames() const;
     bool HasPendingSceneSwitch() const;
     const String& GetPendingSceneFile() const;
     const String& GetCurrentSceneFile() const;
-    const Vector<String>& GetAvailableScenes() const;
+    const Vector<SceneUtils::SceneListEntry>& GetAvailableScenes() const;
 
   private:
     Window& m_Window;
 
     void ApplyTestInstanceMotion();
     void CreateSceneDepthSRVs();
+    void InvalidateRuntimeDescriptorIndices();
+    void PrepareRuntimeReload();
     void PresentLoadingFrame();
+    void RecreateRuntimeFrameResources(bool recreateSkyCube);
+    void SubmitDLSSCommonConstants(const Camera::FrameData& cameraFrameData, f32 jitterPxX, f32 jitterPxY, bool reset);
     void SubmitSceneUploadAndSync(PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd);
 
     // Keep the device layer declared before allocator-backed resources so it outlives them.
@@ -110,19 +116,15 @@ class Renderer
         Array<ComPtr<ID3D12RootSignature>, AlphaMode_Count> rootSigs;
     } m_GBuf{};
 
-    struct LightingResources
+    struct DLSSRRGuideResources
     {
-        ComPtr<ID3D12PipelineState> pso;
+        SharedPtr<Shader> cs;
         ComPtr<ID3D12RootSignature> rootSig;
-        SharedPtr<Shader> pxShader;
-        SharedPtr<Shader> vxShader;
+        ComPtr<ID3D12PipelineState> pso;
 
-        Array<RenderTarget, IE_Constants::frameInFlightCount> hdrRt;
-        ComPtr<ID3D12DescriptorHeap> rtvHeap;
-
-        Array<ComPtr<ID3D12Resource>, IE_Constants::frameInFlightCount> cb;
-        Array<u8*, IE_Constants::frameInFlightCount> cbMapped;
-    } m_Light{};
+        Array<Texture, IE_Constants::frameInFlightCount> diffuseAlbedo;
+        Array<Texture, IE_Constants::frameInFlightCount> specularAlbedo;
+    } m_DLSSRRGuides{};
 
     struct ToneMapResources
     {
@@ -131,8 +133,15 @@ class Renderer
 
         Array<RenderTarget, IE_Constants::frameInFlightCount> sdrRt;
         ComPtr<ID3D12DescriptorHeap> rtvHeap;
+        Array<RenderTarget, IE_Constants::frameInFlightCount> uiRt;
+        ComPtr<ID3D12DescriptorHeap> uiRtvHeap;
+        Array<RenderTarget, IE_Constants::frameInFlightCount> backBufferRt;
+        ComPtr<ID3D12DescriptorHeap> backBufferRtvHeap;
         SharedPtr<Shader> vxShader;
         SharedPtr<Shader> pxShader;
+        SharedPtr<Shader> composePxShader;
+        ComPtr<ID3D12RootSignature> composeRootSig;
+        ComPtr<ID3D12PipelineState> composePso;
     } m_Tonemap{};
 
     struct BloomResources
@@ -167,37 +176,37 @@ class Renderer
     void CreateUpscaleResources();
     void CreateBloomResources();
     void CreateGBufferPassResources();
-    void CreateLightingPassResources();
+    void CreateDLSSRRGuideResources();
 
     void CreateDepthPrePassPipelines(const Vector<String>& globalDefines);
     void CreateGBufferPassPipelines(const Vector<String>& globalDefines);
-    void CreateLightingPassPipelines(const Vector<String>& globalDefines);
+    void CreateDLSSRRGuidePassPipelines(const Vector<String>& globalDefines);
     void CreateBloomPassPipelines(const Vector<String>& globalDefines);
     void CreateToneMapPassPipelines(const Vector<String>& globalDefines);
 
     void ReloadRuntimeAndScene(const String& sceneFile);
-    void ReloadRuntimeForDLSSModeChange();
+    void ReloadRuntimeForUpscalingConfigChange();
     void LoadScene(const String& sceneFile);
     void ProcessPendingSceneSwitch();
-
     void BeginFrame(PerFrameData& frameData, ComPtr<ID3D12GraphicsCommandList7>& cmd, Camera::FrameData& cameraFrameData, f32& jitterNormX, f32& jitterNormY);
     void Pass_DepthPre(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
-    void Pass_Shadows(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
     void Pass_GBuffer(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
+    void Pass_DLSSRRGuides(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const Camera::FrameData& cameraFrameData);
     void Pass_PathTrace(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
-    void Pass_RTSpecular(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
-    void Pass_Lighting(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const Camera::FrameData& cameraFrameData);
-    void Pass_Upscale(const ComPtr<ID3D12GraphicsCommandList7>& cmd, f32 jitterNormX, f32 jitterNormY, const Camera::FrameData& cameraFrameData);
+    void Pass_Upscale(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const Camera::FrameData& cameraFrameData);
     void Pass_Bloom(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
     void Pass_Tonemap(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
     void Pass_ImGui(const ComPtr<ID3D12GraphicsCommandList7>& cmd, const Camera::FrameData& cameraFrameData);
+    void Pass_PresentComposite(const ComPtr<ID3D12GraphicsCommandList7>& cmd);
     void EndFrame(const PerFrameData& frameData, const ComPtr<ID3D12GraphicsCommandList7>& cmd);
+    void CheckFrameGenerationApiError();
 
     void WaitForGpuIdle();
     void ReloadShaders();
 
     u32 m_FrameInFlightIdx = 0;
     u32 m_FrameIndex = 0;
+    u32 m_StreamlineFrameIndex = 0;
 
     SharedPtr<Buffer> m_ConstantsBuffer;
     u8* m_ConstantsCbMapped = nullptr;
@@ -217,15 +226,14 @@ class Renderer
     Culling m_Culling;
     AutoExposure m_AutoExposure;
     Sky m_Sky;
-    f32 m_LastSkyIntensityForRadianceCache = -1.0f;
-    u32 m_LastRadianceCacheMaxSamples = 0u;
-    u32 m_LastRadianceCacheNormalBinRes = 0u;
-    f32 m_LastRadianceCacheCellSize = -1.0f;
     bool m_TestMovePrev = false;
     Vector<XMFLOAT4X4> m_TestBaseWorlds;
     DLSS::Mode m_DLSSMode = DLSS::Mode::Quality;
     DLSS::Mode m_PendingDLSSMode = DLSS::Mode::Quality;
     bool m_HasPendingDLSSModeChange = false;
+    bool m_FrameGenerationEnabled = true;
+    bool m_PendingFrameGenerationEnabled = true;
+    bool m_HasPendingFrameGenerationChange = false;
     u32 m_PendingSceneSwitchDelayFrames = 0;
 
     Environments m_Environments;

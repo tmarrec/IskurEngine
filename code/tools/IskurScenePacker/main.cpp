@@ -46,7 +46,7 @@ static void Require(bool cond, const char* msg)
         Fatal(msg);
 }
 
-static bool IsFiniteF32(float v)
+static bool IsFiniteF32(f32 v)
 {
     return std::isfinite(v);
 }
@@ -75,13 +75,13 @@ static bool IsFiniteFloat4x4(const XMFLOAT4X4& m)
 
 struct IskurMeshlet
 {
-    uint32_t vertexOffset, triangleOffset;
-    uint16_t vertexCount, triangleCount;
+    u32 vertexOffset, triangleOffset;
+    u16 vertexCount, triangleCount;
 };
 
 using namespace IEPack;
 
-static XMMATRIX RowMatFromColArray(const float Mc[16])
+static XMMATRIX RowMatFromColArray(const f32 Mc[16])
 {
     return XMMatrixSet(Mc[0], Mc[1], Mc[2], Mc[3], Mc[4], Mc[5], Mc[6], Mc[7], Mc[8], Mc[9], Mc[10], Mc[11], Mc[12], Mc[13], Mc[14], Mc[15]);
 }
@@ -89,137 +89,137 @@ static XMMATRIX RowMatFromColArray(const float Mc[16])
 static XMMATRIX NodeLocalMatrix_Row(const fastgltf::Node& n)
 {
     const fastgltf::math::fmat4x4 m = fastgltf::getTransformMatrix(n, fastgltf::math::fmat4x4(1.0f));
-    float Mc[16] = {
+    f32 Mc[16] = {
         m.col(0).x(), m.col(0).y(), m.col(0).z(), m.col(0).w(), m.col(1).x(), m.col(1).y(), m.col(1).z(), m.col(1).w(),
         m.col(2).x(), m.col(2).y(), m.col(2).z(), m.col(2).w(), m.col(3).x(), m.col(3).y(), m.col(3).z(), m.col(3).w(),
     };
     return RowMatFromColArray(Mc);
 }
 
-static float SignNotZeroF(float v)
+static f32 SignNotZeroF(f32 v)
 {
     return (v >= 0.0f) ? 1.0f : -1.0f;
 }
 
 static XMFLOAT3 NormalizeSafe(const XMFLOAT3& n)
 {
-    const float len2 = n.x * n.x + n.y * n.y + n.z * n.z;
+    const f32 len2 = n.x * n.x + n.y * n.y + n.z * n.z;
     if (len2 <= 1e-20f)
         return XMFLOAT3(0.0f, 0.0f, 1.0f);
-    const float invLen = 1.0f / std::sqrt(len2);
+    const f32 invLen = 1.0f / std::sqrt(len2);
     return XMFLOAT3(n.x * invLen, n.y * invLen, n.z * invLen);
 }
 
-static uint32_t PackNormalOctSnorm16(const XMFLOAT3& inNormal)
+static u32 PackNormalOctSnorm16(const XMFLOAT3& inNormal)
 {
     XMFLOAT3 n = NormalizeSafe(inNormal);
-    const float invL1 = 1.0f / (std::abs(n.x) + std::abs(n.y) + std::abs(n.z));
-    float ex = n.x * invL1;
-    float ey = n.y * invL1;
+    const f32 invL1 = 1.0f / (std::abs(n.x) + std::abs(n.y) + std::abs(n.z));
+    f32 ex = n.x * invL1;
+    f32 ey = n.y * invL1;
     if (n.z < 0.0f)
     {
-        const float ox = (1.0f - std::abs(ey)) * SignNotZeroF(ex);
-        const float oy = (1.0f - std::abs(ex)) * SignNotZeroF(ey);
+        const f32 ox = (1.0f - std::abs(ey)) * SignNotZeroF(ex);
+        const f32 oy = (1.0f - std::abs(ex)) * SignNotZeroF(ey);
         ex = ox;
         ey = oy;
     }
 
-    const auto toSnorm16 = [](float v) -> int16_t {
+    const auto toSnorm16 = [](f32 v) -> i16 {
         v = std::clamp(v, -1.0f, 1.0f);
         int q = static_cast<int>(std::lround(v * 32767.0f));
         q = std::clamp(q, -32767, 32767);
-        return static_cast<int16_t>(q);
+        return static_cast<i16>(q);
     };
 
-    const uint16_t qx = static_cast<uint16_t>(toSnorm16(ex));
-    const uint16_t qy = static_cast<uint16_t>(toSnorm16(ey));
-    return static_cast<uint32_t>(qx) | (static_cast<uint32_t>(qy) << 16);
+    const u16 qx = static_cast<u16>(toSnorm16(ex));
+    const u16 qy = static_cast<u16>(toSnorm16(ey));
+    return static_cast<u32>(qx) | (static_cast<u32>(qy) << 16);
 }
 
-static XMFLOAT3 UnpackNormalOctSnorm16(uint32_t packed)
+static XMFLOAT3 UnpackNormalOctSnorm16(u32 packed)
 {
-    const int16_t qx = static_cast<int16_t>(packed & 0xFFFFu);
-    const int16_t qy = static_cast<int16_t>((packed >> 16) & 0xFFFFu);
+    const i16 qx = static_cast<i16>(packed & 0xFFFFu);
+    const i16 qy = static_cast<i16>((packed >> 16) & 0xFFFFu);
 
-    float ex = static_cast<float>(qx) / 32767.0f;
-    float ey = static_cast<float>(qy) / 32767.0f;
+    f32 ex = static_cast<f32>(qx) / 32767.0f;
+    f32 ey = static_cast<f32>(qy) / 32767.0f;
     ex = std::max(-1.0f, ex);
     ey = std::max(-1.0f, ey);
 
-    float x = ex;
-    float y = ey;
-    float z = 1.0f - std::abs(x) - std::abs(y);
+    f32 x = ex;
+    f32 y = ey;
+    f32 z = 1.0f - std::abs(x) - std::abs(y);
     if (z < 0.0f)
     {
-        const float ox = (1.0f - std::abs(y)) * SignNotZeroF(x);
-        const float oy = (1.0f - std::abs(x)) * SignNotZeroF(y);
+        const f32 ox = (1.0f - std::abs(y)) * SignNotZeroF(x);
+        const f32 oy = (1.0f - std::abs(x)) * SignNotZeroF(y);
         x = ox;
         y = oy;
     }
     return NormalizeSafe(XMFLOAT3(x, y, z));
 }
 
-static uint32_t PackTexCoordHalf2(const XMFLOAT2& uv)
+static u32 PackTexCoordHalf2(const XMFLOAT2& uv)
 {
-    const uint16_t ux = DirectX::PackedVector::XMConvertFloatToHalf(uv.x);
-    const uint16_t uy = DirectX::PackedVector::XMConvertFloatToHalf(uv.y);
-    return static_cast<uint32_t>(ux) | (static_cast<uint32_t>(uy) << 16);
+    const u16 ux = DirectX::PackedVector::XMConvertFloatToHalf(uv.x);
+    const u16 uy = DirectX::PackedVector::XMConvertFloatToHalf(uv.y);
+    return static_cast<u32>(ux) | (static_cast<u32>(uy) << 16);
 }
 
-static XMFLOAT2 UnpackTexCoordHalf2(uint32_t packed)
+static XMFLOAT2 UnpackTexCoordHalf2(u32 packed)
 {
-    const uint16_t ux = static_cast<uint16_t>(packed & 0xFFFFu);
-    const uint16_t uy = static_cast<uint16_t>((packed >> 16) & 0xFFFFu);
+    const u16 ux = static_cast<u16>(packed & 0xFFFFu);
+    const u16 uy = static_cast<u16>((packed >> 16) & 0xFFFFu);
     return XMFLOAT2(DirectX::PackedVector::XMConvertHalfToFloat(ux), DirectX::PackedVector::XMConvertHalfToFloat(uy));
 }
 
 struct PackedColorRGBA16Unorm
 {
-    uint32_t lo;
-    uint32_t hi;
+    u32 lo;
+    u32 hi;
 };
 
 static PackedColorRGBA16Unorm PackColorRGBA16Unorm(const XMFLOAT4& color)
 {
-    const auto toUnorm16 = [](float v) -> uint32_t {
-        const float c = std::clamp(v, 0.0f, 1.0f);
+    const auto toUnorm16 = [](f32 v) -> u32 {
+        const f32 c = std::clamp(v, 0.0f, 1.0f);
         const int q = static_cast<int>(std::lround(c * 65535.0f));
-        return static_cast<uint32_t>(std::clamp(q, 0, 65535));
+        return static_cast<u32>(std::clamp(q, 0, 65535));
     };
 
-    const uint32_t r = toUnorm16(color.x);
-    const uint32_t g = toUnorm16(color.y);
-    const uint32_t b = toUnorm16(color.z);
-    const uint32_t a = toUnorm16(color.w);
+    const u32 r = toUnorm16(color.x);
+    const u32 g = toUnorm16(color.y);
+    const u32 b = toUnorm16(color.z);
+    const u32 a = toUnorm16(color.w);
     return PackedColorRGBA16Unorm{r | (g << 16), b | (a << 16)};
 }
 
-static uint32_t PackTangentR10G10B10A2(const XMFLOAT3& inTangent, float handedness)
+static u32 PackTangentR10G10B10A2(const XMFLOAT3& inTangent, f32 handedness)
 {
     XMFLOAT3 t = inTangent;
-    const float len2 = t.x * t.x + t.y * t.y + t.z * t.z;
+    const f32 len2 = t.x * t.x + t.y * t.y + t.z * t.z;
     if (len2 <= 1e-20f)
     {
         t = XMFLOAT3(1.0f, 0.0f, 0.0f);
     }
     else
     {
-        const float invLen = 1.0f / std::sqrt(len2);
+        const f32 invLen = 1.0f / std::sqrt(len2);
         t.x *= invLen;
         t.y *= invLen;
         t.z *= invLen;
     }
 
-    const auto toUnorm10 = [](float v) -> uint32_t {
-        const float u = std::clamp(v * 0.5f + 0.5f, 0.0f, 1.0f);
+    const auto toUnorm10 = [](f32 v) -> u32 {
+        const f32 u = std::clamp(v * 0.5f + 0.5f, 0.0f, 1.0f);
         const int q = static_cast<int>(std::lround(u * 1023.0f));
-        return static_cast<uint32_t>(std::clamp(q, 0, 1023));
+        return static_cast<u32>(std::clamp(q, 0, 1023));
     };
 
-    const uint32_t x = toUnorm10(t.x);
-    const uint32_t y = toUnorm10(t.y);
-    const uint32_t z = toUnorm10(t.z);
-    const uint32_t a2 = (handedness < 0.0f) ? 0u : 3u;
+    const u32 x = toUnorm10(t.x);
+    const u32 y = toUnorm10(t.y);
+    const u32 z = toUnorm10(t.z);
+    const u32 a2 = (handedness < 0.0f) ? 0u : 3u;
     return x | (y << 10) | (z << 20) | (a2 << 30);
 }
 
@@ -310,7 +310,7 @@ static fs::path FindRepoRoot(const fs::path& exePath)
     return cwd;
 }
 
-static HRESULT LoadAnyImageMemory(const uint8_t* bytes, size_t size, ScratchImage& out, WIC_FLAGS wicFlags)
+static HRESULT LoadAnyImageMemory(const u8* bytes, size_t size, ScratchImage& out, WIC_FLAGS wicFlags)
 {
     if (size >= 4 && bytes[0] == 'D' && bytes[1] == 'D' && bytes[2] == 'S' && bytes[3] == ' ')
         return LoadFromDDSMemory(bytes, size, DDS_FLAGS_NONE, nullptr, out);
@@ -319,7 +319,7 @@ static HRESULT LoadAnyImageMemory(const uint8_t* bytes, size_t size, ScratchImag
     return LoadFromWICMemory(bytes, size, wicFlags, nullptr, out);
 }
 
-enum : uint32_t
+enum : u32
 {
     IMG_BASECOLOR = 1u << 0,
     IMG_NORMAL = 1u << 1,
@@ -328,10 +328,10 @@ enum : uint32_t
     IMG_EMISSIVE = 1u << 4
 };
 
-static std::vector<uint32_t> BuildImageUsageFlags(const fastgltf::Asset& asset)
+static std::vector<u32> BuildImageUsageFlags(const fastgltf::Asset& asset)
 {
-    std::vector<uint32_t> flags(asset.images.size(), 0);
-    auto mark = [&](const auto& opt, uint32_t f) {
+    std::vector<u32> flags(asset.images.size(), 0);
+    auto mark = [&](const auto& opt, u32 f) {
         if (!opt)
             return;
         const size_t ti = opt->textureIndex;
@@ -356,24 +356,54 @@ static std::vector<uint32_t> BuildImageUsageFlags(const fastgltf::Asset& asset)
     return flags;
 }
 
+constexpr int kOpacityMicromapStates = 4;
+constexpr int kOpacityMicromapMaxLevel = 6;
+constexpr f32 kOpacityMicromapTargetEdge = 3.0f;
+
+struct DecodedRgba8Image
+{
+    u32 width = 0;
+    u32 height = 0;
+    u32 rowPitch = 0;
+    std::vector<u8> pixels;
+};
+
+struct MaskMaterialAlphaSource
+{
+    bool enabled = false;
+    u32 imageIndex = UINT32_MAX;
+    u32 width = 0;
+    u32 height = 0;
+    u32 rowPitch = 0;
+    std::vector<u8> pixels;
+};
+
+struct OMMBuildStats
+{
+    u32 maskedPrimitiveCount = 0;
+    u64 entryCount = 0;
+    u64 dataBytesBeforeCompaction = 0;
+    u64 dataBytesAfterCompaction = 0;
+};
+
 // ---- MikkTSpace ----
 static int mk_getNumFaces(const SMikkTSpaceContext* ctx);
 static int mk_getNumVerticesOfFace(const SMikkTSpaceContext*, const int)
 {
     return 3;
 }
-static void mk_getPosition(const SMikkTSpaceContext* ctx, float out[3], const int f, const int v);
-static void mk_getNormal(const SMikkTSpaceContext* ctx, float out[3], const int f, const int v);
-static void mk_getTexCoord(const SMikkTSpaceContext* ctx, float out[2], const int f, const int v);
-static void mk_setTSpaceBasic(const SMikkTSpaceContext* ctx, const float t[3], const float sign, const int f, const int v);
+static void mk_getPosition(const SMikkTSpaceContext* ctx, f32 out[3], const int f, const int v);
+static void mk_getNormal(const SMikkTSpaceContext* ctx, f32 out[3], const int f, const int v);
+static void mk_getTexCoord(const SMikkTSpaceContext* ctx, f32 out[2], const int f, const int v);
+static void mk_setTSpaceBasic(const SMikkTSpaceContext* ctx, const f32 t[3], const f32 sign, const int f, const int v);
 
 struct MikkUserData
 {
-    const std::vector<uint32_t>* indices;
+    const std::vector<u32>* indices;
     std::vector<Vertex>* verts;
 };
 
-static void ComputeTangentsMikk(const std::vector<uint32_t>& idx, std::vector<Vertex>& verts)
+static void ComputeTangentsMikk(const std::vector<u32>& idx, std::vector<Vertex>& verts)
 {
     SMikkTSpaceInterface i{};
     i.m_getNumFaces = mk_getNumFaces;
@@ -396,44 +426,44 @@ static int mk_getNumFaces(const SMikkTSpaceContext* ctx)
     return static_cast<int>(ud->indices->size() / 3);
 }
 
-static void mk_getPosition(const SMikkTSpaceContext* ctx, float out[3], const int f, const int v)
+static void mk_getPosition(const SMikkTSpaceContext* ctx, f32 out[3], const int f, const int v)
 {
     auto* ud = static_cast<const MikkUserData*>(ctx->m_pUserData);
-    uint32_t i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
+    u32 i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
     auto& P = (*ud->verts)[i].position;
     out[0] = P.x;
     out[1] = P.y;
     out[2] = P.z;
 }
 
-static void mk_getNormal(const SMikkTSpaceContext* ctx, float out[3], const int f, const int v)
+static void mk_getNormal(const SMikkTSpaceContext* ctx, f32 out[3], const int f, const int v)
 {
     auto* ud = static_cast<const MikkUserData*>(ctx->m_pUserData);
-    uint32_t i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
+    u32 i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
     XMFLOAT3 N = UnpackNormalOctSnorm16((*ud->verts)[i].normalPacked);
     out[0] = N.x;
     out[1] = N.y;
     out[2] = N.z;
 }
 
-static void mk_getTexCoord(const SMikkTSpaceContext* ctx, float out[2], const int f, const int v)
+static void mk_getTexCoord(const SMikkTSpaceContext* ctx, f32 out[2], const int f, const int v)
 {
     auto* ud = static_cast<const MikkUserData*>(ctx->m_pUserData);
-    uint32_t i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
+    u32 i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
     XMFLOAT2 uv = UnpackTexCoordHalf2((*ud->verts)[i].texCoordPacked);
     out[0] = uv.x;
     out[1] = uv.y;
 }
 
-static void mk_setTSpaceBasic(const SMikkTSpaceContext* ctx, const float t[3], const float s, const int f, const int v)
+static void mk_setTSpaceBasic(const SMikkTSpaceContext* ctx, const f32 t[3], const f32 s, const int f, const int v)
 {
     auto* ud = static_cast<MikkUserData*>(ctx->m_pUserData);
-    uint32_t i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
-    const float handedness = -s;
+    u32 i = (*ud->indices)[static_cast<size_t>(f) * 3 + static_cast<size_t>(v)];
+    const f32 handedness = -s;
     (*ud->verts)[i].tangentPacked = PackTangentR10G10B10A2(XMFLOAT3(t[0], t[1], t[2]), handedness);
 }
 
-static bool DecodeDataUri(const fastgltf::URIView& uri, std::vector<uint8_t>& out)
+static bool DecodeDataUri(const fastgltf::URIView& uri, std::vector<u8>& out)
 {
     if (!uri.isDataUri())
         return false;
@@ -455,7 +485,7 @@ static bool DecodeDataUri(const fastgltf::URIView& uri, std::vector<uint8_t>& ou
     return true;
 }
 
-static bool LoadUriBytes(const fastgltf::URIView& uri, const fs::path& baseDir, std::vector<uint8_t>& owned)
+static bool LoadUriBytes(const fastgltf::URIView& uri, const fs::path& baseDir, std::vector<u8>& owned)
 {
     if (uri.isDataUri())
         return DecodeDataUri(uri, owned);
@@ -473,7 +503,7 @@ static bool LoadUriBytes(const fastgltf::URIView& uri, const fs::path& baseDir, 
     return f.good();
 }
 
-static bool LoadBufferViewBytes(const fastgltf::Asset& asset, const fastgltf::BufferView& view, const fs::path& baseDir, const uint8_t*& bytes, size_t& size, std::vector<uint8_t>& owned)
+static bool LoadBufferViewBytes(const fastgltf::Asset& asset, const fastgltf::BufferView& view, const fs::path& baseDir, const u8*& bytes, size_t& size, std::vector<u8>& owned)
 {
     if (view.bufferIndex >= asset.buffers.size())
         return false;
@@ -482,7 +512,7 @@ static bool LoadBufferViewBytes(const fastgltf::Asset& asset, const fastgltf::Bu
     const size_t offset = view.byteOffset;
     const size_t length = view.byteLength;
 
-    auto setView = [&](const uint8_t* data, size_t dataSize) -> bool {
+    auto setView = [&](const u8* data, size_t dataSize) -> bool {
         if (offset + length > dataSize)
             return false;
         bytes = data + offset;
@@ -491,9 +521,9 @@ static bool LoadBufferViewBytes(const fastgltf::Asset& asset, const fastgltf::Bu
     };
 
     return std::visit(fastgltf::visitor{
-                          [&](const fastgltf::sources::Array& arr) -> bool { return setView(reinterpret_cast<const uint8_t*>(arr.bytes.data()), arr.bytes.size_bytes()); },
-                          [&](const fastgltf::sources::Vector& vec) -> bool { return setView(reinterpret_cast<const uint8_t*>(vec.bytes.data()), vec.bytes.size()); },
-                          [&](const fastgltf::sources::ByteView& bv) -> bool { return setView(reinterpret_cast<const uint8_t*>(bv.bytes.data()), bv.bytes.size()); },
+                          [&](const fastgltf::sources::Array& arr) -> bool { return setView(reinterpret_cast<const u8*>(arr.bytes.data()), arr.bytes.size_bytes()); },
+                          [&](const fastgltf::sources::Vector& vec) -> bool { return setView(reinterpret_cast<const u8*>(vec.bytes.data()), vec.bytes.size()); },
+                          [&](const fastgltf::sources::ByteView& bv) -> bool { return setView(reinterpret_cast<const u8*>(bv.bytes.data()), bv.bytes.size()); },
                           [&](const fastgltf::sources::URI& uri) -> bool {
                               fastgltf::URIView view = uri.uri;
                               if (!LoadUriBytes(view, baseDir, owned))
@@ -505,47 +535,180 @@ static bool LoadBufferViewBytes(const fastgltf::Asset& asset, const fastgltf::Bu
                       buf.data);
 }
 
-static void BuildTexturesToMemory(const fs::path& glbPath, const fastgltf::Asset& asset, const std::vector<uint32_t>& imgUsage, bool fastCompress, std::vector<TextureRecord>& outTable,
-                                  std::vector<TextureSubresourceRecord>& outSubresources, std::vector<uint8_t>& outBlob)
+static bool LoadImageBytes(const fs::path& baseDir, const fastgltf::Asset& asset, size_t imgIndex, const u8*& bytes, size_t& size, std::vector<u8>& owned)
+{
+    if (imgIndex >= asset.images.size())
+        return false;
+
+    const auto& img = asset.images[imgIndex];
+    return std::visit(fastgltf::visitor{
+                          [&](const fastgltf::sources::URI& filePath) -> bool {
+                              fastgltf::URIView view = filePath.uri;
+                              if (!LoadUriBytes(view, baseDir, owned))
+                                  return false;
+                              bytes = owned.data();
+                              size = owned.size();
+                              return true;
+                          },
+                          [&](const fastgltf::sources::Array& arr) -> bool {
+                              bytes = reinterpret_cast<const u8*>(arr.bytes.data());
+                              size = arr.bytes.size_bytes();
+                              return true;
+                          },
+                          [&](const fastgltf::sources::Vector& vec) -> bool {
+                              bytes = reinterpret_cast<const u8*>(vec.bytes.data());
+                              size = vec.bytes.size();
+                              return true;
+                          },
+                          [&](const fastgltf::sources::ByteView& bv) -> bool {
+                              bytes = reinterpret_cast<const u8*>(bv.bytes.data());
+                              size = bv.bytes.size();
+                              return true;
+                          },
+                          [&](const fastgltf::sources::BufferView& view) -> bool {
+                              if (view.bufferViewIndex >= asset.bufferViews.size())
+                                  return false;
+                              return LoadBufferViewBytes(asset, asset.bufferViews[view.bufferViewIndex], baseDir, bytes, size, owned);
+                          },
+                          [&](auto&) -> bool { return false; },
+                      },
+                      img.data);
+}
+
+static DecodedRgba8Image DecodeImageToRgba8(const fs::path& glbPath, const fastgltf::Asset& asset, size_t imgIndex)
 {
     const fs::path baseDir = glbPath.parent_path();
-    std::vector<uint8_t> done(asset.images.size(), 0);
+    const u8* raw = nullptr;
+    size_t rawSize = 0;
+    std::vector<u8> owned;
+    if (!LoadImageBytes(baseDir, asset, imgIndex, raw, rawSize, owned))
+        Fatal("Failed to load image bytes from glTF");
 
-    auto loadImageBytes = [&](size_t imgIndex, const uint8_t*& bytes, size_t& size, std::vector<uint8_t>& owned) -> bool {
-        const auto& img = asset.images[imgIndex];
-        return std::visit(fastgltf::visitor{
-                              [&](const fastgltf::sources::URI& filePath) -> bool {
-                                  fastgltf::URIView view = filePath.uri;
-                                  if (!LoadUriBytes(view, baseDir, owned))
-                                      return false;
-                                  bytes = owned.data();
-                                  size = owned.size();
-                                  return true;
-                              },
-                              [&](const fastgltf::sources::Array& arr) -> bool {
-                                  bytes = reinterpret_cast<const uint8_t*>(arr.bytes.data());
-                                  size = arr.bytes.size_bytes();
-                                  return true;
-                              },
-                              [&](const fastgltf::sources::Vector& vec) -> bool {
-                                  bytes = reinterpret_cast<const uint8_t*>(vec.bytes.data());
-                                  size = vec.bytes.size();
-                                  return true;
-                              },
-                              [&](const fastgltf::sources::ByteView& bv) -> bool {
-                                  bytes = reinterpret_cast<const uint8_t*>(bv.bytes.data());
-                                  size = bv.bytes.size();
-                                  return true;
-                              },
-                              [&](const fastgltf::sources::BufferView& view) -> bool {
-                                  if (view.bufferViewIndex >= asset.bufferViews.size())
-                                      return false;
-                                  return LoadBufferViewBytes(asset, asset.bufferViews[view.bufferViewIndex], baseDir, bytes, size, owned);
-                              },
-                              [&](auto&) -> bool { return false; },
-                          },
-                          img.data);
-    };
+    ScratchImage loaded;
+    const HRESULT hrDec = LoadAnyImageMemory(raw, rawSize, loaded, WIC_FLAGS_NONE);
+    if (!IE_Try(hrDec))
+        Fatal("Image decode failed");
+
+    const DXGI_FORMAT wantBase = DXGI_FORMAT_R8G8B8A8_UNORM;
+    const Image* srcImage = loaded.GetImage(0, 0, 0);
+    const TexMetadata loadedMeta = loaded.GetMetadata();
+    ScratchImage converted;
+    if (loadedMeta.format != wantBase)
+    {
+        const HRESULT hrC = Convert(loaded.GetImages(), loaded.GetImageCount(), loadedMeta, wantBase, TEX_FILTER_DEFAULT, 0.0f, converted);
+        if (!IE_Try(hrC))
+            Fatal("Image format conversion failed");
+        srcImage = converted.GetImage(0, 0, 0);
+    }
+
+    Require(srcImage != nullptr, "Decoded image has no top-level surface");
+    Require(srcImage->width <= UINT32_MAX && srcImage->height <= UINT32_MAX, "Decoded image dimensions exceed pack format limits");
+    Require(srcImage->rowPitch >= srcImage->width * 4, "Decoded image row pitch is too small");
+
+    DecodedRgba8Image out{};
+    out.width = static_cast<u32>(srcImage->width);
+    out.height = static_cast<u32>(srcImage->height);
+    out.rowPitch = out.width * 4u;
+    out.pixels.resize(static_cast<size_t>(out.rowPitch) * static_cast<size_t>(out.height));
+    for (u32 y = 0; y < out.height; ++y)
+    {
+        std::memcpy(out.pixels.data() + static_cast<size_t>(y) * out.rowPitch, srcImage->pixels + static_cast<size_t>(y) * srcImage->rowPitch, out.rowPitch);
+    }
+
+    return out;
+}
+
+static u8 QuantizeUnorm8(f32 value)
+{
+    const f32 clamped = std::clamp(value, 0.0f, 1.0f);
+    int q = static_cast<int>(std::lround(clamped * 255.0f));
+    q = std::clamp(q, 0, 255);
+    return static_cast<u8>(q);
+}
+
+static f32 RemapAlphaToHalfCutoff(f32 alpha, f32 alphaCutoff)
+{
+    const f32 cutoff = std::clamp(alphaCutoff, 0.0f, 1.0f);
+    const f32 scale = 0.5f / std::max(cutoff, 1.0f - cutoff);
+    const f32 bias = 0.5f - scale * cutoff;
+    return std::clamp(scale * alpha + bias, 0.0f, 1.0f);
+}
+
+static std::vector<MaskMaterialAlphaSource> BuildMaskMaterialAlphaSources(const fs::path& glbPath, const fastgltf::Asset& asset)
+{
+    std::vector<MaskMaterialAlphaSource> out(asset.materials.size());
+    std::unordered_map<u32, DecodedRgba8Image> imageCache;
+
+    for (size_t i = 0; i < asset.materials.size(); ++i)
+    {
+        const fastgltf::Material& material = asset.materials[i];
+        if (material.alphaMode == fastgltf::AlphaMode::Opaque)
+            continue;
+
+        if (!material.pbrData.baseColorTexture)
+        {
+            std::println("Error: alpha-tested material {} has no baseColor texture for OMM generation", i);
+            std::exit(EXIT_FAILURE);
+        }
+
+        const size_t textureIndex = material.pbrData.baseColorTexture->textureIndex;
+        if (textureIndex >= asset.textures.size())
+        {
+            std::println("Error: alpha-tested material {} references invalid baseColor texture {}", i, textureIndex);
+            std::exit(EXIT_FAILURE);
+        }
+
+        const auto& texture = asset.textures[textureIndex];
+        if (!texture.imageIndex || *texture.imageIndex >= asset.images.size())
+        {
+            std::println("Error: alpha-tested material {} has no usable baseColor image for OMM generation", i);
+            std::exit(EXIT_FAILURE);
+        }
+
+        const u32 imageIndex = static_cast<u32>(*texture.imageIndex);
+        auto cacheIt = imageCache.find(imageIndex);
+        if (cacheIt == imageCache.end())
+            cacheIt = imageCache.emplace(imageIndex, DecodeImageToRgba8(glbPath, asset, imageIndex)).first;
+
+        const f32 alphaScale = static_cast<f32>(material.pbrData.baseColorFactor.w());
+        const f32 alphaCutoff = static_cast<f32>(material.alphaCutoff);
+        if (!IsFiniteF32(alphaScale) || alphaScale < 0.0f)
+        {
+            std::println("Error: alpha-tested material {} has invalid baseColor alpha factor {}", i, alphaScale);
+            std::exit(EXIT_FAILURE);
+        }
+        if (!IsFiniteF32(alphaCutoff))
+        {
+            std::println("Error: alpha-tested material {} has invalid alphaCutoff {}", i, alphaCutoff);
+            std::exit(EXIT_FAILURE);
+        }
+
+        MaskMaterialAlphaSource& source = out[i];
+        source.enabled = true;
+        source.imageIndex = imageIndex;
+        source.width = cacheIt->second.width;
+        source.height = cacheIt->second.height;
+        source.rowPitch = cacheIt->second.rowPitch;
+        source.pixels = cacheIt->second.pixels;
+
+        if (alphaScale != 1.0f || alphaCutoff != 0.5f)
+        {
+            for (size_t p = 3; p < source.pixels.size(); p += 4)
+            {
+                const f32 alpha = (static_cast<f32>(source.pixels[p]) / 255.0f) * alphaScale;
+                source.pixels[p] = QuantizeUnorm8(RemapAlphaToHalfCutoff(alpha, alphaCutoff));
+            }
+        }
+    }
+
+    return out;
+}
+
+static void BuildTexturesToMemory(const fs::path& glbPath, const fastgltf::Asset& asset, const std::vector<u32>& imgUsage, bool fastCompress, std::vector<TextureRecord>& outTable,
+                                  std::vector<TextureSubresourceRecord>& outSubresources, std::vector<u8>& outBlob)
+{
+    const fs::path baseDir = glbPath.parent_path();
+    std::vector<u8> done(asset.images.size(), 0);
 
     for (size_t t = 0; t < asset.textures.size(); ++t)
     {
@@ -570,17 +733,17 @@ static void BuildTexturesToMemory(const fs::path& glbPath, const fastgltf::Asset
                    },
                    img.data);
 
-        const uint8_t* raw = nullptr;
+        const u8* raw = nullptr;
         size_t rawSize = 0;
-        std::vector<uint8_t> owned;
+        std::vector<u8> owned;
 
-        bool okLoad = loadImageBytes(imgIndex, raw, rawSize, owned);
+        bool okLoad = LoadImageBytes(baseDir, asset, imgIndex, raw, rawSize, owned);
         if (!okLoad)
             Fatal("Failed to load image bytes from glTF");
 
         std::println("[tex {}][img {}] src=\"{}\"", t, imgIndex, srcDesc);
 
-        const uint32_t usage = (imgIndex < imgUsage.size()) ? imgUsage[imgIndex] : 0u;
+        const u32 usage = (imgIndex < imgUsage.size()) ? imgUsage[imgIndex] : 0u;
         const bool isNormal = (usage & IMG_NORMAL) != 0;
         const bool isNonColor = isNormal || ((usage & (IMG_METALROUGH | IMG_OCCLUSION)) != 0);
         const bool isSRGB = !isNonColor && ((usage & (IMG_BASECOLOR | IMG_EMISSIVE)) != 0);
@@ -654,19 +817,19 @@ static void BuildTexturesToMemory(const fs::path& glbPath, const fastgltf::Asset
         Require(outSubresources.size() <= UINT32_MAX, "Texture subresource table exceeds pack format limits");
 
         TextureRecord tr{};
-        tr.imageIndex = static_cast<uint32_t>(imgIndex);
-        tr.format = static_cast<uint32_t>(bcMeta.format);
-        tr.dimension = static_cast<uint32_t>(bcMeta.dimension);
-        tr.miscFlags = static_cast<uint32_t>(bcMeta.miscFlags);
-        tr.miscFlags2 = static_cast<uint32_t>(bcMeta.miscFlags2);
-        tr.width = static_cast<uint32_t>(bcMeta.width);
-        tr.height = static_cast<uint32_t>(bcMeta.height);
-        tr.depth = static_cast<uint32_t>(bcMeta.depth);
-        tr.arraySize = static_cast<uint32_t>(bcMeta.arraySize);
-        tr.mipLevels = static_cast<uint32_t>(bcMeta.mipLevels);
-        tr.subresourceOffset = static_cast<uint32_t>(outSubresources.size());
-        tr.subresourceCount = static_cast<uint32_t>(bcImageCount);
-        tr.byteOffset = static_cast<uint64_t>(outBlob.size());
+        tr.imageIndex = static_cast<u32>(imgIndex);
+        tr.format = static_cast<u32>(bcMeta.format);
+        tr.dimension = static_cast<u32>(bcMeta.dimension);
+        tr.miscFlags = static_cast<u32>(bcMeta.miscFlags);
+        tr.miscFlags2 = static_cast<u32>(bcMeta.miscFlags2);
+        tr.width = static_cast<u32>(bcMeta.width);
+        tr.height = static_cast<u32>(bcMeta.height);
+        tr.depth = static_cast<u32>(bcMeta.depth);
+        tr.arraySize = static_cast<u32>(bcMeta.arraySize);
+        tr.mipLevels = static_cast<u32>(bcMeta.mipLevels);
+        tr.subresourceOffset = static_cast<u32>(outSubresources.size());
+        tr.subresourceCount = static_cast<u32>(bcImageCount);
+        tr.byteOffset = static_cast<u64>(outBlob.size());
 
         for (size_t i = 0; i < bcImageCount; ++i)
         {
@@ -674,15 +837,15 @@ static void BuildTexturesToMemory(const fs::path& glbPath, const fastgltf::Asset
             Require(image.rowPitch <= UINT32_MAX, "Texture row pitch exceeds pack format limits");
             Require(image.slicePitch <= UINT32_MAX, "Texture slice pitch exceeds pack format limits");
             TextureSubresourceRecord subresource{};
-            subresource.byteOffset = static_cast<uint64_t>(outBlob.size()) - tr.byteOffset;
-            subresource.byteSize = static_cast<uint64_t>(image.slicePitch);
-            subresource.rowPitch = static_cast<uint32_t>(image.rowPitch);
-            subresource.slicePitch = static_cast<uint32_t>(image.slicePitch);
+            subresource.byteOffset = static_cast<u64>(outBlob.size()) - tr.byteOffset;
+            subresource.byteSize = static_cast<u64>(image.slicePitch);
+            subresource.rowPitch = static_cast<u32>(image.rowPitch);
+            subresource.slicePitch = static_cast<u32>(image.slicePitch);
             outSubresources.push_back(subresource);
             outBlob.insert(outBlob.end(), image.pixels, image.pixels + image.slicePitch);
         }
 
-        tr.byteSize = static_cast<uint64_t>(outBlob.size()) - tr.byteOffset;
+        tr.byteSize = static_cast<u64>(outBlob.size()) - tr.byteOffset;
         outTable.push_back(tr);
         done[imgIndex] = 1;
     }
@@ -749,7 +912,7 @@ static bool HasMissingSampler(const fastgltf::Asset& asset)
     return false;
 }
 
-static uint32_t BuildSamplerTable(const fastgltf::Asset& asset, std::vector<D3D12_SAMPLER_DESC>& outSamp)
+static u32 BuildSamplerTable(const fastgltf::Asset& asset, std::vector<D3D12_SAMPLER_DESC>& outSamp)
 {
     for (const fastgltf::Sampler& s : asset.samplers)
     {
@@ -771,16 +934,16 @@ static uint32_t BuildSamplerTable(const fastgltf::Asset& asset, std::vector<D3D1
         outSamp.push_back(samplerDesc);
     }
 
-    uint32_t defaultSamplerIndex = UINT32_MAX;
+    u32 defaultSamplerIndex = UINT32_MAX;
     if (outSamp.empty() || HasMissingSampler(asset))
     {
-        defaultSamplerIndex = static_cast<uint32_t>(outSamp.size());
+        defaultSamplerIndex = static_cast<u32>(outSamp.size());
         outSamp.push_back(MakeDefaultSamplerDesc());
     }
     return defaultSamplerIndex;
 }
 
-static void BuildMaterialTable(const fastgltf::Asset& asset, const std::vector<TextureRecord>& texTable, std::vector<MaterialRecord>& outMatl, uint32_t defaultSamplerIndex)
+static void BuildMaterialTable(const fastgltf::Asset& asset, const std::vector<TextureRecord>& texTable, std::vector<MaterialRecord>& outMatl, u32 defaultSamplerIndex)
 {
     std::unordered_map<int, int> texToTxhd;
     texToTxhd.reserve(texTable.size());
@@ -798,7 +961,7 @@ static void BuildMaterialTable(const fastgltf::Asset& asset, const std::vector<T
         return (it == texToTxhd.end()) ? -1 : it->second;
     };
 
-    auto parseAlphaMode = [](const fastgltf::Material& m) -> uint32_t {
+    auto parseAlphaMode = [](const fastgltf::Material& m) -> u32 {
         if (m.alphaMode == fastgltf::AlphaMode::Mask)
             return MATF_ALPHA_MASK;
         if (m.alphaMode == fastgltf::AlphaMode::Blend)
@@ -827,20 +990,20 @@ static void BuildMaterialTable(const fastgltf::Asset& asset, const std::vector<T
         {
             const fastgltf::Material& m = asset.materials[i];
 
-            mr.baseColorFactor[0] = static_cast<float>(m.pbrData.baseColorFactor.x());
-            mr.baseColorFactor[1] = static_cast<float>(m.pbrData.baseColorFactor.y());
-            mr.baseColorFactor[2] = static_cast<float>(m.pbrData.baseColorFactor.z());
-            mr.baseColorFactor[3] = static_cast<float>(m.pbrData.baseColorFactor.w());
+            mr.baseColorFactor[0] = static_cast<f32>(m.pbrData.baseColorFactor.x());
+            mr.baseColorFactor[1] = static_cast<f32>(m.pbrData.baseColorFactor.y());
+            mr.baseColorFactor[2] = static_cast<f32>(m.pbrData.baseColorFactor.z());
+            mr.baseColorFactor[3] = static_cast<f32>(m.pbrData.baseColorFactor.w());
 
-            mr.metallicFactor = static_cast<float>(m.pbrData.metallicFactor);
-            mr.roughnessFactor = static_cast<float>(m.pbrData.roughnessFactor);
+            mr.metallicFactor = static_cast<f32>(m.pbrData.metallicFactor);
+            mr.roughnessFactor = static_cast<f32>(m.pbrData.roughnessFactor);
 
-            mr.emissiveFactor[0] = static_cast<float>(m.emissiveFactor.x());
-            mr.emissiveFactor[1] = static_cast<float>(m.emissiveFactor.y());
-            mr.emissiveFactor[2] = static_cast<float>(m.emissiveFactor.z());
+            mr.emissiveFactor[0] = static_cast<f32>(m.emissiveFactor.x());
+            mr.emissiveFactor[1] = static_cast<f32>(m.emissiveFactor.y());
+            mr.emissiveFactor[2] = static_cast<f32>(m.emissiveFactor.z());
 
             if (m.alphaMode == fastgltf::AlphaMode::Mask)
-                mr.alphaCutoff = static_cast<float>(m.alphaCutoff);
+                mr.alphaCutoff = static_cast<f32>(m.alphaCutoff);
 
             mr.flags |= parseAlphaMode(m);
             if (m.doubleSided)
@@ -853,7 +1016,7 @@ static void BuildMaterialTable(const fastgltf::Asset& asset, const std::vector<T
                     "Material scalar parameter contains NaN/Inf");
             Require(IsFiniteF32(mr.emissiveFactor[0]) && IsFiniteF32(mr.emissiveFactor[1]) && IsFiniteF32(mr.emissiveFactor[2]), "Material emissiveFactor contains NaN/Inf");
 
-            auto chooseSampler = [&](size_t texIndex) -> uint32_t {
+            auto chooseSampler = [&](size_t texIndex) -> u32 {
                 if (texIndex >= asset.textures.size())
                     return UINT32_MAX;
                 const auto& tex = asset.textures[texIndex];
@@ -861,7 +1024,7 @@ static void BuildMaterialTable(const fastgltf::Asset& asset, const std::vector<T
                     return defaultSamplerIndex;
                 if (*tex.samplerIndex >= asset.samplers.size())
                     return defaultSamplerIndex;
-                return static_cast<uint32_t>(*tex.samplerIndex);
+                return static_cast<u32>(*tex.samplerIndex);
             };
 
             if (m.pbrData.baseColorTexture)
@@ -876,7 +1039,7 @@ static void BuildMaterialTable(const fastgltf::Asset& asset, const std::vector<T
             {
                 const size_t ti = m.normalTexture->textureIndex;
                 mr.normalTx = texIndexToTxhd(ti);
-                mr.normalScale = static_cast<float>(m.normalTexture->scale);
+                mr.normalScale = static_cast<f32>(m.normalTexture->scale);
                 if (mr.normalTx >= 0)
                     mr.normalSampler = chooseSampler(ti);
             }
@@ -893,7 +1056,7 @@ static void BuildMaterialTable(const fastgltf::Asset& asset, const std::vector<T
             {
                 const size_t ti = m.occlusionTexture->textureIndex;
                 mr.occlusionTx = texIndexToTxhd(ti);
-                mr.occlusionStrength = static_cast<float>(m.occlusionTexture->strength);
+                mr.occlusionStrength = static_cast<f32>(m.occlusionTexture->strength);
                 if (mr.occlusionTx >= 0)
                     mr.occlusionSampler = chooseSampler(ti);
             }
@@ -911,14 +1074,114 @@ static void BuildMaterialTable(const fastgltf::Asset& asset, const std::vector<T
     }
 }
 
-static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx, size_t primIdx, std::vector<Vertex>& blobVertices, std::vector<uint32_t>& blobIndices,
-                                    std::vector<IskurMeshlet>& blobMeshlets, std::vector<uint32_t>& blobMLVerts, std::vector<uint8_t>& blobMLTris, std::vector<MeshletBounds>& blobMLBounds)
+static void BuildPrimitiveOpacityMicromap(u32 materialIndex, size_t meshIdx, size_t primIdx, bool hasTexcoords, const std::vector<Vertex>& outVertices, const std::vector<u32>& outIndices,
+                                          const std::vector<MaskMaterialAlphaSource>& alphaSources, PrimRecord& outPrim, std::vector<i32>& blobOmmIndices,
+                                          std::vector<OpacityMicromapDescRecord>& blobOmmDescs, std::vector<u8>& blobOmmData, OMMBuildStats& stats)
+{
+    if (materialIndex >= alphaSources.size())
+        return;
+
+    const MaskMaterialAlphaSource& source = alphaSources[materialIndex];
+    if (!source.enabled)
+        return;
+
+    if (!hasTexcoords)
+    {
+        std::println("Error: masked primitive mesh={} prim={} has no TEXCOORD_0 required for OMM generation", meshIdx, primIdx);
+        std::exit(EXIT_FAILURE);
+    }
+
+    Require((outIndices.size() % 3) == 0, "Primitive OMM index count must be divisible by 3");
+    Require(outIndices.size() / 3 <= UINT32_MAX, "Primitive triangle count exceeds OMM pack format limits");
+    Require(blobOmmIndices.size() <= UINT32_MAX, "Scene OMM index table exceeds pack format limits");
+    Require(blobOmmDescs.size() <= UINT32_MAX, "Scene OMM descriptor table exceeds pack format limits");
+    Require(blobOmmData.size() <= UINT64_MAX, "Scene OMM data blob exceeds pack format limits");
+
+    std::vector<XMFLOAT2> ommUvs(outVertices.size());
+    for (size_t i = 0; i < outVertices.size(); ++i)
+        ommUvs[i] = UnpackTexCoordHalf2(outVertices[i].texCoordPacked);
+
+    const size_t triangleCount = outIndices.size() / 3;
+    std::vector<unsigned char> levels(triangleCount);
+    std::vector<unsigned int> sources(triangleCount);
+    std::vector<int> ommIndices(triangleCount);
+    const size_t ommCount = meshopt_opacityMapMeasure(levels.data(), sources.data(), ommIndices.data(), outIndices.data(), outIndices.size(),
+                                                      reinterpret_cast<const f32*>(ommUvs.data()), ommUvs.size(), sizeof(XMFLOAT2), source.width, source.height,
+                                                      kOpacityMicromapMaxLevel, kOpacityMicromapTargetEdge);
+
+    std::vector<unsigned int> offsets(ommCount);
+    size_t dataSizeBeforeCompaction = 0;
+    for (size_t i = 0; i < ommCount; ++i)
+    {
+        Require(dataSizeBeforeCompaction <= UINT32_MAX, "Primitive OMM data exceeds pack format limits");
+        offsets[i] = static_cast<unsigned int>(dataSizeBeforeCompaction);
+        dataSizeBeforeCompaction += meshopt_opacityMapEntrySize(levels[i], kOpacityMicromapStates);
+    }
+    Require(dataSizeBeforeCompaction <= UINT32_MAX, "Primitive OMM data exceeds pack format limits");
+
+    std::vector<u8> data(dataSizeBeforeCompaction);
+    const u8* const alphaChannel = source.pixels.data() + 3;
+    for (size_t i = 0; i < ommCount; ++i)
+    {
+        const unsigned int tri = sources[i];
+        Require(tri < triangleCount, "OMM source triangle index is out of range");
+        const f32* uv0 = reinterpret_cast<const f32*>(&ommUvs[outIndices[tri * 3 + 0]]);
+        const f32* uv1 = reinterpret_cast<const f32*>(&ommUvs[outIndices[tri * 3 + 1]]);
+        const f32* uv2 = reinterpret_cast<const f32*>(&ommUvs[outIndices[tri * 3 + 2]]);
+        meshopt_opacityMapRasterize(data.data() + offsets[i], levels[i], kOpacityMicromapStates, uv0, uv1, uv2, alphaChannel, 4, source.rowPitch, source.width, source.height);
+    }
+
+    size_t compactedCount = meshopt_opacityMapCompact(data.data(), data.size(), levels.data(), offsets.data(), ommCount, ommIndices.data(), triangleCount, kOpacityMicromapStates);
+    const size_t dataSizeAfterCompaction =
+        (compactedCount == 0) ? 0 : static_cast<size_t>(offsets[compactedCount - 1]) + meshopt_opacityMapEntrySize(levels[compactedCount - 1], kOpacityMicromapStates);
+    Require(compactedCount <= UINT32_MAX, "Primitive OMM entry count exceeds pack format limits");
+    Require(dataSizeAfterCompaction <= UINT32_MAX, "Primitive compacted OMM data exceeds pack format limits");
+    for (int ommIndex : ommIndices)
+    {
+        Require(ommIndex >= -kOpacityMicromapStates, "Primitive OMM special index is out of range");
+        Require(ommIndex < static_cast<int>(compactedCount), "Primitive OMM index is out of range");
+    }
+
+    outPrim.ommIndexOffset = static_cast<u32>(blobOmmIndices.size());
+    outPrim.ommIndexCount = static_cast<u32>(triangleCount);
+    outPrim.ommDescOffset = static_cast<u32>(blobOmmDescs.size());
+    outPrim.ommDescCount = static_cast<u32>(compactedCount);
+    outPrim.ommDataByteOffset = blobOmmData.size();
+    outPrim.ommDataByteSize = static_cast<u32>(dataSizeAfterCompaction);
+    outPrim.ommFormat = kOpacityMicromapStates;
+
+    for (int ommIndex : ommIndices)
+        blobOmmIndices.push_back(static_cast<i32>(ommIndex));
+
+    for (size_t i = 0; i < compactedCount; ++i)
+    {
+        const size_t entrySize = meshopt_opacityMapEntrySize(levels[i], kOpacityMicromapStates);
+        Require(offsets[i] <= UINT32_MAX && entrySize <= UINT32_MAX, "Primitive OMM entry exceeds pack format limits");
+        OpacityMicromapDescRecord desc{};
+        desc.dataByteOffset = offsets[i];
+        desc.dataByteSize = static_cast<u32>(entrySize);
+        desc.subdivisionLevel = levels[i];
+        desc.reserved = 0;
+        blobOmmDescs.push_back(desc);
+    }
+    blobOmmData.insert(blobOmmData.end(), data.begin(), data.begin() + dataSizeAfterCompaction);
+
+    stats.maskedPrimitiveCount += 1;
+    stats.entryCount += compactedCount;
+    stats.dataBytesBeforeCompaction += dataSizeBeforeCompaction;
+    stats.dataBytesAfterCompaction += dataSizeAfterCompaction;
+}
+
+static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx, size_t primIdx, std::vector<Vertex>& blobVertices, std::vector<u32>& blobIndices,
+                                    std::vector<IskurMeshlet>& blobMeshlets, std::vector<u32>& blobMLVerts, std::vector<u8>& blobMLTris,
+                                    std::vector<MeshletBounds>& blobMLBounds, const std::vector<MaskMaterialAlphaSource>& alphaSources, std::vector<i32>& blobOmmIndices,
+                                    std::vector<OpacityMicromapDescRecord>& blobOmmDescs, std::vector<u8>& blobOmmData, OMMBuildStats& ommStats)
 {
     const auto& gltfPrim = asset.meshes[meshIdx].primitives[primIdx];
     if (gltfPrim.type != fastgltf::PrimitiveType::Triangles)
         Fatal("Only triangle primitives are supported");
 
-    const uint32_t materialIndex = gltfPrim.materialIndex ? static_cast<uint32_t>(*gltfPrim.materialIndex) : 0u;
+    const u32 materialIndex = gltfPrim.materialIndex ? static_cast<u32>(*gltfPrim.materialIndex) : 0u;
 
     auto posAttr = gltfPrim.findAttribute("POSITION");
     Require(posAttr != gltfPrim.attributes.end(), "Primitive missing POSITION attribute");
@@ -985,7 +1248,7 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
             if (!normals.empty())
             {
                 const XMFLOAT3 n = normals[i];
-                float len = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+                f32 len = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
                 const XMFLOAT3 nNorm = (len > 0) ? XMFLOAT3(n.x / len, n.y / len, n.z / len) : XMFLOAT3(0, 0, 1);
                 v.normalPacked = PackNormalOctSnorm16(nNorm);
             }
@@ -1006,28 +1269,28 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
         });
     }
 
-    std::vector<uint32_t> initialIndices;
+    std::vector<u32> initialIndices;
     if (gltfPrim.indicesAccessor)
     {
         const auto& acc = asset.accessors[*gltfPrim.indicesAccessor];
         initialIndices.resize(acc.count);
         if (acc.componentType == fastgltf::ComponentType::UnsignedByte)
         {
-            std::vector<uint8_t> tmp(acc.count);
-            fastgltf::copyFromAccessor<uint8_t>(asset, acc, tmp.data());
+            std::vector<u8> tmp(acc.count);
+            fastgltf::copyFromAccessor<u8>(asset, acc, tmp.data());
             for (size_t i = 0; i < tmp.size(); ++i)
                 initialIndices[i] = tmp[i];
         }
         else if (acc.componentType == fastgltf::ComponentType::UnsignedShort)
         {
-            std::vector<uint16_t> tmp(acc.count);
-            fastgltf::copyFromAccessor<uint16_t>(asset, acc, tmp.data());
+            std::vector<u16> tmp(acc.count);
+            fastgltf::copyFromAccessor<u16>(asset, acc, tmp.data());
             for (size_t i = 0; i < tmp.size(); ++i)
                 initialIndices[i] = tmp[i];
         }
         else if (acc.componentType == fastgltf::ComponentType::UnsignedInt)
         {
-            fastgltf::copyFromAccessor<uint32_t>(asset, acc, initialIndices.data());
+            fastgltf::copyFromAccessor<u32>(asset, acc, initialIndices.data());
         }
         else
         {
@@ -1037,27 +1300,27 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
     else
     {
         initialIndices.resize(initialVertices.size());
-        for (uint32_t i = 0; i < static_cast<uint32_t>(initialVertices.size()); ++i)
+        for (u32 i = 0; i < static_cast<u32>(initialVertices.size()); ++i)
             initialIndices[i] = i;
     }
 
     Require((initialIndices.size() % 3) == 0, "Primitive index count must be divisible by 3");
     const size_t vertexCount = initialVertices.size();
-    for (uint32_t idx : initialIndices)
+    for (u32 idx : initialIndices)
         Require(static_cast<size_t>(idx) < vertexCount, "Primitive index out of range for POSITION accessor");
 
     if (normals.empty())
     {
         for (size_t i = 0; i < initialIndices.size(); i += 3)
         {
-            uint32_t i0 = initialIndices[i + 0], i1 = initialIndices[i + 1], i2 = initialIndices[i + 2];
+            u32 i0 = initialIndices[i + 0], i1 = initialIndices[i + 1], i2 = initialIndices[i + 2];
             const XMFLOAT3 &v0 = initialVertices[i0].position, &v1 = initialVertices[i1].position, &v2 = initialVertices[i2].position;
-            float e1x = v1.x - v0.x, e1y = v1.y - v0.y, e1z = v1.z - v0.z;
-            float e2x = v2.x - v0.x, e2y = v2.y - v0.y, e2z = v2.z - v0.z;
-            float nx = e1y * e2z - e1z * e2y;
-            float ny = e1z * e2x - e1x * e2z;
-            float nz = e1x * e2y - e1y * e2x;
-            float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+            f32 e1x = v1.x - v0.x, e1y = v1.y - v0.y, e1z = v1.z - v0.z;
+            f32 e2x = v2.x - v0.x, e2y = v2.y - v0.y, e2z = v2.z - v0.z;
+            f32 nx = e1y * e2z - e1z * e2y;
+            f32 ny = e1z * e2x - e1x * e2z;
+            f32 nz = e1x * e2y - e1y * e2x;
+            f32 len = std::sqrt(nx * nx + ny * ny + nz * nz);
             if (len > 0)
             {
                 nx /= len;
@@ -1065,7 +1328,7 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
                 nz /= len;
             }
             XMFLOAT3 n(nx, ny, nz);
-            const uint32_t packedN = PackNormalOctSnorm16(n);
+            const u32 packedN = PackNormalOctSnorm16(n);
             initialVertices[i0].normalPacked = packedN;
             initialVertices[i1].normalPacked = packedN;
             initialVertices[i2].normalPacked = packedN;
@@ -1074,9 +1337,9 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
     if (!texcoords.empty())
         ComputeTangentsMikk(initialIndices, initialVertices);
 
-    std::vector<uint32_t> remap(initialIndices.size());
+    std::vector<u32> remap(initialIndices.size());
     const size_t totalVertices = meshopt_generateVertexRemap(remap.data(), initialIndices.data(), initialIndices.size(), initialVertices.data(), initialVertices.size(), sizeof(Vertex));
-    std::vector<uint32_t> outIndices(initialIndices.size());
+    std::vector<u32> outIndices(initialIndices.size());
     meshopt_remapIndexBuffer(outIndices.data(), initialIndices.data(), initialIndices.size(), remap.data());
     std::vector<Vertex> outVertices(totalVertices);
     meshopt_remapVertexBuffer(outVertices.data(), initialVertices.data(), initialVertices.size(), sizeof(Vertex), remap.data());
@@ -1085,11 +1348,11 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
     meshopt_optimizeVertexFetch(outVertices.data(), outIndices.data(), outIndices.size(), outVertices.data(), outVertices.size(), sizeof(Vertex));
 
     constexpr size_t maxVertices = 64, maxTriangles = 126;
-    constexpr float coneWeight = 0.25f;
+    constexpr f32 coneWeight = 0.25f;
     const size_t maxMeshlets = meshopt_buildMeshletsBound(outIndices.size(), maxVertices, maxTriangles);
     std::vector<meshopt_Meshlet> temp(maxMeshlets);
-    std::vector<uint32_t> mlVerts(maxMeshlets * maxVertices);
-    std::vector<uint8_t> mlTris(maxMeshlets * maxTriangles * 3);
+    std::vector<u32> mlVerts(maxMeshlets * maxVertices);
+    std::vector<u8> mlTris(maxMeshlets * maxTriangles * 3);
     const size_t meshletCount =
         meshopt_buildMeshlets(temp.data(), mlVerts.data(), mlTris.data(), outIndices.data(), outIndices.size(), &outVertices[0].position.x, outVertices.size(), sizeof(Vertex), maxVertices,
                               maxTriangles, coneWeight);
@@ -1116,8 +1379,8 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
         Require(IsFiniteFloat3(mb.center), "Meshlet bounds center contains NaN/Inf");
         Require(IsFiniteF32(mb.radius) && mb.radius >= 0.0f, "Meshlet bounds radius is invalid");
         Require(IsFiniteFloat3(mb.cone_apex) && IsFiniteFloat3(mb.cone_axis) && IsFiniteF32(mb.cone_cutoff), "Meshlet cone data contains NaN/Inf");
-        mb.coneAxisAndCutoff = (static_cast<uint32_t>(static_cast<uint8_t>(b.cone_axis_s8[0]))) | (static_cast<uint32_t>(static_cast<uint8_t>(b.cone_axis_s8[1])) << 8) |
-                               (static_cast<uint32_t>(static_cast<uint8_t>(b.cone_axis_s8[2])) << 16) | (static_cast<uint32_t>(static_cast<uint8_t>(b.cone_cutoff_s8)) << 24);
+        mb.coneAxisAndCutoff = (static_cast<u32>(static_cast<u8>(b.cone_axis_s8[0]))) | (static_cast<u32>(static_cast<u8>(b.cone_axis_s8[1])) << 8) |
+                               (static_cast<u32>(static_cast<u8>(b.cone_axis_s8[2])) << 16) | (static_cast<u32>(static_cast<u8>(b.cone_cutoff_s8)) << 24);
         mlBounds.push_back(mb);
     }
 
@@ -1131,7 +1394,7 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
     }
 
     XMFLOAT3 localBoundsCenter = XMFLOAT3(0.0f, 0.0f, 0.0f);
-    float localBoundsRadius = 0.0f;
+    f32 localBoundsRadius = 0.0f;
     if (!outVertices.empty())
     {
         XMFLOAT3 minPos = outVertices[0].position;
@@ -1150,13 +1413,13 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
         localBoundsCenter.y = 0.5f * (minPos.y + maxPos.y);
         localBoundsCenter.z = 0.5f * (minPos.z + maxPos.z);
 
-        float maxDistSq = 0.0f;
+        f32 maxDistSq = 0.0f;
         for (const Vertex& v : outVertices)
         {
-            const float dx = v.position.x - localBoundsCenter.x;
-            const float dy = v.position.y - localBoundsCenter.y;
-            const float dz = v.position.z - localBoundsCenter.z;
-            const float distSq = dx * dx + dy * dy + dz * dz;
+            const f32 dx = v.position.x - localBoundsCenter.x;
+            const f32 dy = v.position.y - localBoundsCenter.y;
+            const f32 dz = v.position.z - localBoundsCenter.z;
+            const f32 distSq = dx * dx + dy * dy + dz * dz;
             maxDistSq = std::max(maxDistSq, distSq);
         }
         localBoundsRadius = std::sqrt(maxDistSq);
@@ -1165,27 +1428,28 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
     Require(IsFiniteF32(localBoundsRadius) && localBoundsRadius >= 0.0f, "Primitive local bounds radius is invalid");
 
     PrimRecord r{};
-    r.meshIndex = static_cast<uint32_t>(meshIdx);
-    r.primIndex = static_cast<uint32_t>(primIdx);
+    r.meshIndex = static_cast<u32>(meshIdx);
+    r.primIndex = static_cast<u32>(primIdx);
     r.materialIndex = materialIndex;
     Require(outVertices.size() <= UINT32_MAX, "Primitive vertex count exceeds pack format limits");
     Require(outIndices.size() <= UINT32_MAX, "Primitive index count exceeds pack format limits");
     Require(meshlets.size() <= UINT32_MAX, "Primitive meshlet count exceeds pack format limits");
-    r.vertexCount = static_cast<uint32_t>(outVertices.size());
-    r.indexCount = static_cast<uint32_t>(outIndices.size());
-    r.meshletCount = static_cast<uint32_t>(meshlets.size());
+    r.vertexCount = static_cast<u32>(outVertices.size());
+    r.indexCount = static_cast<u32>(outIndices.size());
+    r.meshletCount = static_cast<u32>(meshlets.size());
     Require(mlVerts.size() <= UINT32_MAX, "Primitive meshlet vertex data exceeds pack format limits");
     Require(mlTris.size() <= UINT32_MAX, "Primitive meshlet triangle data exceeds pack format limits");
-    r.mlVertsCount = static_cast<uint32_t>(mlVerts.size());
-    r.mlTrisByteCount = static_cast<uint32_t>(mlTris.size());
+    r.mlVertsCount = static_cast<u32>(mlVerts.size());
+    r.mlTrisByteCount = static_cast<u32>(mlTris.size());
     r.vertexByteOffset = blobVertices.size() * sizeof(Vertex);
-    r.indexByteOffset = blobIndices.size() * sizeof(uint32_t);
+    r.indexByteOffset = blobIndices.size() * sizeof(u32);
     r.meshletsByteOffset = blobMeshlets.size() * sizeof(IskurMeshlet);
-    r.mlVertsByteOffset = blobMLVerts.size() * sizeof(uint32_t);
+    r.mlVertsByteOffset = blobMLVerts.size() * sizeof(u32);
     r.mlTrisByteOffset = blobMLTris.size();
     r.mlBoundsByteOffset = blobMLBounds.size() * sizeof(MeshletBounds);
     r.localBoundsCenter = localBoundsCenter;
     r.localBoundsRadius = localBoundsRadius;
+    BuildPrimitiveOpacityMicromap(materialIndex, meshIdx, primIdx, !texcoords.empty(), outVertices, outIndices, alphaSources, r, blobOmmIndices, blobOmmDescs, blobOmmData, ommStats);
 
     blobVertices.insert(blobVertices.end(), outVertices.begin(), outVertices.end());
     blobIndices.insert(blobIndices.end(), outIndices.begin(), outIndices.end());
@@ -1194,15 +1458,15 @@ static PrimRecord BuildOnePrimitive(const fastgltf::Asset& asset, size_t meshIdx
     blobMLTris.insert(blobMLTris.end(), mlTris.begin(), mlTris.end());
     blobMLBounds.insert(blobMLBounds.end(), mlBounds.begin(), mlBounds.end());
 
-    std::println("[prim] mesh={} prim={}  v={} i={} m={}", r.meshIndex, r.primIndex, r.vertexCount, r.indexCount, r.meshletCount);
+    std::println("[prim] mesh={} prim={}  v={} i={} m={} ommEntries={}", r.meshIndex, r.primIndex, r.vertexCount, r.indexCount, r.meshletCount, r.ommDescCount);
 
     return r;
 }
 
-static void BuildMeshPrimToPrimIndex(const std::vector<PrimRecord>& prims, std::vector<std::vector<uint32_t>>& map, size_t meshCount)
+static void BuildMeshPrimToPrimIndex(const std::vector<PrimRecord>& prims, std::vector<std::vector<u32>>& map, size_t meshCount)
 {
     map.resize(meshCount);
-    for (uint32_t pi = 0; pi < prims.size(); ++pi)
+    for (u32 pi = 0; pi < prims.size(); ++pi)
     {
         const auto& pr = prims[pi];
         auto& vec = map[pr.meshIndex];
@@ -1212,7 +1476,7 @@ static void BuildMeshPrimToPrimIndex(const std::vector<PrimRecord>& prims, std::
     }
 }
 
-static void GatherInstances_Recursive(const fastgltf::Asset& asset, size_t nodeIndex, const std::vector<std::vector<uint32_t>>& meshPrimToPrimIndex, const XMMATRIX& parentWorld,
+static void GatherInstances_Recursive(const fastgltf::Asset& asset, size_t nodeIndex, const std::vector<std::vector<u32>>& meshPrimToPrimIndex, const XMMATRIX& parentWorld,
                                       std::vector<InstanceRecord>& out)
 {
     const fastgltf::Node& n = asset.nodes[nodeIndex];
@@ -1222,7 +1486,7 @@ static void GatherInstances_Recursive(const fastgltf::Asset& asset, size_t nodeI
         const auto& m = asset.meshes[*n.meshIndex];
         for (size_t p = 0; p < m.primitives.size(); ++p)
         {
-            uint32_t primIndex = UINT32_MAX;
+            u32 primIndex = UINT32_MAX;
             if (*n.meshIndex < meshPrimToPrimIndex.size())
             {
                 const auto& vec = meshPrimToPrimIndex[*n.meshIndex];
@@ -1251,7 +1515,7 @@ static void GatherInstances_Recursive(const fastgltf::Asset& asset, size_t nodeI
 static void BuildInstanceTable(const fastgltf::Asset& asset, const std::vector<PrimRecord>& prims, std::vector<InstanceRecord>& out)
 {
     Require(!asset.scenes.empty(), "glTF must contain at least one scene");
-    std::vector<std::vector<uint32_t>> map;
+    std::vector<std::vector<u32>> map;
     BuildMeshPrimToPrimIndex(prims, map, asset.meshes.size());
     size_t sceneIndex = asset.defaultScene.value_or(0);
     if (sceneIndex >= asset.scenes.size())
@@ -1264,11 +1528,11 @@ static void BuildInstanceTable(const fastgltf::Asset& asset, const std::vector<P
 
 static void ResolveInstanceMaterials(const std::vector<PrimRecord>& prims, const std::vector<MaterialRecord>& mats, std::vector<InstanceRecord>& inst)
 {
-    const uint32_t matCount = static_cast<uint32_t>(mats.empty() ? 1 : mats.size());
+    const u32 matCount = static_cast<u32>(mats.empty() ? 1 : mats.size());
 
     for (auto& I : inst)
     {
-        uint32_t mat = (I.primIndex < prims.size()) ? prims[I.primIndex].materialIndex : 0u;
+        u32 mat = (I.primIndex < prims.size()) ? prims[I.primIndex].materialIndex : 0u;
         if (mat >= matCount)
             mat = 0u;
         I.materialIndex = mat;
@@ -1279,18 +1543,24 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
 {
     std::vector<PrimRecord> prims;
     std::vector<Vertex> blobVertices;
-    std::vector<uint32_t> blobIndices;
+    std::vector<u32> blobIndices;
     std::vector<IskurMeshlet> blobMeshlets;
-    std::vector<uint32_t> blobMLVerts;
-    std::vector<uint8_t> blobMLTris;
+    std::vector<u32> blobMLVerts;
+    std::vector<u8> blobMLTris;
     std::vector<MeshletBounds> blobMLBounds;
+    std::vector<i32> blobOmmIndices;
+    std::vector<OpacityMicromapDescRecord> blobOmmDescs;
+    std::vector<u8> blobOmmData;
+    const std::vector<MaskMaterialAlphaSource> alphaSources = BuildMaskMaterialAlphaSources(glbPath, asset);
+    OMMBuildStats ommStats{};
 
     for (size_t mi = 0; mi < asset.meshes.size(); ++mi)
     {
         const auto& mesh = asset.meshes[mi];
         for (size_t pi = 0; pi < mesh.primitives.size(); ++pi)
         {
-            PrimRecord r = BuildOnePrimitive(asset, mi, pi, blobVertices, blobIndices, blobMeshlets, blobMLVerts, blobMLTris, blobMLBounds);
+            PrimRecord r =
+                BuildOnePrimitive(asset, mi, pi, blobVertices, blobIndices, blobMeshlets, blobMLVerts, blobMLTris, blobMLBounds, alphaSources, blobOmmIndices, blobOmmDescs, blobOmmData, ommStats);
             prims.push_back(r);
         }
     }
@@ -1300,7 +1570,7 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
 
     std::vector<TextureRecord> texTable;
     std::vector<TextureSubresourceRecord> texSubresources;
-    std::vector<uint8_t> texBlob;
+    std::vector<u8> texBlob;
     {
         auto imgUsage = BuildImageUsageFlags(asset);
         BuildTexturesToMemory(glbPath, asset, imgUsage, fastCompress, texTable, texSubresources, texBlob);
@@ -1310,46 +1580,49 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
 
     std::vector<D3D12_SAMPLER_DESC> sampTable;
     std::vector<MaterialRecord> matTable;
-    const uint32_t defaultSamplerIndex = BuildSamplerTable(asset, sampTable);
+    const u32 defaultSamplerIndex = BuildSamplerTable(asset, sampTable);
     BuildMaterialTable(asset, texTable, matTable, defaultSamplerIndex);
 
     if (!instTable.empty())
         ResolveInstanceMaterials(prims, matTable, instTable);
 
     std::vector<ChunkRecord> chunks;
-    uint32_t chunkCount = 7u + (texTable.empty() ? 0u : 3u) + (sampTable.empty() ? 0u : 1u) + (matTable.empty() ? 0u : 1u) + (instTable.empty() ? 0u : 1u);
+    u32 chunkCount = 10u + (texTable.empty() ? 0u : 3u) + (sampTable.empty() ? 0u : 1u) + (matTable.empty() ? 0u : 1u) + (instTable.empty() ? 0u : 1u);
 
-    const uint64_t ofsHeader = 0;
-    const uint64_t ofsChunkTbl = ofsHeader + sizeof(PackHeader);
-    const uint64_t ofsPrimTbl = ofsChunkTbl + chunkCount * sizeof(ChunkRecord);
-    const uint64_t ofsVertices = ofsPrimTbl + prims.size() * sizeof(PrimRecord);
-    const uint64_t ofsIndices = ofsVertices + blobVertices.size() * sizeof(Vertex);
-    const uint64_t ofsMeshlets = ofsIndices + blobIndices.size() * sizeof(uint32_t);
-    const uint64_t ofsMLVerts = ofsMeshlets + blobMeshlets.size() * sizeof(IskurMeshlet);
-    const uint64_t ofsMLTris = ofsMLVerts + blobMLVerts.size() * sizeof(uint32_t);
-    const uint64_t ofsMLBounds = ofsMLTris + blobMLTris.size();
-    uint64_t cur = ofsMLBounds + blobMLBounds.size() * sizeof(MeshletBounds);
+    const u64 ofsHeader = 0;
+    const u64 ofsChunkTbl = ofsHeader + sizeof(PackHeader);
+    const u64 ofsPrimTbl = ofsChunkTbl + chunkCount * sizeof(ChunkRecord);
+    const u64 ofsVertices = ofsPrimTbl + prims.size() * sizeof(PrimRecord);
+    const u64 ofsIndices = ofsVertices + blobVertices.size() * sizeof(Vertex);
+    const u64 ofsMeshlets = ofsIndices + blobIndices.size() * sizeof(u32);
+    const u64 ofsMLVerts = ofsMeshlets + blobMeshlets.size() * sizeof(IskurMeshlet);
+    const u64 ofsMLTris = ofsMLVerts + blobMLVerts.size() * sizeof(u32);
+    const u64 ofsMLBounds = ofsMLTris + blobMLTris.size();
+    const u64 ofsOmmIndices = ofsMLBounds + blobMLBounds.size() * sizeof(MeshletBounds);
+    const u64 ofsOmmDescs = ofsOmmIndices + blobOmmIndices.size() * sizeof(i32);
+    const u64 ofsOmmData = ofsOmmDescs + blobOmmDescs.size() * sizeof(OpacityMicromapDescRecord);
+    u64 cur = ofsOmmData + blobOmmData.size();
 
-    const uint64_t ofsTxHd = texTable.empty() ? 0 : cur;
+    const u64 ofsTxHd = texTable.empty() ? 0 : cur;
     if (!texTable.empty())
         cur += texTable.size() * sizeof(TextureRecord);
-    const uint64_t ofsTxSr = texTable.empty() ? 0 : cur;
+    const u64 ofsTxSr = texTable.empty() ? 0 : cur;
     if (!texTable.empty())
         cur += texSubresources.size() * sizeof(TextureSubresourceRecord);
-    const uint64_t ofsTxTb = texTable.empty() ? 0 : cur;
+    const u64 ofsTxTb = texTable.empty() ? 0 : cur;
     if (!texTable.empty())
         cur += texBlob.size();
-    const uint64_t ofsSamp = sampTable.empty() ? 0 : cur;
+    const u64 ofsSamp = sampTable.empty() ? 0 : cur;
     if (!sampTable.empty())
         cur += sampTable.size() * sizeof(D3D12_SAMPLER_DESC);
-    const uint64_t ofsMatl = matTable.empty() ? 0 : cur;
+    const u64 ofsMatl = matTable.empty() ? 0 : cur;
     if (!matTable.empty())
         cur += matTable.size() * sizeof(MaterialRecord);
-    const uint64_t ofsInst = instTable.empty() ? 0 : cur;
+    const u64 ofsInst = instTable.empty() ? 0 : cur;
     if (!instTable.empty())
         cur += instTable.size() * sizeof(InstanceRecord);
 
-    auto addChunk = [&](uint32_t id, uint64_t off, uint64_t size) {
+    auto addChunk = [&](u32 id, u64 off, u64 size) {
         ChunkRecord r;
         r.id = id;
         r.offset = off;
@@ -1359,11 +1632,14 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
 
     addChunk(CH_PRIM, ofsPrimTbl, prims.size() * sizeof(PrimRecord));
     addChunk(CH_VERT, ofsVertices, blobVertices.size() * sizeof(Vertex));
-    addChunk(CH_INDX, ofsIndices, blobIndices.size() * sizeof(uint32_t));
+    addChunk(CH_INDX, ofsIndices, blobIndices.size() * sizeof(u32));
     addChunk(CH_MSHL, ofsMeshlets, blobMeshlets.size() * sizeof(IskurMeshlet));
-    addChunk(CH_MLVT, ofsMLVerts, blobMLVerts.size() * sizeof(uint32_t));
+    addChunk(CH_MLVT, ofsMLVerts, blobMLVerts.size() * sizeof(u32));
     addChunk(CH_MLTR, ofsMLTris, blobMLTris.size());
     addChunk(CH_MLBD, ofsMLBounds, blobMLBounds.size() * sizeof(MeshletBounds));
+    addChunk(CH_OMIX, ofsOmmIndices, blobOmmIndices.size() * sizeof(i32));
+    addChunk(CH_OMDS, ofsOmmDescs, blobOmmDescs.size() * sizeof(OpacityMicromapDescRecord));
+    addChunk(CH_OMDT, ofsOmmData, blobOmmData.size());
 
     if (!texTable.empty())
     {
@@ -1387,8 +1663,8 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
     PackHeader hdr{};
     std::memcpy(hdr.magic, "ISKURPACK", 9);
     hdr.version = PACK_VERSION_LATEST;
-    hdr.primCount = static_cast<uint32_t>(prims.size());
-    hdr.chunkCount = static_cast<uint32_t>(chunks.size());
+    hdr.primCount = static_cast<u32>(prims.size());
+    hdr.chunkCount = static_cast<u32>(chunks.size());
     hdr.reserved0 = 0;
     hdr.chunkTableOffset = ofsChunkTbl;
     hdr.primTableOffset = ofsPrimTbl;
@@ -1407,11 +1683,14 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
     out.write(reinterpret_cast<const char*>(chunks.data()), static_cast<std::streamsize>(chunks.size() * sizeof(ChunkRecord)));
     out.write(reinterpret_cast<const char*>(prims.data()), static_cast<std::streamsize>(prims.size() * sizeof(PrimRecord)));
     out.write(reinterpret_cast<const char*>(blobVertices.data()), static_cast<std::streamsize>(blobVertices.size() * sizeof(Vertex)));
-    out.write(reinterpret_cast<const char*>(blobIndices.data()), static_cast<std::streamsize>(blobIndices.size() * sizeof(uint32_t)));
+    out.write(reinterpret_cast<const char*>(blobIndices.data()), static_cast<std::streamsize>(blobIndices.size() * sizeof(u32)));
     out.write(reinterpret_cast<const char*>(blobMeshlets.data()), static_cast<std::streamsize>(blobMeshlets.size() * sizeof(IskurMeshlet)));
-    out.write(reinterpret_cast<const char*>(blobMLVerts.data()), static_cast<std::streamsize>(blobMLVerts.size() * sizeof(uint32_t)));
+    out.write(reinterpret_cast<const char*>(blobMLVerts.data()), static_cast<std::streamsize>(blobMLVerts.size() * sizeof(u32)));
     out.write(reinterpret_cast<const char*>(blobMLTris.data()), static_cast<std::streamsize>(blobMLTris.size()));
     out.write(reinterpret_cast<const char*>(blobMLBounds.data()), static_cast<std::streamsize>(blobMLBounds.size() * sizeof(MeshletBounds)));
+    out.write(reinterpret_cast<const char*>(blobOmmIndices.data()), static_cast<std::streamsize>(blobOmmIndices.size() * sizeof(i32)));
+    out.write(reinterpret_cast<const char*>(blobOmmDescs.data()), static_cast<std::streamsize>(blobOmmDescs.size() * sizeof(OpacityMicromapDescRecord)));
+    out.write(reinterpret_cast<const char*>(blobOmmData.data()), static_cast<std::streamsize>(blobOmmData.size()));
     if (!texTable.empty())
     {
         out.write(reinterpret_cast<const char*>(texTable.data()), static_cast<std::streamsize>(texTable.size() * sizeof(TextureRecord)));
@@ -1431,6 +1710,8 @@ static void ProcessAllMeshesAndWritePack(const fs::path& outPackPath, const fs::
     std::println("Meshes pack written: {}", outPackPath.string());
     std::println("  prims={}, verts={}, inds={}, meshlets={}, mlVerts={}, mlTris={} bytes, mlBounds={}", static_cast<size_t>(hdr.primCount), blobVertices.size(), blobIndices.size(),
                  blobMeshlets.size(), blobMLVerts.size(), blobMLTris.size(), blobMLBounds.size());
+    std::println("  omm: maskedPrims={}, indices={}, entries={}, bytes(before={} after={})", ommStats.maskedPrimitiveCount, blobOmmIndices.size(), ommStats.entryCount,
+                 ommStats.dataBytesBeforeCompaction, ommStats.dataBytesAfterCompaction);
     if (!texTable.empty())
         std::println("  textures: {}", texTable.size());
     if (!sampTable.empty())
@@ -1545,7 +1826,7 @@ int main(int argc, char** argv)
         CoUninitialize();
 
         auto t1 = std::chrono::steady_clock::now();
-        double sec = std::chrono::duration<double>(t1 - t0).count();
+        f64 sec = std::chrono::duration<f64>(t1 - t0).count();
         std::println("Total time: {:.3f} s", sec);
         return 0;
     }
@@ -1582,7 +1863,7 @@ int main(int argc, char** argv)
     CoUninitialize();
 
     auto t1 = std::chrono::steady_clock::now();
-    double sec = std::chrono::duration<double>(t1 - t0).count();
+    f64 sec = std::chrono::duration<f64>(t1 - t0).count();
     std::println("Total time: {:.3f} s", sec);
 
     return 0;

@@ -65,6 +65,13 @@ struct LoadedPrimitive
     const u8* meshletTriangles = nullptr;
     u32 meshletTriangleByteCount = 0;
     const MeshletBounds* meshletBounds = nullptr;
+    const i32* ommIndices = nullptr;
+    u32 ommIndexCount = 0;
+    const IEPack::OpacityMicromapDescRecord* ommDescs = nullptr;
+    u32 ommDescCount = 0;
+    const u8* ommData = nullptr;
+    u32 ommDataByteCount = 0;
+    u32 ommFormat = 0;
 
     u32 meshletCount = 0;
     XMFLOAT3 localBoundsCenter = {0.0f, 0.0f, 0.0f};

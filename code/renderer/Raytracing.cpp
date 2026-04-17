@@ -15,20 +15,71 @@
 namespace
 {
 constexpr u32 kInvalidMaterialIdx = 0xFFFFFFFFu;
-constexpr u32 kCacheCSGroupSize = 256u;
-constexpr u32 kClearCacheDispatchX = 1024u;
-constexpr f32 kPruneStartOccupancy = 0.80f;
-constexpr f32 kPruneStopOccupancy = 0.65f;
-constexpr f32 kPruneForceOccupancy = 0.95f;
-constexpr u32 kPruneBudgetEntriesPerFrame = 1u << 15;
-constexpr u32 kPruneMinAgeFrames = 512u;
-constexpr u32 kPruneMinSamplesToKeep = 32u;
-constexpr u32 kPruneAttemptsPerThread = 4u;
-constexpr u32 kRadianceCacheMaxSamplesSafeClamp = 262144u;
 
-constexpr u32 kShadowPayloadBytes = sizeof(u32);
-constexpr u32 kPathTracePayloadBytes = 52u;
+constexpr u32 kPathTracePayloadBytes = 72u;
 constexpr u32 kTriangleAttribBytes = 2u * sizeof(f32);
+
+void RequireOpacityMicromapSupport(const ComPtr<ID3D12Device14>& device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
+    IE_Check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5)));
+    if (options5.RaytracingTier < D3D12_RAYTRACING_TIER_1_2)
+    {
+        IE_LogFatal("Opacity micromaps are mandatory but the device only supports DXR tier {}.", static_cast<u32>(options5.RaytracingTier));
+        IE_Assert(false);
+    }
+}
+
+void RequireShaderExecutionReorderingSupport(const ComPtr<ID3D12Device14>& device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS22 options22{};
+    IE_Check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS22, &options22, sizeof(options22)));
+    if (!options22.ShaderExecutionReorderingActuallyReorders)
+    {
+        IE_LogFatal("Shader execution reordering is mandatory but the device does not support it.");
+        IE_Assert(false);
+    }
+}
+
+D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT ToD3D12OpacityMicromapFormat(const u32 format)
+{
+    switch (format)
+    {
+    case 2:
+        return D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_2_STATE;
+    case 4:
+        return D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE;
+    default:
+        IE_LogFatal("Unsupported serialized OMM format {}.", format);
+        IE_Assert(false);
+        return D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE;
+    }
+}
+
+Vector<D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY> BuildOpacityMicromapHistogram(const LoadedPrimitive& prim)
+{
+    constexpr u32 kMaxSubdivLevel = D3D12_RAYTRACING_OPACITY_MICROMAP_OC1_MAX_SUBDIVISION_LEVEL;
+    Vector<u32> counts(kMaxSubdivLevel + 1u, 0u);
+    for (u32 i = 0; i < prim.ommDescCount; ++i)
+    {
+        IE_Assert(prim.ommDescs[i].subdivisionLevel <= kMaxSubdivLevel);
+        counts[prim.ommDescs[i].subdivisionLevel] += 1u;
+    }
+
+    Vector<D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY> histogram;
+    for (u32 level = 0; level <= kMaxSubdivLevel; ++level)
+    {
+        if (counts[level] == 0u)
+            continue;
+
+        D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY entry{};
+        entry.Count = counts[level];
+        entry.SubdivisionLevel = level;
+        entry.Format = ToD3D12OpacityMicromapFormat(prim.ommFormat);
+        histogram.push_back(entry);
+    }
+    return histogram;
+}
 
 void FillInstanceTransform(D3D12_RAYTRACING_INSTANCE_DESC& dst, const XMFLOAT4X4& m)
 {
@@ -52,6 +103,14 @@ u32 CalcShaderRecordSize()
 {
     constexpr u32 recordAligned = IE_AlignUp(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT);
     return IE_AlignUp(recordAligned, D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
+}
+
+void ReleaseTextureDescriptors(BindlessHeaps& bindlessHeaps, Texture& texture)
+{
+    bindlessHeaps.FreeCbvSrvUav(texture.srvIndex);
+    bindlessHeaps.FreeCbvSrvUav(texture.uavIndex);
+    texture.srvIndex = UINT32_MAX;
+    texture.uavIndex = UINT32_MAX;
 }
 
 void CreateGlobalRootSigConstants(const ComPtr<ID3D12Device14>& device, u32 num32BitConstants, ComPtr<ID3D12RootSignature>& outRootSig)
@@ -111,23 +170,18 @@ void Raytracing::Init(ComPtr<ID3D12GraphicsCommandList7>& cmd, const XMUINT2& re
                       const Vector<RTInstance>& instances)
 {
     InitRaytracingWorld(cmd, primitives, loadedPrimitives, instances);
-    m_Cleared = false;
-    m_PruneActive = false;
-    CreateShadowPassResources(renderSize);
     CreatePathTracePassResources(renderSize);
-    CreateSpecularPassResources(renderSize);
 }
 
 void Raytracing::ReloadShaders()
 {
-    CreateShadowPassPipelines();
     CreatePathTracePassPipelines();
-    CreateSpecularPassPipelines();
 }
 
 void Raytracing::InitRaytracingWorld(ComPtr<ID3D12GraphicsCommandList7>& cmd, Vector<Primitive>& primitives, const Vector<LoadedPrimitive>& loadedPrimitives, const Vector<RTInstance>& instances)
 {
     const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
+    RequireOpacityMicromapSupport(device);
     m_Primitives = &primitives;
     IE_Assert(primitives.size() == loadedPrimitives.size());
 
@@ -158,17 +212,9 @@ void Raytracing::InitRaytracingWorld(ComPtr<ID3D12GraphicsCommandList7>& cmd, Ve
         }
     }
 
-    D3D12_RAYTRACING_GEOMETRY_DESC geom{};
-    geom.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-    geom.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-    geom.Triangles.Transform3x4 = 0;
-    geom.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
-    geom.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-    geom.Triangles.VertexBuffer.StrideInBytes = sizeof(Vertex);
-
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in{};
     in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-    in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS;
     in.NumDescs = 1;
     in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
 
@@ -180,6 +226,7 @@ void Raytracing::InitRaytracingWorld(ComPtr<ID3D12GraphicsCommandList7>& cmd, Ve
         const LoadedPrimitive& srcPrim = loadedPrimitives[primIndex];
         const u32 indexCount = srcPrim.indexCount;
         const u32 vertexCount = srcPrim.vertexCount;
+        const bool alphaTested = primAlphaMode[primIndex] != static_cast<u32>(AlphaMode_Opaque);
 
         BufferCreateDesc d{};
         d.heapType = D3D12_HEAP_TYPE_DEFAULT;
@@ -205,17 +252,137 @@ void Raytracing::InitRaytracingWorld(ComPtr<ID3D12GraphicsCommandList7>& cmd, Ve
         primInfos[primIndex].ibSrvIndex = prim.rtIndices->srvIndex;
         primInfos[primIndex].materialIdx = primMaterialIdx[primIndex];
 
-        geom.Flags = (primAlphaMode[primIndex] == static_cast<u32>(AlphaMode_Opaque)) ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+        D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC trianglesDesc{};
+        trianglesDesc.Transform3x4 = 0;
+        trianglesDesc.IndexFormat = DXGI_FORMAT_R32_UINT;
+        trianglesDesc.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        trianglesDesc.IndexCount = indexCount;
+        trianglesDesc.VertexCount = vertexCount;
+        trianglesDesc.IndexBuffer = prim.rtIndices->resource->GetGPUVirtualAddress();
+        trianglesDesc.VertexBuffer.StartAddress = prim.rtVertices->resource->GetGPUVirtualAddress();
+        trianglesDesc.VertexBuffer.StrideInBytes = sizeof(Vertex);
 
-        geom.Triangles.IndexCount = indexCount;
-        geom.Triangles.VertexCount = vertexCount;
-        geom.Triangles.IndexBuffer = prim.rtIndices->resource->GetGPUVirtualAddress();
-        geom.Triangles.VertexBuffer.StartAddress = prim.rtVertices->resource->GetGPUVirtualAddress();
+        D3D12_RAYTRACING_GEOMETRY_DESC geom{};
+        geom.Flags = alphaTested ? D3D12_RAYTRACING_GEOMETRY_FLAG_NONE : D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+        D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC ommLinkage{};
+
+        if (alphaTested)
+        {
+            if (srcPrim.ommFormat == 0u || srcPrim.ommIndexCount != (indexCount / 3u) || srcPrim.ommIndices == nullptr)
+            {
+                IE_LogFatal("Alpha-tested primitive {} is missing required opacity micromap index data.", primIndex);
+                IE_Assert(false);
+            }
+
+            d.viewKind = BufferCreateDesc::ViewKind::None;
+            d.createSRV = false;
+            d.createUAV = false;
+            d.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            d.finalState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            d.resourceFlags = D3D12_RESOURCE_FLAG_NONE;
+            d.initialData = srcPrim.ommIndices;
+            d.initialDataSize = srcPrim.ommIndexCount * sizeof(i32);
+            d.sizeInBytes = d.initialDataSize;
+            d.name = L"Primitive/ommIndices";
+            prim.ommIndices = CreateBuffer(cmd.Get(), d);
+
+            if (srcPrim.ommDescCount > 0u)
+            {
+                IE_Assert(srcPrim.ommDescs != nullptr);
+                IE_Assert(srcPrim.ommData != nullptr);
+                IE_Assert(srcPrim.ommDataByteCount > 0u);
+
+                Vector<D3D12_RAYTRACING_OPACITY_MICROMAP_DESC> ommDescs(srcPrim.ommDescCount);
+                for (u32 i = 0; i < srcPrim.ommDescCount; ++i)
+                {
+                    const IEPack::OpacityMicromapDescRecord& srcDesc = srcPrim.ommDescs[i];
+                    D3D12_RAYTRACING_OPACITY_MICROMAP_DESC& dstDesc = ommDescs[i];
+                    dstDesc.ByteOffset = srcDesc.dataByteOffset;
+                    dstDesc.SubdivisionLevel = static_cast<UINT16>(srcDesc.subdivisionLevel);
+                    dstDesc.Format = ToD3D12OpacityMicromapFormat(srcPrim.ommFormat);
+                }
+
+                d.initialData = ommDescs.data();
+                d.initialDataSize = static_cast<u32>(ommDescs.size() * sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC));
+                d.sizeInBytes = d.initialDataSize;
+                d.name = L"Primitive/ommDescs";
+                prim.ommDescs = CreateBuffer(cmd.Get(), d);
+
+                d.initialData = srcPrim.ommData;
+                d.initialDataSize = srcPrim.ommDataByteCount;
+                d.sizeInBytes = srcPrim.ommDataByteCount;
+                d.name = L"Primitive/ommData";
+                prim.ommData = CreateBuffer(cmd.Get(), d);
+
+                const Vector<D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY> histogram = BuildOpacityMicromapHistogram(srcPrim);
+                IE_Assert(!histogram.empty());
+
+                D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC ommArrayDesc{};
+                ommArrayDesc.NumOmmHistogramEntries = static_cast<UINT>(histogram.size());
+                ommArrayDesc.pOmmHistogram = histogram.data();
+                ommArrayDesc.InputBuffer = prim.ommData->resource->GetGPUVirtualAddress();
+                ommArrayDesc.PerOmmDescs.StartAddress = prim.ommDescs->resource->GetGPUVirtualAddress();
+                ommArrayDesc.PerOmmDescs.StrideInBytes = sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC);
+
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ommInputs{};
+                ommInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY;
+                ommInputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
+                ommInputs.NumDescs = 1u;
+                ommInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+                ommInputs.pOpacityMicromapArrayDesc = &ommArrayDesc;
+
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO ommInfo{};
+                device->GetRaytracingAccelerationStructurePrebuildInfo(&ommInputs, &ommInfo);
+                IE_Assert(ommInfo.ScratchDataSizeInBytes <= UINT32_MAX);
+                IE_Assert(ommInfo.ResultDataMaxSizeInBytes <= UINT32_MAX);
+
+                d.initialData = nullptr;
+                d.initialDataSize = 0u;
+                d.resourceFlags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                d.initialState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                d.finalState = d.initialState;
+                d.sizeInBytes = static_cast<u32>(ommInfo.ScratchDataSizeInBytes);
+                d.name = L"Primitive/ommArrayScratch";
+                prim.ommArrayScratch = CreateBuffer(cmd.Get(), d);
+
+                d.sizeInBytes = static_cast<u32>(ommInfo.ResultDataMaxSizeInBytes);
+                d.initialState = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+                d.finalState = d.initialState;
+                d.name = L"Primitive/ommArray";
+                prim.ommArray = CreateBuffer(nullptr, d);
+
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC ommBuild{};
+                ommBuild.DestAccelerationStructureData = prim.ommArray->resource->GetGPUVirtualAddress();
+                ommBuild.Inputs = ommInputs;
+                ommBuild.ScratchAccelerationStructureData = prim.ommArrayScratch->resource->GetGPUVirtualAddress();
+                cmd->BuildRaytracingAccelerationStructure(&ommBuild, 0, nullptr);
+
+                const D3D12_RESOURCE_BARRIER ommBarrier = CD3DX12_RESOURCE_BARRIER::UAV(prim.ommArray->resource.Get());
+                cmd->ResourceBarrier(1, &ommBarrier);
+            }
+
+            ommLinkage.OpacityMicromapIndexBuffer.StartAddress = prim.ommIndices->resource->GetGPUVirtualAddress();
+            ommLinkage.OpacityMicromapIndexBuffer.StrideInBytes = sizeof(i32);
+            ommLinkage.OpacityMicromapIndexFormat = DXGI_FORMAT_R32_UINT;
+            ommLinkage.OpacityMicromapBaseLocation = 0u;
+            ommLinkage.OpacityMicromapArray = prim.ommArray ? prim.ommArray->resource->GetGPUVirtualAddress() : 0ull;
+
+            geom.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES;
+            geom.OmmTriangles.pTriangles = &trianglesDesc;
+            geom.OmmTriangles.pOmmLinkage = &ommLinkage;
+        }
+        else
+        {
+            geom.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+            geom.Triangles = trianglesDesc;
+        }
 
         in.pGeometryDescs = &geom;
 
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
         device->GetRaytracingAccelerationStructurePrebuildInfo(&in, &info);
+        IE_Assert(info.ScratchDataSizeInBytes <= UINT32_MAX);
+        IE_Assert(info.ResultDataMaxSizeInBytes <= UINT32_MAX);
 
         d.initialData = nullptr;
         d.initialDataSize = 0;
@@ -275,6 +442,7 @@ void Raytracing::InitRaytracingWorld(ComPtr<ID3D12GraphicsCommandList7>& cmd, Ve
 
         D3D12_RAYTRACING_INSTANCE_DESC idesc{};
         idesc.InstanceMask = 0xFF;
+        idesc.Flags = g_Settings.rtOmmsEnabled ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE : D3D12_RAYTRACING_INSTANCE_FLAG_DISABLE_OMMS;
         idesc.AccelerationStructure = prim.blas->resource->GetGPUVirtualAddress();
         idesc.InstanceID = inst.primIndex;
 
@@ -368,6 +536,7 @@ void Raytracing::UpdateInstances(const ComPtr<ID3D12GraphicsCommandList7>& cmd, 
 
         D3D12_RAYTRACING_INSTANCE_DESC idesc{};
         idesc.InstanceMask = 0xFF;
+        idesc.Flags = g_Settings.rtOmmsEnabled ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE : D3D12_RAYTRACING_INSTANCE_FLAG_DISABLE_OMMS;
         idesc.AccelerationStructure = prim.blas->resource->GetGPUVirtualAddress();
         idesc.InstanceID = inst.primIndex;
         FillInstanceTransform(idesc, inst.world);
@@ -452,217 +621,66 @@ void Raytracing::UpdateInstances(const ComPtr<ID3D12GraphicsCommandList7>& cmd, 
     cmd->BuildRaytracingAccelerationStructure(&topBuild, 0, nullptr);
 }
 
-void Raytracing::CreateShadowPassResources(const XMUINT2& renderSize)
-{
-    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
-
-    const CD3DX12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16_FLOAT, renderSize.x, renderSize.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-
-    const CD3DX12_HEAP_PROPERTIES defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-
-    IE_Check(
-        device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&m_Shadow.trace.outputTexture.resource)));
-    m_Shadow.trace.outputTexture.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    m_Shadow.trace.outputTexture.SetName(L"RT Shadows Output");
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC outputUavDesc{};
-    outputUavDesc.Format = DXGI_FORMAT_R16_FLOAT;
-    outputUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    m_Shadow.trace.outputTexture.uavIndex = m_BindlessHeaps.CreateUAV(m_Shadow.trace.outputTexture.resource, outputUavDesc);
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC outputSrvDesc{};
-    outputSrvDesc.Format = DXGI_FORMAT_R16_FLOAT;
-    outputSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    outputSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    outputSrvDesc.Texture2D.MipLevels = 1;
-    m_Shadow.trace.outputTexture.srvIndex = m_BindlessHeaps.CreateSRV(m_Shadow.trace.outputTexture.resource, outputSrvDesc);
-
-    IE_Check(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                                             IID_PPV_ARGS(&m_Shadow.blur.intermediateResource.resource)));
-    m_Shadow.blur.intermediateResource.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    m_Shadow.blur.intermediateResource.SetName(L"RTShadows_BlurIntermediate");
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC intermediateUavDesc{};
-    intermediateUavDesc.Format = DXGI_FORMAT_R16_FLOAT;
-    intermediateUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    m_Shadow.blur.intermediateResource.uavIndex = m_BindlessHeaps.CreateUAV(m_Shadow.blur.intermediateResource.resource, intermediateUavDesc);
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC intermediateSrvDesc = outputSrvDesc;
-    m_Shadow.blur.intermediateResource.srvIndex = m_BindlessHeaps.CreateSRV(m_Shadow.blur.intermediateResource.resource, intermediateSrvDesc);
-}
-
 void Raytracing::CreatePathTracePassResources(const XMUINT2& renderSize)
 {
     const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
-    const XMUINT2 halfRes = {IE_DivRoundUp(renderSize.x, 2u), IE_DivRoundUp(renderSize.y, 2u)};
+    ReleaseTextureDescriptors(m_BindlessHeaps, m_PathTrace.trace.outputTexture);
+    ReleaseTextureDescriptors(m_BindlessHeaps, m_PathTrace.trace.hitDistanceTexture);
 
-    const CD3DX12_RESOURCE_DESC traceDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16B16A16_FLOAT, halfRes.x, halfRes.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     const CD3DX12_RESOURCE_DESC outDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16B16A16_FLOAT, renderSize.x, renderSize.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-
-    const CD3DX12_HEAP_PROPERTIES defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-
-    IE_Check(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &traceDesc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                                             IID_PPV_ARGS(&m_PathTrace.trace.indirectDiffuseTraceTexture.resource)));
-    m_PathTrace.trace.indirectDiffuseTraceTexture.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    m_PathTrace.trace.indirectDiffuseTraceTexture.SetName(L"Indirect Diffuse Trace Half");
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC traceUavDesc{};
-    traceUavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    traceUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    m_PathTrace.trace.indirectDiffuseTraceTexture.uavIndex = m_BindlessHeaps.CreateUAV(m_PathTrace.trace.indirectDiffuseTraceTexture.resource, traceUavDesc);
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC traceSrvDesc{};
-    traceSrvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    traceSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    traceSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    traceSrvDesc.Texture2D.MipLevels = 1;
-    m_PathTrace.trace.indirectDiffuseTraceTexture.srvIndex = m_BindlessHeaps.CreateSRV(m_PathTrace.trace.indirectDiffuseTraceTexture.resource, traceSrvDesc);
+    const CD3DX12_RESOURCE_DESC hitDistanceDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16_FLOAT, renderSize.x, renderSize.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
 
     IE_Check(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &outDesc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                                             IID_PPV_ARGS(&m_PathTrace.trace.indirectDiffuseTexture.resource)));
-    m_PathTrace.trace.indirectDiffuseTexture.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    m_PathTrace.trace.indirectDiffuseTexture.SetName(L"Indirect Diffuse");
+                                             IID_PPV_ARGS(&m_PathTrace.trace.outputTexture.resource)));
+    m_PathTrace.trace.outputTexture.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    m_PathTrace.trace.outputTexture.SetName(L"Path-Traced Lighting");
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC outUavDesc{};
     outUavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     outUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    m_PathTrace.trace.indirectDiffuseTexture.uavIndex = m_BindlessHeaps.CreateUAV(m_PathTrace.trace.indirectDiffuseTexture.resource, outUavDesc);
+    m_PathTrace.trace.outputTexture.uavIndex = m_BindlessHeaps.CreateUAV(m_PathTrace.trace.outputTexture.resource, outUavDesc);
 
     D3D12_SHADER_RESOURCE_VIEW_DESC outSrvDesc{};
     outSrvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     outSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     outSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     outSrvDesc.Texture2D.MipLevels = 1;
-    m_PathTrace.trace.indirectDiffuseTexture.srvIndex = m_BindlessHeaps.CreateSRV(m_PathTrace.trace.indirectDiffuseTexture.resource, outSrvDesc);
+    m_PathTrace.trace.outputTexture.srvIndex = m_BindlessHeaps.CreateSRV(m_PathTrace.trace.outputTexture.resource, outSrvDesc);
 
-    BufferCreateDesc d{};
-    d.sizeInBytes = RC_ENTRIES * sizeof(RadianceCacheEntry);
-    d.heapType = D3D12_HEAP_TYPE_DEFAULT;
-    d.resourceFlags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    d.initialState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    d.finalState = d.initialState;
-    d.viewKind = BufferCreateDesc::ViewKind::Structured;
-    d.strideInBytes = sizeof(RadianceCacheEntry);
-    d.createSRV = true;
-    d.createUAV = true;
-    d.name = L"RadianceCache";
-    m_PathTrace.trace.radianceCache = CreateBuffer(nullptr, d);
+    IE_Check(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &hitDistanceDesc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                             IID_PPV_ARGS(&m_PathTrace.trace.hitDistanceTexture.resource)));
+    m_PathTrace.trace.hitDistanceTexture.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    m_PathTrace.trace.hitDistanceTexture.SetName(L"Path-Traced Lighting Specular Hit Distance");
 
-    d.sizeInBytes = halfRes.x * halfRes.y * sizeof(RadianceSample);
-    d.strideInBytes = sizeof(RadianceSample);
-    d.name = L"RadianceSamples";
-    m_PathTrace.trace.radianceSamples = CreateBuffer(nullptr, d);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC hitDistanceUavDesc{};
+    hitDistanceUavDesc.Format = DXGI_FORMAT_R16_FLOAT;
+    hitDistanceUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    m_PathTrace.trace.hitDistanceTexture.uavIndex = m_BindlessHeaps.CreateUAV(m_PathTrace.trace.hitDistanceTexture.resource, hitDistanceUavDesc);
 
-    d.sizeInBytes = sizeof(u32);
-    d.strideInBytes = sizeof(u32);
-    d.name = L"RadianceCacheUsageCounter";
-    m_PathTrace.trace.radianceCacheUsageCounter = CreateBuffer(nullptr, d);
-
-    BufferCreateDesc rb{};
-    rb.sizeInBytes = sizeof(u32);
-    rb.heapType = D3D12_HEAP_TYPE_READBACK;
-    rb.viewKind = BufferCreateDesc::ViewKind::None;
-    rb.createSRV = false;
-    rb.createUAV = false;
-    rb.initialState = D3D12_RESOURCE_STATE_COPY_DEST;
-    rb.finalState = D3D12_RESOURCE_STATE_COPY_DEST;
-    rb.name = L"RadianceCacheUsageReadback";
-
-    for (u32 i = 0; i < IE_Constants::frameInFlightCount; ++i)
-    {
-        m_PathTrace.trace.radianceCacheUsageReadback[i] = CreateBuffer(nullptr, rb);
-
-        u32* mapped = nullptr;
-        const D3D12_RANGE readRange(0, 0);
-        IE_Check(m_PathTrace.trace.radianceCacheUsageReadback[i]->Map(0, &readRange, reinterpret_cast<void**>(&mapped)));
-        *mapped = 0u;
-        const D3D12_RANGE writeRange(0, 0);
-        m_PathTrace.trace.radianceCacheUsageReadback[i]->Unmap(0, &writeRange);
-    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC hitDistanceSrvDesc{};
+    hitDistanceSrvDesc.Format = DXGI_FORMAT_R16_FLOAT;
+    hitDistanceSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    hitDistanceSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    hitDistanceSrvDesc.Texture2D.MipLevels = 1;
+    m_PathTrace.trace.hitDistanceTexture.srvIndex = m_BindlessHeaps.CreateSRV(m_PathTrace.trace.hitDistanceTexture.resource, hitDistanceSrvDesc);
 }
 
-void Raytracing::CreateSpecularPassResources(const XMUINT2& renderSize)
+void Raytracing::InvalidatePathTraceDescriptorIndices()
 {
-    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
-
-    const CD3DX12_RESOURCE_DESC outDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16B16A16_FLOAT, renderSize.x, renderSize.y, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    const CD3DX12_HEAP_PROPERTIES defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-
-    IE_Check(
-        device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &outDesc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&m_Specular.trace.outputTexture.resource)));
-    m_Specular.trace.outputTexture.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    m_Specular.trace.outputTexture.SetName(L"RT Specular");
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC outUavDesc{};
-    outUavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    outUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    m_Specular.trace.outputTexture.uavIndex = m_BindlessHeaps.CreateUAV(m_Specular.trace.outputTexture.resource, outUavDesc);
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC outSrvDesc{};
-    outSrvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    outSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    outSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    outSrvDesc.Texture2D.MipLevels = 1;
-    m_Specular.trace.outputTexture.srvIndex = m_BindlessHeaps.CreateSRV(m_Specular.trace.outputTexture.resource, outSrvDesc);
-}
-
-void Raytracing::CreateShadowPassPipelines()
-{
-    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
-
-    Shader::ReloadOrCreate(m_Shadow.trace.shader, IE_SHADER_TYPE_LIB, "systems/raytracing/shadows/shadows.rt.hlsl", {});
-    CreateGlobalRootSigConstants(device, sizeof(RTShadowsTraceConstants) / sizeof(u32), m_Shadow.trace.rootSig);
-
-    CD3DX12_STATE_OBJECT_DESC raytracingPipeline{D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE};
-
-    auto* lib = raytracingPipeline.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
-    const D3D12_SHADER_BYTECODE libdxil = m_Shadow.trace.shader->GetBytecode();
-    lib->SetDXILLibrary(&libdxil);
-    lib->DefineExport(L"Raygen");
-    lib->DefineExport(L"AnyHit");
-    lib->DefineExport(L"ClosestHit");
-    lib->DefineExport(L"Miss");
-
-    auto* hitGroup = raytracingPipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
-    hitGroup->SetAnyHitShaderImport(L"AnyHit");
-    hitGroup->SetClosestHitShaderImport(L"ClosestHit");
-    hitGroup->SetHitGroupExport(L"HitGroup");
-    hitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
-
-    auto* shaderConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
-    shaderConfig->Config(kShadowPayloadBytes, kTriangleAttribBytes);
-
-    auto* globalRootSignature = raytracingPipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
-    globalRootSignature->SetRootSignature(m_Shadow.trace.rootSig.Get());
-
-    auto* pipelineConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
-    pipelineConfig->Config(1);
-
-    IE_Check(device->CreateStateObject(raytracingPipeline, IID_PPV_ARGS(&m_Shadow.trace.dxrStateObject)));
-
-    ComPtr<ID3D12StateObjectProperties> props;
-    IE_Check(m_Shadow.trace.dxrStateObject.As(&props));
-
-    const u32 shaderRecordSize = CalcShaderRecordSize();
-    CreateShaderTable(device, props, L"RayGenShaderTable", L"Raygen", shaderRecordSize, m_Shadow.trace.rayGenShaderTable);
-    CreateShaderTable(device, props, L"MissShaderTable", L"Miss", shaderRecordSize, m_Shadow.trace.missShaderTable);
-    CreateShaderTable(device, props, L"HitGroupShaderTable", L"HitGroup", shaderRecordSize, m_Shadow.trace.hitGroupShaderTable);
-
-    Shader::ReloadOrCreate(m_Shadow.blur.cs, IE_SHADER_TYPE_COMPUTE, "systems/raytracing/shadows/shadows_blur.cs.hlsl", {});
-
-    m_Shadow.blur.rootSignature = m_Shadow.blur.cs->GetOrCreateRootSignature(device);
-
-    D3D12_COMPUTE_PIPELINE_STATE_DESC blurPsoDesc{};
-    blurPsoDesc.pRootSignature = m_Shadow.blur.rootSignature.Get();
-    blurPsoDesc.CS = m_Shadow.blur.cs->GetBytecode();
-    IE_Check(device->CreateComputePipelineState(&blurPsoDesc, IID_PPV_ARGS(&m_Shadow.blur.pso)));
+    m_PathTrace.trace.outputTexture.srvIndex = UINT32_MAX;
+    m_PathTrace.trace.outputTexture.uavIndex = UINT32_MAX;
+    m_PathTrace.trace.hitDistanceTexture.srvIndex = UINT32_MAX;
+    m_PathTrace.trace.hitDistanceTexture.uavIndex = UINT32_MAX;
 }
 
 void Raytracing::CreatePathTracePassPipelines()
 {
     const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
+    RequireOpacityMicromapSupport(device);
+    RequireShaderExecutionReorderingSupport(device);
 
-    Shader::ReloadOrCreate(m_PathTrace.trace.shader, IE_SHADER_TYPE_LIB, "systems/raytracing/pathtrace/pathtrace.rt.hlsl", {});
+    Shader::ReloadOrCreate(m_PathTrace.trace.shader, IE_SHADER_TYPE_LIB, "systems/raytracing/lighting/path_trace.rt.hlsl", {});
     CreateGlobalRootSigConstants(device, sizeof(PathTraceConstants) / sizeof(u32), m_PathTrace.trace.rootSig);
 
     CD3DX12_STATE_OBJECT_DESC raytracingPipeline{D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE};
@@ -687,8 +705,8 @@ void Raytracing::CreatePathTracePassPipelines()
     auto* globalRootSignature = raytracingPipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
     globalRootSignature->SetRootSignature(m_PathTrace.trace.rootSig.Get());
 
-    auto* pipelineConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
-    pipelineConfig->Config(1);
+    auto* pipelineConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT>();
+    pipelineConfig->Config(1, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS);
 
     IE_Check(device->CreateStateObject(raytracingPipeline, IID_PPV_ARGS(&m_PathTrace.trace.dxrStateObject)));
 
@@ -696,343 +714,69 @@ void Raytracing::CreatePathTracePassPipelines()
     IE_Check(m_PathTrace.trace.dxrStateObject.As(&props));
 
     const u32 shaderRecordSize = CalcShaderRecordSize();
-    CreateShaderTable(device, props, L"RayGenShaderTable", L"Raygen", shaderRecordSize, m_PathTrace.trace.rayGenShaderTable);
-    CreateShaderTable(device, props, L"MissShaderTable", L"Miss", shaderRecordSize, m_PathTrace.trace.missShaderTable);
-    CreateShaderTable(device, props, L"HitGroupShaderTable", L"HitGroup", shaderRecordSize, m_PathTrace.trace.hitGroupShaderTable);
-
-    Shader::ReloadOrCreate(m_PathTrace.cache.csClearSamples, IE_SHADER_TYPE_COMPUTE, "systems/raytracing/pathtrace/pathtrace_clear_samples.cs.hlsl", {});
-    Shader::ReloadOrCreate(m_PathTrace.cache.csIntegrateSamples, IE_SHADER_TYPE_COMPUTE, "systems/raytracing/pathtrace/pathtrace_integrate_samples.cs.hlsl", {});
-    Shader::ReloadOrCreate(m_PathTrace.cache.csClearCache, IE_SHADER_TYPE_COMPUTE, "systems/raytracing/pathtrace/pathtrace_clear_cache.cs.hlsl", {});
-    Shader::ReloadOrCreate(m_PathTrace.cache.csPruneCache, IE_SHADER_TYPE_COMPUTE, "systems/raytracing/pathtrace/pathtrace_prune_cache.cs.hlsl", {});
-    Shader::ReloadOrCreate(m_PathTrace.upsample.cs, IE_SHADER_TYPE_COMPUTE, "systems/raytracing/pathtrace/pathtrace_upsample.cs.hlsl", {});
-
-    m_PathTrace.cache.rootSignature = m_PathTrace.cache.csClearSamples->GetOrCreateRootSignature(device);
-    m_PathTrace.upsample.rootSignature = m_PathTrace.upsample.cs->GetOrCreateRootSignature(device);
-
-    D3D12_COMPUTE_PIPELINE_STATE_DESC cachePsoDesc{};
-    cachePsoDesc.pRootSignature = m_PathTrace.cache.rootSignature.Get();
-    cachePsoDesc.CS = m_PathTrace.cache.csClearSamples->GetBytecode();
-    IE_Check(device->CreateComputePipelineState(&cachePsoDesc, IID_PPV_ARGS(&m_PathTrace.cache.clearPso)));
-    cachePsoDesc.CS = m_PathTrace.cache.csIntegrateSamples->GetBytecode();
-    IE_Check(device->CreateComputePipelineState(&cachePsoDesc, IID_PPV_ARGS(&m_PathTrace.cache.integratePso)));
-    cachePsoDesc.CS = m_PathTrace.cache.csClearCache->GetBytecode();
-    IE_Check(device->CreateComputePipelineState(&cachePsoDesc, IID_PPV_ARGS(&m_PathTrace.cache.clearCachePso)));
-    cachePsoDesc.CS = m_PathTrace.cache.csPruneCache->GetBytecode();
-    IE_Check(device->CreateComputePipelineState(&cachePsoDesc, IID_PPV_ARGS(&m_PathTrace.cache.pruneCachePso)));
-
-    D3D12_COMPUTE_PIPELINE_STATE_DESC upsamplePsoDesc{};
-    upsamplePsoDesc.pRootSignature = m_PathTrace.upsample.rootSignature.Get();
-    upsamplePsoDesc.CS = m_PathTrace.upsample.cs->GetBytecode();
-    IE_Check(device->CreateComputePipelineState(&upsamplePsoDesc, IID_PPV_ARGS(&m_PathTrace.upsample.pso)));
-}
-
-void Raytracing::CreateSpecularPassPipelines()
-{
-    const ComPtr<ID3D12Device14>& device = m_RenderDevice.GetDevice();
-
-    Shader::ReloadOrCreate(m_Specular.trace.shader, IE_SHADER_TYPE_LIB, "systems/raytracing/specular/specular.rt.hlsl", {});
-    CreateGlobalRootSigConstants(device, sizeof(RTSpecularConstants) / sizeof(u32), m_Specular.trace.rootSig);
-
-    CD3DX12_STATE_OBJECT_DESC raytracingPipeline{D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE};
-
-    auto* lib = raytracingPipeline.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
-    const D3D12_SHADER_BYTECODE libdxil = m_Specular.trace.shader->GetBytecode();
-    lib->SetDXILLibrary(&libdxil);
-    lib->DefineExport(L"Raygen");
-    lib->DefineExport(L"AnyHit");
-    lib->DefineExport(L"ClosestHit");
-    lib->DefineExport(L"Miss");
-
-    auto* hitGroup = raytracingPipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
-    hitGroup->SetAnyHitShaderImport(L"AnyHit");
-    hitGroup->SetClosestHitShaderImport(L"ClosestHit");
-    hitGroup->SetHitGroupExport(L"HitGroup");
-    hitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
-
-    auto* shaderConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
-    shaderConfig->Config(kPathTracePayloadBytes, kTriangleAttribBytes);
-
-    auto* globalRootSignature = raytracingPipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
-    globalRootSignature->SetRootSignature(m_Specular.trace.rootSig.Get());
-
-    auto* pipelineConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
-    pipelineConfig->Config(1);
-
-    IE_Check(device->CreateStateObject(raytracingPipeline, IID_PPV_ARGS(&m_Specular.trace.dxrStateObject)));
-
-    ComPtr<ID3D12StateObjectProperties> props;
-    IE_Check(m_Specular.trace.dxrStateObject.As(&props));
-
-    const u32 shaderRecordSize = CalcShaderRecordSize();
-    CreateShaderTable(device, props, L"Specular/RayGenShaderTable", L"Raygen", shaderRecordSize, m_Specular.trace.rayGenShaderTable);
-    CreateShaderTable(device, props, L"Specular/MissShaderTable", L"Miss", shaderRecordSize, m_Specular.trace.missShaderTable);
-    CreateShaderTable(device, props, L"Specular/HitGroupShaderTable", L"HitGroup", shaderRecordSize, m_Specular.trace.hitGroupShaderTable);
-}
-
-void Raytracing::ShadowPass(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers, const XMUINT2& renderSize, const ShadowPassInput& input)
-{
-    Camera& camera = m_Camera;
-
-    const Camera::FrameData cameraFrameData = camera.GetFrameData();
-    const Array<ID3D12DescriptorHeap*, 2> descriptorHeaps = m_BindlessHeaps.GetDescriptorHeaps();
-    cmd->SetDescriptorHeaps(descriptorHeaps.size(), descriptorHeaps.data());
-
-    static constexpr XMUINT2 ditherFactors[4] = {
-        XMUINT2(1, 1),
-        XMUINT2(1, 2),
-        XMUINT2(2, 2),
-        XMUINT2(4, 4),
-    };
-    static constexpr u32 rtTileCount[4] = {
-        1,
-        2,
-        4,
-        16,
-    };
-
-    const u32 shadowTypeIndex = static_cast<u32>(g_Settings.rtShadowsResolution);
-    IE_Assert(shadowTypeIndex < 4);
-
-    const XMUINT2 currentDitherFactors = ditherFactors[shadowTypeIndex];
-    const u32 tileCount = rtTileCount[shadowTypeIndex];
-    const u32 slot = input.frameIndex % tileCount;
-
-    u32 idx = 0;
-    if (tileCount < 4)
-    {
-        idx = slot;
-    }
-    else if (tileCount == 4)
-    {
-        static constexpr u32 invBayer2[4] = {0, 3, 1, 2};
-        idx = invBayer2[slot];
-    }
-    else
-    {
-        static constexpr u32 invBayer4[16] = {0, 10, 2, 8, 5, 15, 7, 13, 1, 11, 3, 9, 4, 14, 6, 12};
-        idx = invBayer4[slot];
-    }
-
-    const u32 shift = currentDitherFactors.x >> 1;
-    const u32 mask = currentDitherFactors.x - 1;
-    const XMUINT2 ditherOffset = XMUINT2(idx & mask, idx >> shift);
-
-    D3D12_DISPATCH_RAYS_DESC dispatchRaysDesc{};
-    dispatchRaysDesc.RayGenerationShaderRecord.StartAddress = m_Shadow.trace.rayGenShaderTable->GetGPUVirtualAddress();
-    dispatchRaysDesc.RayGenerationShaderRecord.SizeInBytes = m_Shadow.trace.rayGenShaderTable->GetDesc().Width;
-
-    dispatchRaysDesc.MissShaderTable.StartAddress = m_Shadow.trace.missShaderTable->GetGPUVirtualAddress();
-    dispatchRaysDesc.MissShaderTable.SizeInBytes = m_Shadow.trace.missShaderTable->GetDesc().Width;
-    dispatchRaysDesc.MissShaderTable.StrideInBytes = m_Shadow.trace.missShaderTable->GetDesc().Width;
-
-    dispatchRaysDesc.HitGroupTable.StartAddress = m_Shadow.trace.hitGroupShaderTable->GetGPUVirtualAddress();
-    dispatchRaysDesc.HitGroupTable.SizeInBytes = m_Shadow.trace.hitGroupShaderTable->GetDesc().Width;
-    dispatchRaysDesc.HitGroupTable.StrideInBytes = m_Shadow.trace.hitGroupShaderTable->GetDesc().Width;
-
-    dispatchRaysDesc.Depth = 1;
-    dispatchRaysDesc.Width = IE_DivRoundUp(renderSize.x, currentDitherFactors.x);
-    dispatchRaysDesc.Height = IE_DivRoundUp(renderSize.y, currentDitherFactors.y);
-
-    RTShadowsTraceConstants constants{};
-    constants.invViewProj = cameraFrameData.invViewProj;
-    constants.outputTextureIndex = m_Shadow.trace.outputTexture.uavIndex;
-    constants.fullDimInv = XMFLOAT2(1.0f / static_cast<f32>(dispatchRaysDesc.Width * currentDitherFactors.x), 1.0f / static_cast<f32>(dispatchRaysDesc.Height * currentDitherFactors.y));
-    constants.ditherFactors = currentDitherFactors;
-    constants.ditherOffset = ditherOffset;
-    constants.sunDir = input.sunDir;
-    constants.cameraPos = cameraFrameData.position;
-    constants.depthTextureIndex = input.depthTextureIndex;
-    constants.normalGeoTextureIndex = input.normalGeoTextureIndex;
-    constants.primInfoBufferIndex = m_RTPrimInfoBuffer->srvIndex;
-    constants.materialsBufferIndex = input.materialsBufferIndex;
-    constants.tlasIndex = m_TlasSrvIndex;
-
-    GPU_MARKER_BEGIN(cmd, gpuTimers, "Ray-Traced Shadows");
-    {
-        m_Shadow.trace.outputTexture.Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        cmd->SetComputeRootSignature(m_Shadow.trace.rootSig.Get());
-        cmd->SetPipelineState1(m_Shadow.trace.dxrStateObject.Get());
-        cmd->SetComputeRoot32BitConstants(0, sizeof(RTShadowsTraceConstants) / sizeof(u32), &constants, 0);
-        cmd->DispatchRays(&dispatchRaysDesc);
-    }
-    GPU_MARKER_END(cmd, gpuTimers);
-
-    GPU_MARKER_BEGIN(cmd, gpuTimers, "Ray-Traced Shadows Blur");
-    {
-        RTShadowsBlurConstants rootConstants{};
-        rootConstants.zNear = cameraFrameData.znearfar.x;
-        rootConstants.depthTextureIndex = input.depthTextureIndex;
-        rootConstants.normalGeoTextureIndex = input.normalGeoTextureIndex;
-
-        const u32 dispatchX = IE_DivRoundUp(renderSize.x, 16);
-        const u32 dispatchY = IE_DivRoundUp(renderSize.y, 16);
-
-        cmd->SetComputeRootSignature(m_Shadow.blur.rootSignature.Get());
-        cmd->SetPipelineState(m_Shadow.blur.pso.Get());
-
-        m_Shadow.trace.outputTexture.UavBarrier(cmd);
-        m_Shadow.trace.outputTexture.Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        m_Shadow.blur.intermediateResource.Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        rootConstants.inputTextureIndex = m_Shadow.trace.outputTexture.srvIndex;
-        rootConstants.outputTextureIndex = m_Shadow.blur.intermediateResource.uavIndex;
-        rootConstants.axis = {1u, 0u};
-        cmd->SetComputeRoot32BitConstants(0, sizeof(RTShadowsBlurConstants) / sizeof(u32), &rootConstants, 0);
-        cmd->Dispatch(dispatchX, dispatchY, 1);
-
-        m_Shadow.blur.intermediateResource.UavBarrier(cmd);
-        m_Shadow.trace.outputTexture.Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        m_Shadow.blur.intermediateResource.Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-        rootConstants.inputTextureIndex = m_Shadow.blur.intermediateResource.srvIndex;
-        rootConstants.outputTextureIndex = m_Shadow.trace.outputTexture.uavIndex;
-        rootConstants.axis = {0u, 1u};
-        cmd->SetComputeRoot32BitConstants(0, sizeof(RTShadowsBlurConstants) / sizeof(u32), &rootConstants, 0);
-        cmd->Dispatch(dispatchX, dispatchY, 1);
-
-        m_Shadow.trace.outputTexture.UavBarrier(cmd);
-        m_Shadow.trace.outputTexture.Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    }
-    GPU_MARKER_END(cmd, gpuTimers);
+    CreateShaderTable(device, props, L"PathTrace/RayGenShaderTable", L"Raygen", shaderRecordSize, m_PathTrace.trace.rayGenShaderTable);
+    CreateShaderTable(device, props, L"PathTrace/MissShaderTable", L"Miss", shaderRecordSize, m_PathTrace.trace.missShaderTable);
+    CreateShaderTable(device, props, L"PathTrace/HitGroupShaderTable", L"HitGroup", shaderRecordSize, m_PathTrace.trace.hitGroupShaderTable);
 }
 
 void Raytracing::PathTracePass(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers, const XMUINT2& renderSize, const PathTracePassInput& input)
 {
-    Camera& camera = m_Camera;
-    const XMUINT2 halfRes = {IE_DivRoundUp(renderSize.x, 2u), IE_DivRoundUp(renderSize.y, 2u)};
-
-    const Camera::FrameData cameraFrameData = camera.GetFrameData();
+    const Camera::FrameData cameraFrameData = m_Camera.GetFrameData();
     const Array<ID3D12DescriptorHeap*, 2> descriptorHeaps = m_BindlessHeaps.GetDescriptorHeaps();
-
-    bool cacheWasCleared = false;
-    if (!m_Cleared)
-    {
-        ClearPathTraceRadianceCacheCS(cmd, gpuTimers);
-        m_Cleared = true;
-        cacheWasCleared = true;
-    }
     cmd->SetDescriptorHeaps(descriptorHeaps.size(), descriptorHeaps.data());
-
-    const u32 samplesCount = halfRes.x * halfRes.y;
-    const u32 readbackIdx = input.frameInFlightIdx % IE_Constants::frameInFlightCount;
-
-    u32 usedEntriesPrev = 0u;
-    const SharedPtr<Buffer>& usageReadback = m_PathTrace.trace.radianceCacheUsageReadback[readbackIdx];
-    if (usageReadback && usageReadback->resource)
-    {
-        const D3D12_RANGE readRange(0, sizeof(u32));
-        u32* mapped = nullptr;
-        if (SUCCEEDED(usageReadback->Map(0, &readRange, reinterpret_cast<void**>(&mapped))) && mapped)
-        {
-            usedEntriesPrev = *mapped;
-            const D3D12_RANGE writeRange(0, 0);
-            usageReadback->Unmap(0, &writeRange);
-        }
-    }
-
-    const f32 occupancy = static_cast<f32>(usedEntriesPrev) / static_cast<f32>(RC_ENTRIES);
-    if (cacheWasCleared)
-    {
-        m_PruneActive = false;
-    }
-    else if (!m_PruneActive && occupancy >= kPruneStartOccupancy)
-    {
-        m_PruneActive = true;
-    }
-    else if (m_PruneActive && occupancy <= kPruneStopOccupancy)
-    {
-        m_PruneActive = false;
-    }
-
-    GPU_MARKER_BEGIN(cmd, gpuTimers, "Radiance Cache - Clear Samples");
-    {
-        cmd->SetComputeRootSignature(m_PathTrace.cache.rootSignature.Get());
-        cmd->SetPipelineState(m_PathTrace.cache.clearPso.Get());
-
-        m_PathTrace.trace.radianceSamples->Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        PathTraceCacheClearSamplesConstants c{};
-        c.radianceSamplesUavIndex = m_PathTrace.trace.radianceSamples->uavIndex;
-        c.samplesCount = samplesCount;
-
-        cmd->SetComputeRoot32BitConstants(0, sizeof(c) / sizeof(u32), &c, 0);
-        cmd->Dispatch(IE_DivRoundUp(samplesCount, kCacheCSGroupSize), 1, 1);
-
-        m_PathTrace.trace.radianceSamples->UavBarrier(cmd);
-    }
-    GPU_MARKER_END(cmd, gpuTimers);
 
     D3D12_DISPATCH_RAYS_DESC dispatchRayDesc{};
     dispatchRayDesc.RayGenerationShaderRecord.StartAddress = m_PathTrace.trace.rayGenShaderTable->GetGPUVirtualAddress();
     dispatchRayDesc.RayGenerationShaderRecord.SizeInBytes = m_PathTrace.trace.rayGenShaderTable->GetDesc().Width;
-
     dispatchRayDesc.MissShaderTable.StartAddress = m_PathTrace.trace.missShaderTable->GetGPUVirtualAddress();
     dispatchRayDesc.MissShaderTable.SizeInBytes = m_PathTrace.trace.missShaderTable->GetDesc().Width;
     dispatchRayDesc.MissShaderTable.StrideInBytes = m_PathTrace.trace.missShaderTable->GetDesc().Width;
-
     dispatchRayDesc.HitGroupTable.StartAddress = m_PathTrace.trace.hitGroupShaderTable->GetGPUVirtualAddress();
     dispatchRayDesc.HitGroupTable.SizeInBytes = m_PathTrace.trace.hitGroupShaderTable->GetDesc().Width;
     dispatchRayDesc.HitGroupTable.StrideInBytes = m_PathTrace.trace.hitGroupShaderTable->GetDesc().Width;
 
-    dispatchRayDesc.Width = halfRes.x;
-    dispatchRayDesc.Height = halfRes.y;
+    dispatchRayDesc.Width = renderSize.x;
+    dispatchRayDesc.Height = renderSize.y;
     dispatchRayDesc.Depth = 1;
 
     PathTraceConstants constants{};
     constants.invViewProj = cameraFrameData.invViewProj;
     constants.cameraPos = cameraFrameData.position;
-    constants.indirectDiffuseTextureIndex = m_PathTrace.trace.indirectDiffuseTraceTexture.uavIndex;
-    constants.sunDir = input.sunDir;
+    constants.outputTextureIndex = m_PathTrace.trace.outputTexture.uavIndex;
+    constants.hitDistanceTextureIndex = m_PathTrace.trace.hitDistanceTexture.uavIndex;
+    constants.depthTextureIndex = input.depthTextureIndex;
+    constants.albedoTextureIndex = input.albedoTextureIndex;
+    constants.normalTextureIndex = input.normalTextureIndex;
     constants.normalGeoTextureIndex = input.normalGeoTextureIndex;
+    constants.materialTextureIndex = input.materialTextureIndex;
+    constants.emissiveTextureIndex = input.emissiveTextureIndex;
     constants.fullDimInv = XMFLOAT2(1.0f / static_cast<f32>(renderSize.x), 1.0f / static_cast<f32>(renderSize.y));
     constants.tlasIndex = m_TlasSrvIndex;
-    constants.depthTextureIndex = input.depthTextureIndex;
     constants.primInfoBufferIndex = m_RTPrimInfoBuffer->srvIndex;
     constants.materialsBufferIndex = input.materialsBufferIndex;
-    constants.radianceCacheUavIndex = m_PathTrace.trace.radianceCache->uavIndex;
-    constants.radianceCacheSrvIndex = m_PathTrace.trace.radianceCache->srvIndex;
-    constants.radianceCacheCellSize = g_Settings.radianceCacheCellSize;
-    constants.frameIndex = input.frameIndex;
-    constants.radianceSamplesUavIndex = m_PathTrace.trace.radianceSamples->uavIndex;
-    constants.samplesCount = samplesCount;
     constants.skyCubeIndex = input.skyCubeIndex;
-    constants.skyIntensity = g_Settings.skyIntensity;
     constants.samplerIndex = input.samplerIndex;
-    const XMVECTOR sunDir = XMLoadFloat3(&input.sunDir);
-    const XMVECTOR sunDirNormalized = XMVector3Normalize(sunDir);
-    XMStoreFloat3(&constants.sunDir, sunDirNormalized);
-    const XMVECTOR sunColor = XMLoadFloat3(&input.sunColor);
-    const XMVECTOR sunColorClamped = XMVectorMax(sunColor, XMVectorZero());
-    XMFLOAT3 sunColorClampedF3{};
-    XMStoreFloat3(&sunColorClampedF3, sunColorClamped);
-    const f32 luminance = sunColorClampedF3.x * 0.2126f + sunColorClampedF3.y * 0.7152f + sunColorClampedF3.z * 0.0722f;
-    XMFLOAT3 sunRadiance = {};
-    if (luminance > 1e-4f)
-    {
-        const f32 invLuminance = 1.0f / luminance;
-        sunRadiance.x = sunColorClampedF3.x * invLuminance * g_Settings.sunIntensity;
-        sunRadiance.y = sunColorClampedF3.y * invLuminance * g_Settings.sunIntensity;
-        sunRadiance.z = sunColorClampedF3.z * invLuminance * g_Settings.sunIntensity;
-    }
-    constants.sunRadiance = sunRadiance;
-    constants.spp = g_Settings.pathTraceSpp;
-    constants.bounceCount = g_Settings.pathTraceBounceCount;
-    constants.useTrilinear = g_Settings.radianceCacheTrilinear ? 1u : 0u;
-    constants.useSoftNormalInterpolation = g_Settings.radianceCacheSoftNormalInterpolation ? 1u : 0u;
-    constants.softNormalMinDot = g_Settings.radianceCacheSoftNormalMinDot;
-    constants.trilinearMinCornerSamples = g_Settings.radianceCacheTrilinearMinCornerSamples;
-    constants.trilinearMinHits = g_Settings.radianceCacheTrilinearMinHits;
-    constants.trilinearPresentMinSamples = g_Settings.radianceCacheTrilinearPresentMinSamples;
-    constants.normalBinRes = g_Settings.radianceCacheNormalBinRes;
-    constants.minExtraSppCount = g_Settings.radianceCacheMinExtraSppCount;
-    constants.maxProbes = g_Settings.radianceCacheMaxProbes;
-    const u32 clampedMaxSamples = (g_Settings.radianceCacheMaxSamples < kRadianceCacheMaxSamplesSafeClamp) ? g_Settings.radianceCacheMaxSamples : kRadianceCacheMaxSamplesSafeClamp;
-    constants.maxSamples = clampedMaxSamples;
+    constants.sunDir = input.sunDir;
+    constants.frameIndex = input.frameIndex;
+    constants.sunColor = input.sunColor;
+    constants.rtPathTraceSpp = IE_Max(g_Settings.rtPathTraceSpp, 1u);
+    constants.skyIntensity = g_Settings.skyIntensity;
+    constants.sunIntensity = g_Settings.sunIntensity;
+    constants.sunDiskAngleDeg = IE_Clamp(input.sunDiskAngleDeg, 0.001f, 12.0f);
+    constants.shadowMinVisibility = g_Settings.shadowMinVisibility;
+    constants.specularShadowMinVisibility = g_Settings.specularShadowMinVisibility;
+    constants.rtMaxBounces = IE_Max(g_Settings.rtMaxBounces, 1u);
+    constants.rtShadowsEnabled = g_Settings.rtShadowsEnabled ? 1u : 0u;
+    constants.rtUse2StateOmmRays = g_Settings.rtUse2StateOmmRays ? 1u : 0u;
+    constants.rtOmmsEnabled = g_Settings.rtOmmsEnabled ? 1u : 0u;
+    constants.rtSerEnabled = g_Settings.rtSerEnabled ? 1u : 0u;
+    constants.debugViewMode = g_Settings.lightingDebugMode;
+    constants.debugMeshletColorEnabled = g_Settings.debugMeshletColor ? 1u : 0u;
 
-    GPU_MARKER_BEGIN(cmd, gpuTimers, "Path Tracing");
+    GPU_MARKER_BEGIN(cmd, gpuTimers, "Path-Traced Lighting");
     {
-        m_PathTrace.trace.indirectDiffuseTraceTexture.Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_PathTrace.trace.outputTexture.Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_PathTrace.trace.hitDistanceTexture.Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         cmd->SetComputeRootSignature(m_PathTrace.trace.rootSig.Get());
         cmd->SetPipelineState1(m_PathTrace.trace.dxrStateObject.Get());
@@ -1040,195 +784,17 @@ void Raytracing::PathTracePass(const ComPtr<ID3D12GraphicsCommandList7>& cmd, Gp
 
         cmd->DispatchRays(&dispatchRayDesc);
 
-        m_PathTrace.trace.radianceSamples->UavBarrier(cmd);
-        m_PathTrace.trace.indirectDiffuseTraceTexture.Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    }
-    GPU_MARKER_END(cmd, gpuTimers);
-
-    GPU_MARKER_BEGIN(cmd, gpuTimers, "Path Tracing - Upsample");
-    {
-        m_PathTrace.trace.indirectDiffuseTexture.Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        PathTraceUpsampleConstants c{};
-        c.inputTextureIndex = m_PathTrace.trace.indirectDiffuseTraceTexture.srvIndex;
-        c.outputTextureIndex = m_PathTrace.trace.indirectDiffuseTexture.uavIndex;
-        c.depthTextureIndex = input.depthTextureIndex;
-        c.normalGeoTextureIndex = input.normalGeoTextureIndex;
-
-        cmd->SetComputeRootSignature(m_PathTrace.upsample.rootSignature.Get());
-        cmd->SetPipelineState(m_PathTrace.upsample.pso.Get());
-        cmd->SetComputeRoot32BitConstants(0, sizeof(c) / sizeof(u32), &c, 0);
-        cmd->Dispatch(IE_DivRoundUp(renderSize.x, 8u), IE_DivRoundUp(renderSize.y, 8u), 1);
-
-        m_PathTrace.trace.indirectDiffuseTexture.UavBarrier(cmd);
-        m_PathTrace.trace.indirectDiffuseTexture.Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    }
-    GPU_MARKER_END(cmd, gpuTimers);
-
-    if (m_PruneActive)
-    {
-        GPU_MARKER_BEGIN(cmd, gpuTimers, "Radiance Cache - Prune");
-        {
-            cmd->SetComputeRootSignature(m_PathTrace.cache.rootSignature.Get());
-            cmd->SetPipelineState(m_PathTrace.cache.pruneCachePso.Get());
-
-            m_PathTrace.trace.radianceCache->Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            m_PathTrace.trace.radianceCacheUsageCounter->Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-            const bool forcePrune = occupancy >= kPruneForceOccupancy;
-
-            PathTraceCachePruneConstants c{};
-            c.radianceCacheUavIndex = m_PathTrace.trace.radianceCache->uavIndex;
-            c.radianceCacheUsageCounterUavIndex = m_PathTrace.trace.radianceCacheUsageCounter->uavIndex;
-            c.frameIndex = input.frameIndex;
-            c.minAgeToPrune = forcePrune ? 0u : kPruneMinAgeFrames;
-            c.minSamplesToKeep = forcePrune ? 0u : kPruneMinSamplesToKeep;
-            c.attemptsPerThread = kPruneAttemptsPerThread;
-            c.randomSeed = input.frameIndex * 747796405u + 2891336453u;
-
-            cmd->SetComputeRoot32BitConstants(0, sizeof(c) / sizeof(u32), &c, 0);
-            cmd->Dispatch(IE_DivRoundUp(kPruneBudgetEntriesPerFrame, kCacheCSGroupSize), 1, 1);
-
-            m_PathTrace.trace.radianceCache->UavBarrier(cmd);
-            m_PathTrace.trace.radianceCacheUsageCounter->UavBarrier(cmd);
-        }
-        GPU_MARKER_END(cmd, gpuTimers);
-    }
-
-    GPU_MARKER_BEGIN(cmd, gpuTimers, "Radiance Cache - Integrate Samples");
-    {
-        cmd->SetComputeRootSignature(m_PathTrace.cache.rootSignature.Get());
-        cmd->SetPipelineState(m_PathTrace.cache.integratePso.Get());
-
-        m_PathTrace.trace.radianceSamples->Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        m_PathTrace.trace.radianceCache->Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        m_PathTrace.trace.radianceCacheUsageCounter->Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        PathTraceCacheIntegrateSamplesConstants c;
-        c.radianceSamplesSrvIndex = m_PathTrace.trace.radianceSamples->srvIndex;
-        c.radianceCacheUavIndex = m_PathTrace.trace.radianceCache->uavIndex;
-        c.radianceCacheUsageCounterUavIndex = m_PathTrace.trace.radianceCacheUsageCounter->uavIndex;
-        c.samplesCount = samplesCount;
-        c.frameIndex = input.frameIndex;
-        c.maxProbes = g_Settings.radianceCacheMaxProbes;
-        c.maxSamples = clampedMaxSamples;
-
-        cmd->SetComputeRoot32BitConstants(0, sizeof(c) / sizeof(u32), &c, 0);
-        cmd->Dispatch(IE_DivRoundUp(samplesCount, kCacheCSGroupSize), 1, 1);
-
-        m_PathTrace.trace.radianceCache->UavBarrier(cmd);
-        m_PathTrace.trace.radianceCacheUsageCounter->UavBarrier(cmd);
-
-        m_PathTrace.trace.radianceCacheUsageCounter->Transition(cmd, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        cmd->CopyBufferRegion(m_PathTrace.trace.radianceCacheUsageReadback[readbackIdx]->Get(), 0, m_PathTrace.trace.radianceCacheUsageCounter->Get(), 0, sizeof(u32));
-        m_PathTrace.trace.radianceCacheUsageCounter->Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        m_PathTrace.trace.radianceCache->Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        m_PathTrace.trace.radianceSamples->Transition(cmd, D3D12_RESOURCE_STATE_COMMON);
+        m_PathTrace.trace.outputTexture.UavBarrier(cmd);
+        m_PathTrace.trace.hitDistanceTexture.UavBarrier(cmd);
+        m_PathTrace.trace.outputTexture.Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        m_PathTrace.trace.hitDistanceTexture.Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     GPU_MARKER_END(cmd, gpuTimers);
 }
 
-void Raytracing::SpecularPass(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers, const XMUINT2& renderSize, const SpecularPassInput& input)
+Raytracing::PathTracePassResources& Raytracing::GetPathTracePassResources()
 {
-    Camera& camera = m_Camera;
-
-    const Camera::FrameData cameraFrameData = camera.GetFrameData();
-    const Array<ID3D12DescriptorHeap*, 2> descriptorHeaps = m_BindlessHeaps.GetDescriptorHeaps();
-    cmd->SetDescriptorHeaps(descriptorHeaps.size(), descriptorHeaps.data());
-
-    static constexpr XMUINT2 ditherFactors[4] = {
-        XMUINT2(1, 1),
-        XMUINT2(1, 2),
-        XMUINT2(2, 2),
-        XMUINT2(4, 4),
-    };
-    static constexpr u32 rtTileCount[4] = {
-        1,
-        2,
-        4,
-        16,
-    };
-    const u32 specularTypeIndex = static_cast<u32>(g_Settings.rtSpecularResolution);
-    IE_Assert(specularTypeIndex < 4);
-    const XMUINT2 currentDitherFactors = ditherFactors[specularTypeIndex];
-    const u32 tileCount = rtTileCount[specularTypeIndex];
-    const u32 slot = input.frameIndex % tileCount;
-
-    u32 idx = 0;
-    if (tileCount < 4)
-    {
-        idx = slot;
-    }
-    else if (tileCount == 4)
-    {
-        static constexpr u32 invBayer2[4] = {0, 3, 1, 2};
-        idx = invBayer2[slot];
-    }
-    else
-    {
-        static constexpr u32 invBayer4[16] = {0, 10, 2, 8, 5, 15, 7, 13, 1, 11, 3, 9, 4, 14, 6, 12};
-        idx = invBayer4[slot];
-    }
-
-    const u32 shift = currentDitherFactors.x >> 1;
-    const u32 mask = currentDitherFactors.x - 1;
-    const XMUINT2 ditherOffset = XMUINT2(idx & mask, idx >> shift);
-
-    D3D12_DISPATCH_RAYS_DESC dispatchRayDesc{};
-    dispatchRayDesc.RayGenerationShaderRecord.StartAddress = m_Specular.trace.rayGenShaderTable->GetGPUVirtualAddress();
-    dispatchRayDesc.RayGenerationShaderRecord.SizeInBytes = m_Specular.trace.rayGenShaderTable->GetDesc().Width;
-
-    dispatchRayDesc.MissShaderTable.StartAddress = m_Specular.trace.missShaderTable->GetGPUVirtualAddress();
-    dispatchRayDesc.MissShaderTable.SizeInBytes = m_Specular.trace.missShaderTable->GetDesc().Width;
-    dispatchRayDesc.MissShaderTable.StrideInBytes = m_Specular.trace.missShaderTable->GetDesc().Width;
-
-    dispatchRayDesc.HitGroupTable.StartAddress = m_Specular.trace.hitGroupShaderTable->GetGPUVirtualAddress();
-    dispatchRayDesc.HitGroupTable.SizeInBytes = m_Specular.trace.hitGroupShaderTable->GetDesc().Width;
-    dispatchRayDesc.HitGroupTable.StrideInBytes = m_Specular.trace.hitGroupShaderTable->GetDesc().Width;
-
-    dispatchRayDesc.Width = IE_DivRoundUp(renderSize.x, currentDitherFactors.x);
-    dispatchRayDesc.Height = IE_DivRoundUp(renderSize.y, currentDitherFactors.y);
-    dispatchRayDesc.Depth = 1;
-
-    RTSpecularConstants constants{};
-    constants.invViewProj = cameraFrameData.invViewProj;
-    constants.cameraPos = cameraFrameData.position;
-    constants.outputTextureIndex = m_Specular.trace.outputTexture.uavIndex;
-    constants.sunDir = input.sunDir;
-    constants.normalTextureIndex = input.normalTextureIndex;
-    constants.fullDimInv = XMFLOAT2(1.0f / static_cast<f32>(renderSize.x), 1.0f / static_cast<f32>(renderSize.y));
-    constants.tlasIndex = m_TlasSrvIndex;
-    constants.depthTextureIndex = input.depthTextureIndex;
-    constants.materialTextureIndex = input.materialTextureIndex;
-    constants.primInfoBufferIndex = m_RTPrimInfoBuffer->srvIndex;
-    constants.materialsBufferIndex = input.materialsBufferIndex;
-    constants.skyCubeIndex = input.skyCubeIndex;
-    constants.samplerIndex = input.samplerIndex;
-    constants.skyIntensity = g_Settings.skyIntensity;
-    constants.sunIntensity = g_Settings.sunIntensity;
-    constants.frameIndex = input.frameIndex;
-    constants.sunColor = input.sunColor;
-    constants.roughnessRaySpread = 0.8f;
-    constants.sppMin = g_Settings.rtSpecularSppMin;
-    constants.sppMax = g_Settings.rtSpecularSppMax;
-    constants.ditherFactors = currentDitherFactors;
-    constants.ditherOffset = ditherOffset;
-
-    GPU_MARKER_BEGIN(cmd, gpuTimers, "Ray-Traced Specular");
-    {
-        m_Specular.trace.outputTexture.Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        cmd->SetComputeRootSignature(m_Specular.trace.rootSig.Get());
-        cmd->SetPipelineState1(m_Specular.trace.dxrStateObject.Get());
-        cmd->SetComputeRoot32BitConstants(0, sizeof(RTSpecularConstants) / sizeof(u32), &constants, 0);
-
-        cmd->DispatchRays(&dispatchRayDesc);
-
-        m_Specular.trace.outputTexture.UavBarrier(cmd);
-        m_Specular.trace.outputTexture.Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    }
-    GPU_MARKER_END(cmd, gpuTimers);
+    return m_PathTrace;
 }
 
 const Raytracing::PathTracePassResources& Raytracing::GetPathTracePassResources() const
@@ -1236,51 +802,3 @@ const Raytracing::PathTracePassResources& Raytracing::GetPathTracePassResources(
     return m_PathTrace;
 }
 
-const Raytracing::SpecularPassResources& Raytracing::GetSpecularPassResources() const
-{
-    return m_Specular;
-}
-
-const Raytracing::ShadowPassResources& Raytracing::GetShadowPassResources() const
-{
-    return m_Shadow;
-}
-
-void Raytracing::ClearPathTraceRadianceCacheCS(const ComPtr<ID3D12GraphicsCommandList7>& cmd, GpuTimers& gpuTimers)
-{
-    const Array<ID3D12DescriptorHeap*, 2> descriptorHeaps = m_BindlessHeaps.GetDescriptorHeaps();
-
-    GPU_MARKER_BEGIN(cmd, gpuTimers, "Radiance Cache - Clear Cache");
-    {
-        cmd->SetDescriptorHeaps(descriptorHeaps.size(), descriptorHeaps.data());
-        cmd->SetComputeRootSignature(m_PathTrace.cache.rootSignature.Get());
-        cmd->SetPipelineState(m_PathTrace.cache.clearCachePso.Get());
-
-        m_PathTrace.trace.radianceCache->Transition(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        PathTraceCacheClearCacheConstants c;
-        c.radianceCacheUavIndex = m_PathTrace.trace.radianceCache->uavIndex;
-        c.cacheEntries = RC_ENTRIES;
-        const u32 groupCount = IE_DivRoundUp(RC_ENTRIES, kCacheCSGroupSize);
-        const u32 dispatchX = kClearCacheDispatchX;
-        const u32 dispatchY = IE_DivRoundUp(groupCount, dispatchX);
-        c.dispatchGroupsX = dispatchX;
-
-        cmd->SetComputeRoot32BitConstants(0, sizeof(c) / sizeof(u32), &c, 0);
-        cmd->Dispatch(dispatchX, dispatchY, 1);
-
-        m_PathTrace.trace.radianceCache->UavBarrier(cmd);
-        const u32 zero = 0u;
-        SetBufferData(cmd, m_PathTrace.trace.radianceCacheUsageCounter, &zero, sizeof(zero), 0);
-        m_PathTrace.trace.radianceCache->Transition(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    }
-    GPU_MARKER_END(cmd, gpuTimers);
-
-    m_PruneActive = false;
-}
-
-void Raytracing::InvalidatePathTraceRadianceCache()
-{
-    m_Cleared = false;
-    m_PruneActive = false;
-}
